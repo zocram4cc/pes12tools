@@ -1,0 +1,6 @@
+[afs2fs]
+img.dir = "4cc-dlc"
+
+[kload]
+dll = afsio
+dll = afs2fs
