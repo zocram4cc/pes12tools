@@ -31,6 +31,7 @@ ctx = bpy.context
 OUT = os.path.join(REPO, "dllprobe", "blender_test")
 os.makedirs(OUT, exist_ok=True)
 
+
 # --- ball (stock dt0b #11 template) ---
 ball = os.path.join(OUT, "ball11_stock.bin")
 assert os.path.exists(ball), ball
@@ -89,4 +90,45 @@ assert sorted(map(key, parsed["subs"])) == sorted(map(key, ref["subs"]))
 assert (sum(s["count"] for s in parsed["subs"]) // 3 ==
         sum(s["count"] for s in ref["subs"]) // 3 ==
         len(obj.data.polygons))
+# --- stadium (dt08 entry 58, e00 back stand) ---
+# import_bin/export_bin route stadium sides through split_stadium (the
+# entry is written to OUT first so the template path is a plain file).
+DT08 = os.path.join(REPO, "Pro Evolution Soccer 2012", "img", "dt08.img")
+ent = int(os.environ.get("PES12_STADIUM_ENTRY", "58"))
+sys.path.insert(0, os.path.join(REPO, "tools"))
+import afs as _afs
+_stad_raw = _afs.read(DT08, ent)
+_stad_tpl = os.path.join(OUT, "dt08_%d_stock.bin" % ent)
+open(_stad_tpl, "wb").write(_stad_raw)
+srep, scol, sobjs = P.import_bin(ctx, _stad_tpl)
+assert srep["kind"] == "stadium", srep
+sv = sum(len(o.data.vertices) for o in sobjs)
+print("stadium import: %d parts, %d verts (%s)" % (len(sobjs), sv, srep["kind"]), flush=True)
+assert (len(sobjs), sv) == (10, 4422), (len(sobjs), sv)
+for o in sobjs:
+    o.select_set(True)
+sout = os.path.join(OUT, "dt08_%d.bin" % ent)
+if os.path.exists(sout):
+    os.remove(sout)
+sgot = P.export_bin(os.path.join(OUT, "dt08"), _stad_tpl, sobjs, False, ent)
+print("stadium export:", sgot, flush=True)
+assert os.path.basename(sgot) == "dt08_%d.bin" % ent, sgot
+sbody = binwrap.unwesys(open(sgot, "rb").read())
+sblocks = binwrap.split_stadium(sbody)
+rv, rlo, rhi = 0, [1e9] * 3, [-1e9] * 3
+for b in sblocks:
+    sm = V.parse_bytes(b, "stad-re")
+    for pp in sm["packets"]:
+        rv += len(pp["vertices"])
+        for v in pp["vertices"]:
+            for k in range(3):
+                rlo[k] = min(rlo[k], v["POSITION"][k])
+                rhi[k] = max(rhi[k], v["POSITION"][k])
+print("stadium re-parse verts: %d bounds x[%.1f,%.1f] y[%.1f,%.1f] z[%.1f,%.1f]" % (
+    rv, rlo[0], rhi[0], rlo[1], rhi[1], rlo[2], rhi[2]), flush=True)
+assert rv == sv == 4422, (rv, sv)
+assert (round(rlo[0], 1), round(rhi[0], 1)) == (-62.4, 62.4)
+assert (round(rlo[2], 1), round(rhi[2], 1)) == (-83.8, -39.2)
+for o in list(sobjs):
+    bpy.data.objects.remove(o, do_unlink=True)
 print("SMOKE PASS", flush=True)

@@ -53,4 +53,4 @@ then `python3 editapp/src/main.py <EDIT.bin>`.
 | `.../dt04_65.bin` | team crests |
 | `kitserver/4cc-dlc/img/dt06.img/dt06_4.bin`, `dt06_17.bin` | menu league names |
 
-Rebuilt by `tools/pes12_4cc_dlc.py` (see `07-edit-and-database.md`).
+Rebuilt by `tools/pes12_4cc_dlc.py` in pes2012-tools/.

@@ -95,7 +95,7 @@ def joint(bone):
 # PES2012's in-match body has one bone per hand; its own hands are modelled
 # curled. A 4cc PES15 hand is authored flat on finger bones this game does not
 # have, so it is bent into PES's relaxed hand before being baked onto the hand
-# bone: the flexion of PES's normal.gani (GameplayFootball AGENTS.md: mcp 15,
+# bone: the flexion of PES's normal.gani (mcp 15,
 # pip 32, dip 20 degrees). The thumb is left as authored.
 # ponytail: one fixed pose; per-player grips (fists, keepers) would need the finger bones
 FINGER_CURL_DEG = {'mcp': 15.0, 'pip': 32.0, 'dip': 20.0}

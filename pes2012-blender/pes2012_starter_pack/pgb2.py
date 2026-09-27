@@ -1,7 +1,7 @@
 """PGB2 custom body codec: drawlogic.dll's per-player body format.
 
 Pure python, no Blender. Provenance: tools/pes15_to_pes12.py docstring and
-09-pes15-import.md (header magic/nv/ni/stride/nsub/mode, submesh table,
+(header magic/nv/ni/stride/nsub/mode, submesh table,
 80-byte vertices, u32 indices, body_<k>.tex PGT1 textures).
 
 Layout:
@@ -59,10 +59,10 @@ N_FACE_SLOTS = 27
 
 
 def influences_to_slots(infl):
-    """[(slot, weight)] -> (4 slots, 3 explicit f32 weights)."""
-    top = sorted(((s, w) for s, w in infl.items() if w >= MIN_WEIGHT),
-                 key=lambda kv: -kv[1])[:MAX_INFLUENCES] or sorted(
-                 infl.items(), key=lambda kv: -kv[1])[:MAX_INFLUENCES]
+    """[(slot, weight)] -> (4 slots, 3 explicit f32 weights). The shader's
+    implicit remainder lands on the last slot, so padded slots repeat the
+    last explicit slot (tools/fmdl_to_pes12.py)."""
+    top = sorted(infl.items(), key=lambda kv: -kv[1])[:MAX_INFLUENCES]
     tw = sum(w for _, w in top) or 1.0
     top = [(s, w / tw) for s, w in top]
     slots = [s for s, _ in top]

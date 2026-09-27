@@ -67,7 +67,7 @@ def import_bin(context, filepath, flip_v=False):
     per KTMDL block, each imported through the vendored importer."""
     import tempfile
     tag, body = _template_body(filepath)
-    kind, blocks = binwrap.split_body(body)
+    kind, blocks = _split_template(body)
     hits = binwrap.find_ktmdl(blocks)
     if not hits:
         raise _ktmdl.KTMDLError('no KTMDL block in %s' % filepath)
@@ -164,6 +164,31 @@ def _mesh_data(obj, flip_v, template=None, packet=0):
     return attrs, tris
 
 
+def _split_template(body):
+    """Template body -> (kind, blocks): ball, dt08 stadium side, generic.
+
+    The dialect is chosen by join(split(x)) == x (ball, then stadium,
+    then generic): row layouts overlap, so header-shape guessing
+    mis-routes (dt08 sides share n=4/hs=64 with balls; texture
+    companions parse as stadium rows). 0-packet reserved slots pass
+    through untouched.
+    """
+    from . import ktmdl_write as _W  # noqa: F401 (kept for export scope)
+    try:
+        kt, tex = binwrap.split_ball(body)
+        if binwrap.join_ball(kt, tex) == bytes(body):
+            return 'ball', [kt, *tex]
+    except ValueError:
+        pass
+    try:
+        blocks = binwrap.split_stadium(body)
+        if binwrap.join_stadium(blocks) == bytes(body):
+            return 'stadium', blocks
+    except ValueError:
+        pass
+    return 'generic', binwrap.split_generic(body)
+
+
 def export_bin(filepath, template_path, objects, flip_v=False, afs_entry=None):
     """Mesh objects + template BIN -> WESYS BIN at filepath.
 
@@ -174,7 +199,7 @@ def export_bin(filepath, template_path, objects, flip_v=False, afs_entry=None):
     """
     from . import ktmdl_write as W
     tag, body = _template_body(template_path)
-    kind, blocks = binwrap.split_body(body)
+    kind, blocks = _split_template(body)
     rows_by_block = {}
     for o in objects:
         block = int(o.get('pes12_block', 0))
@@ -189,9 +214,21 @@ def export_bin(filepath, template_path, objects, flip_v=False, afs_entry=None):
             ktpack.mesh_row(template, packet, attrs, list(tris)))
     new_blocks = list(blocks)
     for block, rows in rows_by_block.items():
+        # untouched packets ride along as template rows: ktmdl_write
+        # rebuilds group/bounding AABBs from the replaced packets only,
+        # so a partial export would otherwise shrink the block bounds.
+        have = {r['packet'] for r in rows}
+        npacket = W._u32(blocks[block], W.H_PACKET_COUNT)
+        for pi in range(npacket):
+            if pi not in have:
+                vb, idx, _st = W.packet_mesh(blocks[block], pi)
+                rows.append({'packet': pi, 'vertices': bytes(vb),
+                             'indices': list(idx)})
         new_blocks[block] = W.build(blocks[block], rows)
     if kind == 'ball':
         out_body = binwrap.join_ball(new_blocks[0], new_blocks[1:])
+    elif kind == 'stadium':
+        out_body = binwrap.join_stadium(new_blocks)
     else:
         n, _, hs = struct.unpack_from('<III', body)
         out_body = binwrap.join_generic(new_blocks, compact=(hs == 12 + 12 * n))

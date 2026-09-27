@@ -5,6 +5,8 @@
 - generic: dt07 #1 rows split/join round-trip (compact header preserved).
 - PGB2: dllprobe/custom/p272101 body.bin + body_0.tex parse-compare.
 - pack_body: export path on p272101, influence+position parse-compare.
+- stadium: stock dt08 entry 58 split/join + per-packet build round-trip
+  (dt08 back stand: 4 blocks; texture companions live in entry 59).
 Run: python3 tests/test_roundtrip.py (from dist/pes2012-blender/).
 """
 import importlib.util
@@ -37,6 +39,7 @@ _spec.loader.exec_module(V)
 DT0B = os.path.join(REPO, 'Pro Evolution Soccer 2012', 'img', 'dt0b.img')
 DT07 = os.path.join(REPO, 'Pro Evolution Soccer 2012', 'img', 'dt07.img')
 P272101 = os.path.join(REPO, 'dllprobe', 'custom', 'p272101')
+DT08 = os.path.join(REPO, 'Pro Evolution Soccer 2012', 'img', 'dt08.img')
 
 
 def stock_body(img, index):
@@ -132,9 +135,11 @@ def test_pack_body():
         if vi in face_verts:
             p = (p[0] + pgb2.HEAD_POS[0], p[1] + pgb2.HEAD_POS[1],
                  p[2] + pgb2.HEAD_POS[2])
+        # shared verts (face and body submeshes cite the same vertex) keep
+        # both maps; pack_body picks by submesh
         vert_data[vi] = dict(pos=p, nrm=v['nrm'], tan=v['tan'], bin=v['bin'],
                              uv0=v['uv0'], uv1=v['uv1'],
-                             infl={} if vi in face_verts else dict(infl),
+                             infl=dict(infl),
                              face=dict(infl) if vi in face_verts else {})
     tris_by_mat, mat_flags, mat_tex, mat_face = {}, {}, {}, {}
     for mi, s in enumerate(parsed['subs']):
@@ -164,14 +169,104 @@ def test_pack_body():
             vi = parsed['idx'][src['first'] + (ni - s['first'])]
             a, b = parsed['verts'][vi], check['verts'][ni]
             assert check['idx'][ni] == ni
-        ia = pgb2.slots_to_influences(a['slots'], a['weights'])
-        ib = pgb2.slots_to_influences(b['slots'], b['weights'])
-        for s in set(ia) | set(ib):
-            worst = max(worst, abs(ia.get(s, 0.0) - ib.get(s, 0.0)))
-        worst = max(worst, max(abs(x - y) for x, y in zip(a['pos'], b['pos'])))
+            ia = pgb2.slots_to_influences(a['slots'], a['weights'])
+            ib = pgb2.slots_to_influences(b['slots'], b['weights'])
+            # influences_to_slots drops sub-MIN_WEIGHT authoring noise
+            # (tools/fmdl_to_pes12.py), so compare above that floor.
+            fa = {t: w for t, w in ia.items() if w >= pgb2.MIN_WEIGHT}
+            fb = {t: w for t, w in ib.items() if w >= pgb2.MIN_WEIGHT}
+            for t in set(fa) | set(fb):
+                worst = max(worst, abs(fa.get(t, 0.0) - fb.get(t, 0.0)))
+            worst = max(worst, max(abs(x - y) for x, y in zip(a['pos'], b['pos'])))
     assert worst < 2e-6, worst
     print('pack_body p272101: %d split verts influence+pos match (worst %.2g) OK'
           % (len(check['verts']), worst))
+
+
+def _stad_attrs(v):
+    return dict(pos=tuple(v['POSITION']), nrm=tuple(v['NORMAL']),
+                uv=[tuple(v['TEXCOORD0']), tuple(v['TEXCOORD1'])])
+
+def _tri_normal_dot(packet, tri):
+    """Face-normal / vertex-normal agreement (+/-/0) for one triangle."""
+    a, b, c = [packet['vertices'][v]['POSITION'] for v in tri]
+    ab = [b[k] - a[k] for k in range(3)]
+    ac = [c[k] - a[k] for k in range(3)]
+    fn = [ab[1] * ac[2] - ab[2] * ac[1], ab[2] * ac[0] - ab[0] * ac[2],
+          ab[0] * ac[1] - ab[1] * ac[0]]
+    vn = [0.0] * 3
+    for v in tri:
+        for k in range(3):
+            vn[k] += packet['vertices'][v]['NORMAL'][k]
+    return sum(f * w for f, w in zip(fn, vn))
+
+
+def test_stadium():
+    """dt08 entry 58 (e00 back stand): split/join + every KTMDL block
+    rebuilt packet-by-packet through ktpack.mesh_row, then re-parsed:
+    packet/vertex counts and bounds match the stock entry (e00 back stand)."""
+    _tag, body = stock_body(DT08, 58)
+    blocks = binwrap.split_stadium(body)
+    assert len(blocks) == 4 and binwrap.join_stadium(blocks) == body
+    tot_v, tot_p = 0, 0
+    lo = [1e9] * 3
+    hi = [-1e9] * 3
+    new_blocks = []
+    for bi, blk in enumerate(blocks):
+        m = V.parse_bytes(blk, 'stad%d' % bi)
+        rows = []
+        for p in m['packets']:
+            assert p['primType'] == 1, 'entry 58 is TRIANGLELIST everywhere'
+            attrs = [_stad_attrs(v) for v in p['vertices']]
+            rows.append(ktpack.mesh_row(blk, p['index'], attrs))
+            tot_v += len(attrs)
+            tot_p += 1
+            for v in p['vertices']:
+                for k in range(3):
+                    lo[k] = min(lo[k], v['POSITION'][k])
+                    hi[k] = max(hi[k], v['POSITION'][k])
+        new_blocks.append(W.build(blk, rows) if rows else blk)
+    assert (tot_v, tot_p) == (4422, 10), (tot_v, tot_p)
+    out = binwrap.join_stadium(new_blocks)
+    m2 = [V.parse_bytes(b, 're%d' % bi) for bi in range(4) for b in [out and new_blocks[bi]]]
+    rv = sum(len(p['vertices']) for m in m2 for p in m['packets'])
+    assert rv == tot_v, (rv, tot_v)
+    rlo = [1e9] * 3
+    rhi = [-1e9] * 3
+    for m in m2:
+        for p in m['packets']:
+            for v in p['vertices']:
+                for k in range(3):
+                    rlo[k] = min(rlo[k], v['POSITION'][k])
+                    rhi[k] = max(rhi[k], v['POSITION'][k])
+    assert rlo == lo and rhi == hi, (rlo, rhi, lo, hi)
+    # winding: face-normal / vertex-normal agreement of stock vs rebuilt
+    agree = lambda ms: sum(
+        (1 if _tri_normal_dot(p, t) > 0 else -1 if _tri_normal_dot(p, t) < 0 else 0)
+        for m in ms for p in m['packets'] for t in p['triangles'])
+    a0 = agree([V.parse_bytes(b, 's%d' % bi) for bi, b in enumerate(blocks)])
+    a1 = agree(m2)
+    assert a0 == a1, (a0, a1)
+    print('stadium dt08#58: %d verts %d packets bounds x[%.1f,%.1f] y[%.1f,%.1f] z[%.1f,%.1f] OK'
+          % (tot_v, tot_p, lo[0], hi[0], lo[1], hi[1], lo[2], hi[2]))
+
+
+def test_stadium_edited_topology():
+    """New topology on a stadium packet: first-100-tri subset of entry 58
+    block 2 packet 2 rebuilds through the TRIANGLELIST path."""
+    _tag, body = stock_body(DT08, 58)
+    blk = binwrap.split_stadium(body)[2]
+    m = V.parse_bytes(blk, 'stad2')
+    p = m['packets'][2]
+    tris = [tuple(f) for f in p['triangles'][:100]]
+    keep = sorted({v for tri in tris for v in tri})
+    remap = {v: k for k, v in enumerate(keep)}
+    attrs = [_stad_attrs(p['vertices'][v]) for v in keep]
+    new_kt = W.build(blk, [ktpack.mesh_row(
+        blk, 2, attrs, [[remap[v] for v in tri] for tri in tris])])
+    m2 = V.parse_bytes(new_kt, 'stad2-edit')
+    assert len(m2['packets'][2]['vertices']) == len(keep)
+    print('stadium edited-topology: %d verts / %d tris OK' % (len(keep), len(tris)))
 
 
 if __name__ == '__main__':
@@ -180,4 +275,6 @@ if __name__ == '__main__':
     test_generic()
     test_pgb2()
     test_pack_body()
+    test_stadium()
+    test_stadium_edited_topology()
     print('ALL ROUND-TRIPS PASS')

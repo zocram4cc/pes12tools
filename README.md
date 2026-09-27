@@ -24,7 +24,7 @@ in each folder's README)..
    formation (coordinates clamped to the role's stock ranges - out-of-range
    values crash the game on team select), bodies, and kits.
 4. Balls/stadiums: `python3 pes12_ball.py` / `python3 pes12_stadium.py`
-   (see `10-stadiums.md`); Blender flows in `pes2012-blender/README.md`.
+   (stadium map and proof conversion: repo 10-stadiums.md).
 
 ## Player settings (custom bodies)
 

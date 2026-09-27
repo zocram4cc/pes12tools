@@ -1,7 +1,7 @@
 """Template-driven KTMDL geometry packer (pure python, no Blender).
 
 Reads the template KTMDL's own vertex declaration (never infers from
-stride; 02-target-formats.md) and packs caller-supplied per-vertex
+stride) and packs caller-supplied per-vertex
 attribute dicts into ktmdl_write.build's {packet, vertices, indices}
 mesh rows. Provenance: declaration semantics in
 pes_ktmdl_importer/ktmdl.py (SEMANTIC_NAMES/TYPE_NAMES), vertex packing

@@ -50,6 +50,11 @@ def split_ball(body):
         if any(pad) or len(pad) != (-sizes[k]) % 16:
             raise ValueError('block %d: unexpected pad' % k)
         blocks.append(bytes(content))
+    # dt08 stadium sides share n=4/hs=64: tell them apart by content
+    # (ball = 1 KTMDL + 3 WE00 textures; stadium side = 4 KTMDL).
+    if bytes(blocks[0][:8]) != KTMDL_MAGIC or \
+            any(bytes(b[:8]) == KTMDL_MAGIC for b in blocks[1:]):
+        raise ValueError('not a 4-entry ball BIN')
     return blocks[0], blocks[1:]
 
 
@@ -116,6 +121,39 @@ def join_generic(blocks, compact=None):
         o += len(blk)
         hdr += struct.pack('<III', len(blk), 0xFFFFFFF0, o if k < len(blocks) - 1 else 0)
     return bytes(hdr) + b''.join(blocks)
+
+
+def split_stadium(body):
+    """Decompressed dt08 entry -> [block bytes] (tools/pes12_stadium.py
+    split_bin). Rows read (offset, size, flag): the
+    generic dialect's (byteLen, flag, end) chained reading mis-splits
+    these, so this lives beside split_generic, not inside it."""
+    n = struct.unpack_from('<I', body)[0]
+    out = []
+    for k in range(n):
+        off, size = struct.unpack_from('<II', body, 8 + 12 * k)
+        if not 0 < off <= len(body) - size:
+            raise ValueError('block %d: bad (offset, size)' % k)
+        out.append(bytes(body[off:off + size]))
+    if not out:
+        raise ValueError('not a stadium BIN (n=%d)' % n)
+    return out
+
+
+def join_stadium(blocks):
+    """Block list -> decompressed dt08 entry (tools/pes12_stadium join_bin:
+    header 8+12n padded to 16, each block start 16-aligned)."""
+    n = len(blocks)
+    hs = (8 + 12 * n + 15) & ~15
+    out = bytearray(struct.pack('<II', n, 8))
+    pos = hs
+    for b in blocks:
+        out += struct.pack('<IIi', pos, len(b), -16)
+        pos += (len(b) + 15) & ~15
+    out += b'\x00' * (hs - len(out))
+    for b in blocks:
+        out += b + b'\x00' * (((len(b) + 15) & ~15) - len(b))
+    return bytes(out)
 
 
 def split_body(body):

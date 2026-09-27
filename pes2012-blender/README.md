@@ -38,11 +38,25 @@ same flows through File > Import/Export. The add-on is GPL-3.0-or-later
 ### Generic single-model BIN
 
 Same flow with any other template: File > Import > PES2012 BIN reads
-both container dialects (4-entry ball BINs and generic `(size, flag,
-end)` TOC BINs, e.g. dt07 boots), export splices the rebuilt KTMDL
-block(s) back and re-wraps WESYS. Multi-KTMDL BINs import every KTMDL
-block; each exported object writes back to its own block
-(`pes12_block`).
+ball BINs, generic `(size, flag, end)` TOC BINs (e.g. dt07 boots), and
+dt08 stadium entries (`(offset, size, flag)` rows),
+export splices the rebuilt KTMDL block(s) back and re-wraps WESYS.
+Multi-KTMDL BINs import every KTMDL block; each exported object writes
+back to its own block (`pes12_block`).
+
+### Stadium side (dt08)
+
+One side = 4 KTMDL blocks in one entry (e00 back stand = entry 58;
+block roles 3/1/4/2 packets: base, boards, upper+roof, seats). Import
+the side entry BIN: each packet becomes one mesh object (10 parts for
+entry 58), all static (single bone `0x21CF6015543CD044`, no skinning,
+TRIANGLELIST). Edit, select, export: each packet rebuilds through its
+own declaration/material/texture slots via `ktmdl_write.build`
+(textures stay stock: geometry entries hold KTMDL only, companions
+hold the WE00 DDS). 0-packet reserved slots pass through untouched;
+packets over 65535 verts are rejected. Serve as
+`Pro Evolution Soccer 2012/kitserver/4cc-dlc/img/dt08.img/dt08_<n>.bin`.
+Units are metres 1:1, same basis as the rest of the add-on.
 
 ### Player body (PGB2)
 
@@ -137,13 +151,17 @@ ball re-parse verts: 1328 vol +0.005499 (stock +0.005510)
 body import: body tris=18741 mats=20
 body export tris: 18741
 body re-parse: 20 subs mode boots
+stadium import: 10 parts, 4422 verts (stadium)
+stadium export: .../dllprobe/blender_test/dt08_58.bin
+stadium re-parse verts: 4422 bounds x[-62.4,62.4] y[0.1,21.8] z[-83.8,-39.2]
 SMOKE PASS
 ```
 
 The smoke asserts: ball re-parse keeps 1328 verts and the stock
 signed-volume sign (no inside-out export); body re-parse keeps mode,
-the (tex, flags) submesh multiset, and the triangle count of p272101.
-`ball_11.bin` proves the `<name>_<entry>.bin` afs2fs naming.
+the (tex, flags) submesh multiset, and the triangle count of p272101;
+stadium re-parse keeps 4422 verts and the entry-58 bounds.
+`ball_11.bin` / `dt08_58.bin` prove the `<name>_<entry>.bin` afs2fs naming.
 
 Pure-python core (`python3 tests/test_roundtrip.py <repo-root>`,
 Blender-free) agrees:
@@ -154,6 +172,8 @@ ball edited-topology: 106 verts / 100 tris OK
 generic dt07#1: 3 blocks round-trip OK
 pgb2 p272101: 19806 verts 18741 tris 20 subs mode boots OK
 pack_body p272101: 56223 split verts influence+pos match (worst 0) OK
+stadium dt08#58: 4422 verts 10 packets bounds x[-62.4,62.4] y[0.1,21.8] z[-83.8,-39.2] OK
+stadium edited-topology: 200 verts / 100 tris OK
 ALL ROUND-TRIPS PASS
 ```
 
