@@ -1,0 +1,1044 @@
+// drawhook: IDirect3DDevice9 vtable interception.
+// Installed as a kitserver DLL. On load: IAT-patch the game's
+// Direct3DCreate9 import to our wrapper; chain IDirect3D9::CreateDevice;
+// chain device methods: SetStreamSource, SetIndices, SetFVF,
+// SetVertexDeclaration, SetTexture, SetRenderState,
+// DrawIndexedPrimitive, Present.
+// Control files <kitserver>\4cc-players\flags\ (drawhook.cpp initRoot):
+//   wire (exists) -> force wireframe on body-ish draws
+//   dump (exists) -> log draws per frame; removed when dump ends
+#include <windows.h>
+#include <stdio.h>
+#include <d3d9.h>
+#include "kitmap.h"
+
+// Paths hang off drawhook's root (<kitserver>\4cc-players\, drawhook.cpp initRoot).
+static wchar_t g_root[MAX_PATH], LOGPATH[MAX_PATH], FLAGDIR[MAX_PATH], CUSTOM_DIR[MAX_PATH], KIT_DIR[MAX_PATH], SHOT_PATH[MAX_PATH];
+static const wchar_t* rootFile(wchar_t* out, const wchar_t* rel) { lstrcpyW(out, g_root); lstrcatW(out, rel); return out; }
+static void initPaths() {
+    typedef const wchar_t* (*ROOT_FN)();
+    HMODULE hook = GetModuleHandleA("drawhook.dll");
+    ROOT_FN root = hook ? (ROOT_FN)GetProcAddress(hook, "hook_root") : NULL;
+    lstrcpyW(g_root, root ? root() : L".\\");
+    rootFile(LOGPATH, L"drawhook.log"); rootFile(FLAGDIR, L"flags\\"); rootFile(CUSTOM_DIR, L"custom\\");
+    rootFile(KIT_DIR, L"custom\\kits\\"); rootFile(SHOT_PATH, L"shots\\frame.bmp");
+}
+static HANDLE g_log = INVALID_HANDLE_VALUE;
+
+static void logline(const char* s) {
+    DWORD w = 0; char b[768]; int n = 0;
+    while (s[n] && n < 740) { b[n] = s[n]; n++; }
+    b[n++] = '\r'; b[n++] = '\n';
+    if (g_log != INVALID_HANDLE_VALUE) WriteFile(g_log, b, n, &w, NULL);
+}
+
+// --- state ---
+static IDirect3DDevice9* g_dev = NULL;
+static IDirect3DVertexBuffer9* g_vb = NULL;
+static UINT g_stride = 0;
+static DWORD g_fvf = 0;
+static IDirect3DIndexBuffer9* g_ib = NULL;
+static IDirect3DBaseTexture9* g_tex0 = NULL;
+static IDirect3DBaseTexture9* g_texStage[8];
+static IDirect3DBaseTexture9* g_prevStage[8];
+static IDirect3DVertexDeclaration9* g_decl = NULL;
+static UINT g_vbOff = 0;
+static float g_vsc[256][4];
+
+// Player groups: in the colour pass each player is a contiguous run of draws
+// opening with the first body packet. Signature measured from the 24-09
+// tunnel dump (drawhook.log): nV=374, primCount=609, stride=44.
+static const UINT GROUP_START_NV = 374;
+static const UINT GROUP_START_NP = 609;
+static const UINT GROUP_START_STRIDE = 44;
+// A player group never contains the pitch/crowd style draws.
+static const UINT NONPLAYER_STRIDE = 32;
+static const UINT NONPLAYER_MIN_NV = 5000;
+static const int MAX_GROUP_DRAWS = 24;
+
+static volatile LONG g_group = -1;     // current group index this frame
+static volatile LONG g_groupDraw = 0;  // draw index inside current group
+static unsigned g_hideMask = 0;        // bit k -> hide group k
+static LONG g_grabGroup = -1;          // group to dump once
+static const LONG GRAB_ALL = 99;       // grab flag value: every draw of one frame
+static LONG g_grabAll = 0;
+
+// In-match body: dt09 #349 block 2 (2131 verts / 5740 strip idx, stride 48),
+// drawn with nV=2133 nP=5729 for every outfield player from ONE shared VB.
+static const UINT BODY_NV = 2133;
+static const UINT BODY_NP = 5729;
+static const UINT BODY_STRIDE = 48;
+// Keeper body: dt09 #349 block 2 verbatim (2131 verts, 5740 strip idx) with
+// the same 19-bone palette; drawn nV=2131 nP=5739 in the 24-09 frame dumps.
+static const UINT GK_BODY_NV = 2131;
+static const UINT GK_BODY_NP = 5739;
+// LOD0 kit (dt0c #3 block 0), per player run in the colour pass (24-09 dumps):
+// packet 5 (755 verts, strip nP 1857, 80 B) carries the hip; packet 18
+// (696 / 1929 / 72 B) the other 18 main bones. Bones live at c20 + 3*slot.
+static const UINT KIT_HIP_NV = 755, KIT_HIP_NP = 1857, KIT_HIP_STRIDE = 80;
+static const UINT KIT_MAIN_NV = 696, KIT_MAIN_NP = 1929, KIT_MAIN_STRIDE = 72;
+static const UINT BONE_REG0 = 20;
+static const UINT BONE_REGS = 3;
+static const UINT CU_SLOTS = 21;           // 19 main bones + 2 finger bones (kitmap.h)
+// draws in a player's kit run from packet 5 to the run's end (24-09 dump:
+// longest run seen (26-09 grabs: 16-19 draws, gloves and boots included);
+// past this the run is over whatever the classes say
+static const LONG MAX_RUN_DRAWS = 32;
+// PoC deformation: inflate the swapped body sideways so it is unmistakable.
+static const float SWAP_INFLATE_XZ = 1.0f;
+static const float SWAP_STRETCH_Y = 2.0f;
+static LONG g_swLo = -1, g_swHi = -1;    // swap body occurrences [lo, hi)
+static unsigned g_bodyHide = 0;
+static LONG g_drawIdx = 0;               // every DIP this frame
+static LONG g_hrLo = -1, g_hrHi = -1;    // hide DIP indices [lo, hi)
+static void readRange(const wchar_t* name, LONG* lo, LONG* hi) {
+    wchar_t p[MAX_PATH]; lstrcpyW(p, FLAGDIR); lstrcatW(p, name);
+    *lo = *hi = -1;
+    HANDLE f = CreateFileW(p, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE, NULL, OPEN_EXISTING, 0, NULL);
+    if (f == INVALID_HANDLE_VALUE) return;
+    char b[64] = {0}; DWORD r = 0; ReadFile(f, b, 63, &r, NULL); CloseHandle(f);
+    LONG v[2] = {0, 0}; int n = 0; bool in = false;
+    for (DWORD i = 0; i <= r && n < 2; i++) {
+        if (b[i] >= '0' && b[i] <= '9') { v[n] = v[n] * 10 + (b[i] - '0'); in = true; }
+        else if (in) { n++; in = false; }
+    }
+    if (n == 2) { *lo = v[0]; *hi = v[1]; }
+}          // bit k -> skip k-th body draw
+static LONG g_bodyDraw = 0;              // body draws seen this frame
+static IDirect3DVertexBuffer9* g_swapVB = NULL;
+static IDirect3DVertexBuffer9* g_swapSrc = NULL;
+
+static bool buildSwapVB(IDirect3DDevice9* d) {
+    if (g_swapVB && g_swapSrc == g_vb) return true;
+    if (g_swapVB) { g_swapVB->Release(); g_swapVB = NULL; }
+    UINT len = BODY_NV * BODY_STRIDE;
+    void* src = NULL;
+    if (FAILED(g_vb->Lock(g_vbOff, len, &src, D3DLOCK_READONLY)) || !src) return false;
+    BYTE* tmp = (BYTE*)HeapAlloc(GetProcessHeap(), 0, len);
+    memcpy(tmp, src, len);
+    g_vb->Unlock();
+    for (UINT k = 0; k < BODY_NV; k++) {
+        float* p = (float*)(tmp + k * BODY_STRIDE);
+        p[0] *= SWAP_INFLATE_XZ; p[1] *= SWAP_STRETCH_Y; p[2] *= SWAP_INFLATE_XZ;
+    }
+    if (FAILED(d->CreateVertexBuffer(len, D3DUSAGE_WRITEONLY, 0, D3DPOOL_DEFAULT, &g_swapVB, NULL))) {
+        HeapFree(GetProcessHeap(), 0, tmp); return false;
+    }
+    void* dst = NULL;
+    if (SUCCEEDED(g_swapVB->Lock(0, len, &dst, 0)) && dst) { memcpy(dst, tmp, len); g_swapVB->Unlock(); }
+    HeapFree(GetProcessHeap(), 0, tmp);
+    g_swapSrc = g_vb;
+    logline("swap VB built");
+    return true;
+}
+static LONG g_grabSeq = 0;
+
+struct Rec { DWORD nV, nP, stride, fvf, tex; };
+static const int MAXR = 1 << 16;
+static Rec g_recs[MAXR];
+static volatile LONG g_n = 0;        // records this frame
+static volatile LONG g_frame = 0;
+static volatile LONG g_dumpLeft = 0; // frames left to dump
+static volatile LONG g_wire = 0;
+
+static bool flagExists(const wchar_t* name) {
+    wchar_t p[MAX_PATH];
+    lstrcpyW(p, FLAGDIR); lstrcatW(p, name);
+    DWORD a = GetFileAttributesW(p);
+    return a != INVALID_FILE_ATTRIBUTES;
+}
+
+// flag file content: decimal number (hide: bitmask of groups). Missing -> def.
+static unsigned readFlagInt(const wchar_t* name, unsigned def) {
+    wchar_t p[MAX_PATH];
+    lstrcpyW(p, FLAGDIR); lstrcatW(p, name);
+    HANDLE f = CreateFileW(p, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE, NULL, OPEN_EXISTING, 0, NULL);
+    if (f == INVALID_HANDLE_VALUE) return def;
+    char b[32] = {0}; DWORD r = 0;
+    ReadFile(f, b, 31, &r, NULL);
+    CloseHandle(f);
+    unsigned v = 0; bool any = false;
+    for (DWORD i = 0; i < r; i++) if (b[i] >= '0' && b[i] <= '9') { v = v * 10 + (b[i] - '0'); any = true; }
+    return any ? v : def;
+}
+
+typedef HRESULT (STDMETHODCALLTYPE *DIP_FN)(IDirect3DDevice9*, D3DPRIMITIVETYPE, INT, UINT, UINT, UINT, UINT);
+typedef HRESULT (STDMETHODCALLTYPE *PRESENT_FN)(IDirect3DDevice9*, const RECT*, const RECT*, HWND, const RGNDATA*);
+typedef HRESULT (STDMETHODCALLTYPE *SSS_FN)(IDirect3DDevice9*, UINT, IDirect3DVertexBuffer9*, UINT, UINT);
+typedef HRESULT (STDMETHODCALLTYPE *SVD_FN)(IDirect3DDevice9*, IDirect3DVertexDeclaration9*);
+typedef HRESULT (STDMETHODCALLTYPE *SFVF_FN)(IDirect3DDevice9*, DWORD);
+typedef HRESULT (STDMETHODCALLTYPE *SI_FN)(IDirect3DDevice9*, IDirect3DIndexBuffer9*);
+typedef HRESULT (STDMETHODCALLTYPE *STEX_FN)(IDirect3DDevice9*, DWORD, IDirect3DBaseTexture9*);
+typedef HRESULT (STDMETHODCALLTYPE *RS_FN)(IDirect3DDevice9*, D3DRENDERSTATETYPE, DWORD);
+typedef HRESULT (STDMETHODCALLTYPE *CD_FN)(IDirect3D9*, UINT, D3DDEVTYPE, HWND, DWORD, D3DPRESENT_PARAMETERS*, IDirect3DDevice9**);
+typedef IDirect3D9* (WINAPI *D3DC9_FN)(UINT);
+
+static DIP_FN g_orgDIP = NULL;
+static PRESENT_FN g_orgPresent = NULL;
+static SSS_FN g_orgSSS = NULL;
+static SVD_FN g_orgSVD = NULL;
+static SFVF_FN g_orgSFVF = NULL;
+static SI_FN g_orgSI = NULL;
+static STEX_FN g_orgSTEX = NULL;
+static RS_FN g_orgRS = NULL;
+static CD_FN g_orgCD = NULL;
+static D3DC9_FN g_realD3DC9 = NULL;
+typedef HRESULT (STDMETHODCALLTYPE *SVSCF_FN)(IDirect3DDevice9*, UINT, const float*, UINT);
+static SVSCF_FN g_orgSVSCF = NULL;
+
+// ---- custom body (tools/fmdl_to_pes12.py PGB1 / tools/pes15_to_pes12.py PGB2) ----
+static const DWORD TEX_MAGIC = 0x31544750;      // 'PGT1'
+static const DWORD CUSTOM_MAGIC = 0x31424750;   // 'PGB1': one texture, u16 indices
+static const DWORD CUSTOM2_MAGIC = 0x32424750;  // 'PGB2': submeshes, u32 indices, flags
+// PGB2 header flags = which stock parts the custom model replaces (PES21 Full
+// Player Customization's four cases). dllprobe\custom\<name>\mode ("head",
+// "body", "kit", "boots") overrides the header.
+enum { MODE_BODY = 0, MODE_HEAD = 1, MODE_KIT = 2, MODE_BOOTS = 3, MODE_COUNT };
+// The stock player, measured 26-09 from grabbed stock frames (tools/grab.py,
+// bounds of each draw's vertices): one stride-76 skin draw (arms, legs, neck
+// and bare hands; it samples the face atlas the marker rides on), then the
+// LOD0 kit run opened by packet 5 (the shorts). The run's make-up varies per
+// player - gloves add a draw, long sleeves merge two, boots differ by model -
+// so its draws are classed by where their vertices sit, not by position:
+//   kit pieces are in body space (bind pose, y up to 1.6 m), head pieces and
+//   boots in their own bone's space (within 0.2 m of the origin).
+enum Part { PART_SHORTS, PART_SHIRT, PART_SLEEVES, PART_SOCKS, PART_NECK, PART_GLOVES,
+            PART_HEAD, PART_BOOTS, PART_OTHER, PART_COUNT };
+static const unsigned PART_BIT = 1;
+static const unsigned PARTS_ALL = (PART_BIT << PART_COUNT) - 1;
+static const unsigned PARTS_KIT = (PART_BIT << PART_SHORTS) | (PART_BIT << PART_SHIRT) |
+                                  (PART_BIT << PART_SLEEVES) | (PART_BIT << PART_SOCKS) | (PART_BIT << PART_BOOTS);
+static const unsigned MODE_PART_HIDE[MODE_COUNT] = {
+    PARTS_ALL,                            // body: the custom model is the whole player
+    PART_BIT << PART_HEAD,                // head: stock body and kit stay
+    PARTS_ALL & ~PARTS_KIT,               // kit: only shirt, shorts, socks, boots stay
+    PARTS_ALL & ~(PART_BIT << PART_BOOTS) // boots: only the boots stay
+};
+static const bool MODE_HIDES_SKIN[MODE_COUNT] = { true, false, true, true };
+// class boundaries (metres, from the 26-09 bounds table)
+static const float LOCAL_SPACE_MAX_Y = 0.3f;    // head pieces/boots top out at 0.17
+static const float BOOT_MAX_Y = 0.03f;          // boots 305/302 verts: y -0.07..0.02; eyes/teeth sit at 0.04+
+static const float BOOT_MIN_WIDTH = 0.1f;       // a boot is 0.15 wide on one side of x = 0; an eye 0.03
+static const float SOCKS_MAX_Y = 0.55f;         // socks 0.06..0.51
+static const float SHORTS_MAX_Y = 1.1f;         // shorts + shorts number 0.61..1.07
+static const float TORSO_MAX_X = 0.25f;         // shirt, collar, back print within |x| 0.20
+static const float GLOVES_MIN_X = 0.6f;         // gloves reach the hands at |x| 0.78; sleeves stop at 0.74
+static const float NECK_MIN_Y = 1.6f;           // the neck (170 verts) rises to 1.62 above the collar's 1.58
+static const float NONPLAYER_MIN_EXTENT = 5.0f; // stadium geometry: the run is over
+// submesh flags (tools/pes15_to_pes12.py sub_flags, from the PES15 .mtl states)
+static const DWORD SUB_ALPHATEST = 1, SUB_BLEND = 2, SUB_TWOSIDED = 4, SUB_NOZWRITE = 8, SUB_KIT = 16, SUB_OUTLINE = 32, SUB_FACE = 64;
+// the stock face mesh (dt0c face BIN, packet 3): drawn 669 or 670 verts, stride 88 (26-09 grabs)
+static const UINT FACE_DRAW_NV_A = 669, FACE_DRAW_NV_B = 670, FACE_DRAW_STRIDE = 88;
+// Outline shells sit a few mm outside the body; at match camera distance that
+// is inside the depth buffer's resolution and the shell pokes through the
+// body in jagged dark cracks (Kurisu, 26-09). Biased back, it only shows past
+// the silhouette. PROVISIONAL values, tuned by eye on the 26-09 replay.
+static const float OUTLINE_DEPTH_BIAS = 0.0002f;
+static const float OUTLINE_SLOPE_BIAS = 2.0f;
+static IDirect3DBaseTexture9* g_runKitTex = NULL;   // kit sheet bound for the current run (packet 5)
+static const DWORD SUB_REF_SHIFT = 8, SUB_REF_MASK = 0xFF;
+static LONG g_cuLo = -1, g_cuHi = -1;           // body occurrences drawn as custom
+struct CustomSub { UINT first, count, tex, flags; };
+static const int MAX_SUBS = 64, MAX_TEXS = 64;
+struct CustomModel {
+    char name[32];
+    IDirect3DVertexBuffer9* vb; IDirect3DIndexBuffer9* ib;
+    IDirect3DTexture9* tex[MAX_TEXS]; UINT ntex;
+    CustomSub sub[MAX_SUBS]; UINT nsub;
+    UINT nv, ni, stride; DWORD flags; bool tried;
+};
+static const int MAX_MODELS = 24, MAX_PICKS = 24;
+static CustomModel g_models[MAX_MODELS]; static int g_nmodels = 0;
+static LONG g_pickK[MAX_PICKS]; static int g_pickM[MAX_PICKS]; static int g_npicks = 0;
+static int g_curModel = -1;
+static CustomModel* g_cuM = NULL;               // model drawCustom() draws
+static bool g_cuKeepGameTex = false;
+static bool g_cuGK = false;
+static bool g_cuCullCW = false;
+static LONG g_kitRun = 0;              // packet-5 occurrences this frame
+static LONG g_cuDrawn = 0;             // custom LOD0 draws this frame
+static LONG g_runPos = -1;             // draws since the current kit run opened (0 = packet 5), -1 outside
+static bool g_runLog = false;           // flags\runlog: log every run draw of one frame
+static unsigned g_pMask = 0;           // flags\pmask: debug, hide these Part classes on every stock run
+static float g_hipM[3][4];
+static IDirect3DVertexDeclaration9* g_kitDecl = NULL;
+static IDirect3DVertexShader9* g_kitVS = NULL;
+
+static BYTE* readAll(const wchar_t* path, DWORD* size) {
+    HANDLE f = CreateFileW(path, GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, 0, NULL);
+    if (f == INVALID_HANDLE_VALUE) return NULL;
+    *size = GetFileSize(f, NULL);
+    BYTE* b = (BYTE*)HeapAlloc(GetProcessHeap(), 0, *size);
+    DWORD r = 0; ReadFile(f, b, *size, &r, NULL); CloseHandle(f);
+    return b;
+}
+
+// body.tex: u32 magic, w, h, mips, then BGRA8 mips largest first.
+static IDirect3DTexture9* loadTex(IDirect3DDevice9* d, const wchar_t* path) {
+    DWORD n = 0; BYTE* b = readAll(path, &n);
+    if (!b) return NULL;
+    DWORD* hd = (DWORD*)b;
+    IDirect3DTexture9* t = NULL;
+    if (hd[0] == TEX_MAGIC && SUCCEEDED(d->CreateTexture(hd[1], hd[2], hd[3], 0, D3DFMT_A8R8G8B8, D3DPOOL_MANAGED, &t, NULL))) {
+        BYTE* src = b + 16;
+        for (DWORD m = 0; m < hd[3]; m++) {
+            UINT mw = hd[1] >> m, mh = hd[2] >> m; if (!mw) mw = 1; if (!mh) mh = 1;
+            D3DLOCKED_RECT lr;
+            if (SUCCEEDED(t->LockRect(m, &lr, NULL, 0))) {
+                for (UINT y = 0; y < mh; y++) memcpy((BYTE*)lr.pBits + y * lr.Pitch, src + y * mw * 4, mw * 4);
+                t->UnlockRect(m);
+            }
+            src += mw * mh * 4;
+        }
+    }
+    HeapFree(GetProcessHeap(), 0, b);
+    return t;
+}
+
+// flags\picks: one "k name" per line; name = folder under dllprobe\custom\.
+static void readPicks() {
+    wchar_t p[MAX_PATH]; lstrcpyW(p, FLAGDIR); lstrcatW(p, L"picks");
+    g_npicks = 0;
+    HANDLE f = CreateFileW(p, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE, NULL, OPEN_EXISTING, 0, NULL);
+    if (f == INVALID_HANDLE_VALUE) return;
+    char b[1024] = {0}; DWORD r = 0; ReadFile(f, b, 1023, &r, NULL); CloseHandle(f);
+    char* line = b;
+    while (*line && g_npicks < MAX_PICKS) {
+        char* e = line; while (*e && *e != '\n' && *e != '\r') e++;
+        char save = *e; *e = 0;
+        LONG k = 0; char* q = line; bool any = false;
+        while (*q >= '0' && *q <= '9') { k = k * 10 + (*q - '0'); q++; any = true; }
+        while (*q == ' ') q++;
+        if (any && *q) {
+            int m = -1;
+            for (int i = 0; i < g_nmodels; i++) if (!lstrcmpA(g_models[i].name, q)) m = i;
+            if (m < 0 && g_nmodels < MAX_MODELS) { m = g_nmodels++; memset(&g_models[m], 0, sizeof(CustomModel)); lstrcpynA(g_models[m].name, q, 32); }
+            if (m >= 0) { g_pickK[g_npicks] = k; g_pickM[g_npicks] = m; g_npicks++; }
+        }
+        *e = save; line = e; while (*line == '\n' || *line == '\r') line++;
+    }
+}
+// ---- player identity: fserv serves each custom player (GDB map.txt, keyed by
+// player id) a face.bin stamped by tools/mark_face.py; the game builds it into
+// the face atlas drawn right before his kit, where the PGB tag is searched.
+static const UINT FACE_NV = 1478, FACE_STRIDE = 76;   // shared head mesh (24-09)
+static const UINT FACE_MAX_NV = 4000;                  // head/hair draws are below this (25-09: 1478 face, 1780 hair)
+static const UINT MARKER_SEARCH_LEVELS = 5;            // smallest atlas mips searched
+static const int MAX_TEXCACHE = 256;
+static DWORD g_tcTex[MAX_TEXCACHE]; static int g_tcMark[MAX_TEXCACHE]; static int g_ntc = 0;
+static int g_pendingModel = -1;                         // set by a marked face draw
+static int findMarker(IDirect3DBaseTexture9* bt) {
+    if (!bt) return -1;
+    for (int i = 0; i < g_ntc; i++) if (g_tcTex[i] == (DWORD)bt) return g_tcMark[i];
+    int mark = -1;
+    if (bt->GetType() == D3DRTYPE_TEXTURE) {
+        IDirect3DTexture9* t = (IDirect3DTexture9*)bt;
+        DWORD lv = t->GetLevelCount();
+        for (DWORD l = (lv > MARKER_SEARCH_LEVELS ? lv - MARKER_SEARCH_LEVELS : 0); l < lv && mark < 0; l++) {
+            D3DSURFACE_DESC sd; t->GetLevelDesc(l, &sd);
+            UINT bytes = ((sd.Width + 3) / 4) * ((sd.Height + 3) / 4) * 16;
+            D3DLOCKED_RECT lr;
+            if (FAILED(t->LockRect(l, &lr, NULL, D3DLOCK_READONLY))) continue;
+            BYTE* b = (BYTE*)lr.pBits;
+            UINT rows = (sd.Height + 3) / 4, rowBytes = ((sd.Width + 3) / 4) * 16;
+            for (UINT r = 0; r < rows && mark < 0; r++)
+                for (UINT i = 0; i + 5 <= rowBytes; i++) {
+                    BYTE* q = b + r * lr.Pitch + i;
+                    if (q[0] == 'P' && q[1] == 'G' && q[2] == 'B' && (BYTE)(q[3] + q[4]) == 255) { mark = q[3]; break; }
+                }
+            t->UnlockRect(l);
+            (void)bytes;
+        }
+    }
+    if (g_ntc < MAX_TEXCACHE) { g_tcTex[g_ntc] = (DWORD)bt; g_tcMark[g_ntc] = mark; g_ntc++; }
+    if (mark >= 0) { char m[80]; wsprintfA(m, "marker %d on face tex %08x", mark, (DWORD)bt); logline(m); }
+    return mark;
+}
+// ---- team kits: kserv cannot serve the 4cc DLC teams (ids 701+ are not in
+// its team table and selecting one crashes, 26-09), so drawlogic writes the
+// team's PES2012-layout kit sheet (tools/pes15_kits.py -> custom\kits\<tid>\
+// <slot>.tex) straight into the kit texture the game bound for the run. The
+// game loads the DLC's placeholder sheet for every 4cc team; which of its
+// strips it loaded says which of the team's kits to write.
+static const UINT KIT_W = 1024, KIT_H = 512;               // A8R8G8B8, 11 levels (26-09)
+static const DWORD KIT_HASH_LEVEL_FROM_END = 3;            // 4x2 level: cheap, still distinct
+struct KitSlot { DWORD hash; const wchar_t* slot; };
+// placeholder strip -> team kit folder name. MEASURED: 1st player strip,
+// both teams at kick-off 26-09. The 2nd and GK strips are not measured yet:
+// their hashes log as "kit: unknown strip" and are left as the game drew them.
+static const KitSlot KIT_SLOTS[] = { { 0x2552e187u, L"pa" } };
+static DWORD kitHash(IDirect3DTexture9* t) {
+    DWORD lv = t->GetLevelCount(), l = lv > KIT_HASH_LEVEL_FROM_END ? lv - KIT_HASH_LEVEL_FROM_END : 0, h = 2166136261u;
+    D3DSURFACE_DESC sd; t->GetLevelDesc(l, &sd);
+    D3DLOCKED_RECT lr;
+    if (SUCCEEDED(t->LockRect(l, &lr, NULL, D3DLOCK_READONLY))) {
+        for (UINT y = 0; y < sd.Height; y++)
+            for (UINT i = 0; i < sd.Width * 4; i++) h = (h ^ ((BYTE*)lr.pBits)[y * lr.Pitch + i]) * 16777619u;
+        t->UnlockRect(l);
+    }
+    return h;
+}
+static const int MAX_KITCACHE = 64;
+static DWORD g_kcTex[MAX_KITCACHE], g_kcHash[MAX_KITCACHE]; static int g_nkc = 0;
+static void patchKit(int tid, IDirect3DBaseTexture9* bt) {
+    if (tid <= 0 || !bt || bt->GetType() != D3DRTYPE_TEXTURE) return;
+    IDirect3DTexture9* t = (IDirect3DTexture9*)bt;
+    D3DSURFACE_DESC sd; t->GetLevelDesc(0, &sd);
+    if (sd.Width != KIT_W || sd.Height != KIT_H || sd.Format != D3DFMT_A8R8G8B8) {
+        static DWORD warned[16]; static int nw = 0; bool seen = false;
+        for (int i = 0; i < nw; i++) seen |= warned[i] == (DWORD)t;
+        if (!seen && nw < 16) { warned[nw++] = (DWORD)t; char m[128]; wsprintfA(m, "kit: team %d sheet %08x is %ux%u fmt %08x, not patchable", tid, (DWORD)t, sd.Width, sd.Height, (DWORD)sd.Format); logline(m); }
+        return;
+    }
+    DWORD h = kitHash(t);
+    for (int i = 0; i < g_nkc; i++) if (g_kcTex[i] == (DWORD)t && g_kcHash[i] == h) return;   // ours already
+    const wchar_t* slot = NULL;
+    for (UINT i = 0; i < sizeof(KIT_SLOTS) / sizeof(KIT_SLOTS[0]); i++) if (KIT_SLOTS[i].hash == h) slot = KIT_SLOTS[i].slot;
+    if (!slot) {
+        static DWORD warned[16]; static int nw = 0; bool seen = false;
+        for (int i = 0; i < nw; i++) seen |= warned[i] == h;
+        if (!seen && nw < 16) { warned[nw++] = h; char m[96]; wsprintfA(m, "kit: unknown strip hash %08x (team %d)", h, tid); logline(m); }
+        return;
+    }
+    wchar_t path[MAX_PATH]; wsprintfW(path, L"%s%d\\%s.tex", KIT_DIR, tid, slot);
+    DWORD n = 0; BYTE* b = readAll(path, &n);
+    if (!b) return;
+    DWORD* hd = (DWORD*)b;
+    if (hd[0] == TEX_MAGIC && hd[1] == KIT_W && hd[2] == KIT_H) {
+        BYTE* src = b + 16;
+        DWORD lv = t->GetLevelCount() < hd[3] ? t->GetLevelCount() : hd[3];
+        for (DWORD m = 0; m < lv; m++) {
+            UINT mw = KIT_W >> m, mh = KIT_H >> m; if (!mw) mw = 1; if (!mh) mh = 1;
+            D3DLOCKED_RECT lr;
+            if (SUCCEEDED(t->LockRect(m, &lr, NULL, 0))) {
+                for (UINT y = 0; y < mh; y++) memcpy((BYTE*)lr.pBits + y * lr.Pitch, src + y * mw * 4, mw * 4);
+                t->UnlockRect(m);
+            }
+            src += mw * mh * 4;
+        }
+        DWORD after = kitHash(t);
+        int k = -1;
+        for (int i = 0; i < g_nkc; i++) if (g_kcTex[i] == (DWORD)t) k = i;
+        if (k < 0 && g_nkc < MAX_KITCACHE) k = g_nkc++;
+        if (k >= 0) { g_kcTex[k] = (DWORD)t; g_kcHash[k] = after; }
+        char m[128]; wsprintfA(m, "kit: team %d %S -> tex %08x", tid, slot, (DWORD)t); logline(m);
+    }
+    HeapFree(GetProcessHeap(), 0, b);
+}
+// custom model name p<(2000 + tid) * 100 + n> (tools/pes12_import_team.py)
+static const int PLACEHOLDER_TEAM_BASE = 2000, PLAYERS_PER_TEAM = 100;
+static int modelTeam(const CustomModel& M) {
+    int v = 0; const char* q = M.name + 1;
+    if (M.name[0] != 'p') return 0;
+    while (*q >= '0' && *q <= '9') v = v * 10 + (*q++ - '0');
+    return v / PLAYERS_PER_TEAM - PLACEHOLDER_TEAM_BASE;
+}
+
+// ---- identity outside the colour pass. A frame draws every player four
+// times (26-09 grab): depth pre-pass (cutscene depth of field reads it),
+// two shadow passes, colour pass last. Only the colour pass's skin draw
+// samples the per-player face atlas carrying the marker, so without this the
+// depth pass drew every custom player as the stock body and the DoF focused
+// on the stock head (box heads blurred round a sharp head-sized disk). The
+// depth and colour passes upload identical bone matrices, so a player's key
+// is his palette slot 0 translation at the skin draw: the colour pass records
+// key -> model, the next frame's depth pass looks it up.
+static const int MAX_KEYS = 64;
+static const float KEY_MATCH_DIST = 0.25f;      // metres moved per frame, well above a sprint (~0.15)
+struct PlayerKey { float p[3]; int model; };
+static PlayerKey g_keyCur[MAX_KEYS], g_keyPrev[MAX_KEYS]; static int g_nKeyCur = 0, g_nKeyPrev = 0;
+static void runKey(float out[3]) { for (int c = 0; c < 3; c++) out[c] = g_vsc[BONE_REG0 + c][3]; }
+static int modelForKey(const float k[3]) {
+    int best = -1; float bd = KEY_MATCH_DIST * KEY_MATCH_DIST;
+    for (int i = 0; i < g_nKeyPrev; i++) {
+        float d = 0; for (int c = 0; c < 3; c++) { float e = g_keyPrev[i].p[c] - k[c]; d += e * e; }
+        if (d < bd) { bd = d; best = g_keyPrev[i].model; }
+    }
+    return best;
+}
+
+static int modelForMarker(int mk) {
+    for (int i = 0; i < g_npicks; i++) if (g_pickK[i] == mk) return g_pickM[i];
+    return -1;
+}
+static void releaseModel(CustomModel& M) {
+    if (M.vb) M.vb->Release(); if (M.ib) M.ib->Release();
+    for (UINT i = 0; i < M.ntex; i++) if (M.tex[i]) M.tex[i]->Release();
+    M.vb = NULL; M.ib = NULL; M.ntex = 0;
+}
+// dllprobe\custom\<name>\mode: first word head|body|kit|boots, else -1
+static int readModeFile(const wchar_t* dir) {
+    wchar_t p[MAX_PATH]; lstrcpyW(p, dir); lstrcatW(p, L"mode");
+    HANDLE f = CreateFileW(p, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE, NULL, OPEN_EXISTING, 0, NULL);
+    if (f == INVALID_HANDLE_VALUE) return -1;
+    char b[16] = {0}; DWORD r = 0; ReadFile(f, b, 15, &r, NULL); CloseHandle(f);
+    for (DWORD i = 0; i < r; i++) b[i] |= 0x20;   // lower case
+    static const char* NAMES[MODE_COUNT] = { "body", "head", "kit", "boots" };
+    for (int m = 0; m < MODE_COUNT; m++) {
+        int n = lstrlenA(NAMES[m]);
+        if (!memcmp(b, NAMES[m], n)) return m;
+    }
+    return -1;
+}
+// dir: folder holding body.bin (+ body.tex | body_<k>.tex)
+static bool loadModel(IDirect3DDevice9* d, CustomModel& M, const wchar_t* dir) {
+    wchar_t path[MAX_PATH]; lstrcpyW(path, dir); lstrcatW(path, L"body.bin");
+    DWORD n = 0; BYTE* b = readAll(path, &n);
+    if (!b) { logline("custom: no body.bin"); return false; }
+    DWORD* hd = (DWORD*)b;
+    bool v2 = hd[0] == CUSTOM2_MAGIC;
+    if (hd[0] != CUSTOM_MAGIC && !v2) { logline("custom: bad header"); HeapFree(GetProcessHeap(), 0, b); return false; }
+    M.nv = hd[1]; M.ni = hd[2]; M.stride = hd[3];
+    BYTE* at = b + 16;
+    if (v2) {
+        M.nsub = hd[4] < (DWORD)MAX_SUBS ? hd[4] : MAX_SUBS; M.flags = hd[5];
+        memcpy(M.sub, b + 24, M.nsub * sizeof(CustomSub));
+        at = b + 24 + hd[4] * sizeof(CustomSub);
+    } else {
+        M.nsub = 1; M.flags = 0; M.sub[0].first = 0; M.sub[0].count = M.ni; M.sub[0].tex = 0; M.sub[0].flags = 0;
+    }
+    { int o = readModeFile(dir); if (o >= 0) M.flags = (DWORD)o; }
+    if (M.flags >= (DWORD)MODE_COUNT) M.flags = MODE_BODY;
+    UINT isz = v2 ? 4 : 2, vlen = M.nv * M.stride, ilen = M.ni * isz;
+    void* p = NULL;
+    bool ok = SUCCEEDED(d->CreateVertexBuffer(vlen, D3DUSAGE_WRITEONLY, 0, D3DPOOL_MANAGED, &M.vb, NULL))
+           && SUCCEEDED(d->CreateIndexBuffer(ilen, D3DUSAGE_WRITEONLY, v2 ? D3DFMT_INDEX32 : D3DFMT_INDEX16, D3DPOOL_MANAGED, &M.ib, NULL));
+    if (ok && SUCCEEDED(M.vb->Lock(0, vlen, &p, 0))) { memcpy(p, at, vlen); M.vb->Unlock(); }
+    if (ok && SUCCEEDED(M.ib->Lock(0, ilen, &p, 0))) { memcpy(p, at + vlen, ilen); M.ib->Unlock(); }
+    HeapFree(GetProcessHeap(), 0, b);
+    M.ntex = 0;
+    for (UINT i = 0; i < M.nsub; i++) if (M.sub[i].tex + 1 > M.ntex) M.ntex = M.sub[i].tex + 1;
+    if (M.ntex > (UINT)MAX_TEXS) M.ntex = MAX_TEXS;
+    for (UINT k = 0; k < M.ntex; k++) {
+        lstrcpyW(path, dir);
+        if (v2) { wchar_t f[32]; wsprintfW(f, L"body_%u.tex", k); lstrcatW(path, f); } else lstrcatW(path, L"body.tex");
+        M.tex[k] = loadTex(d, path);
+    }
+    char m[160]; wsprintfA(m, "custom %s: ok=%d nv=%u ni=%u subs=%u texs=%u mode=%u", M.name, (int)ok, M.nv, M.ni, M.nsub, M.ntex, M.flags); logline(m);
+    if (!ok) releaseModel(M);
+    return ok;
+}
+// select model m: load on first use
+static bool useModel(IDirect3DDevice9* d, int m) {
+    if (m < 0) return false;
+    CustomModel& M = g_models[m];
+    if (!M.vb && !M.tried) {
+        M.tried = true;
+        wchar_t dir[MAX_PATH]; wsprintfW(dir, L"%s%S\\", CUSTOM_DIR, M.name);
+        loadModel(d, M, dir);
+    }
+    if (!M.vb) return false;
+    g_cuM = &M;
+    return true;
+}
+
+static CustomModel g_default;
+static bool loadCustom(IDirect3DDevice9* d) {
+    if (!g_default.vb && !g_default.tried) { g_default.tried = true; lstrcpyA(g_default.name, "default"); loadModel(d, g_default, CUSTOM_DIR); }
+    if (!g_default.vb) return false;
+    g_cuM = &g_default;
+    return true;
+}
+
+static HRESULT drawCustom(IDirect3DDevice9* d, bool faceOnly = false);
+
+static const UINT FACE_PRINT_BYTES = 32;        // vertex bytes fingerprinting a face draw
+static IDirect3DBaseTexture9* g_prevTex = NULL;
+static IDirect3DVertexBuffer9* g_prevVB = NULL; static UINT g_prevOff = 0, g_prevStride = 0, g_prevFirst = 0, g_prevNV = 0;
+static int g_facelog = 0;
+static HRESULT drawCustomLod0(IDirect3DDevice9* d) {
+    float c[CU_SLOTS * BONE_REGS][4];
+    for (UINT k = 0; k < CU_SLOTS; k++)
+        for (UINT r = 0; r < BONE_REGS; r++)
+            memcpy(c[k * BONE_REGS + r], CU_SRC_PKT[k] == 0 ? g_hipM[r] : g_vsc[BONE_REG0 + CU_SRC_SLOT[k] * BONE_REGS + r], 16);
+    if (flagExists(L"dumpc")) {
+        wchar_t p[MAX_PATH]; lstrcpyW(p, FLAGDIR); lstrcatW(p, L"dumpc"); DeleteFileW(p);
+        wchar_t up[MAX_PATH]; HANDLE f = CreateFileW(rootFile(up, L"uploaded.bin"), GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, 0, NULL);
+        DWORD w; WriteFile(f, c, sizeof(c), &w, NULL); WriteFile(f, g_vsc, sizeof(g_vsc), &w, NULL); WriteFile(f, g_hipM, sizeof(g_hipM), &w, NULL); CloseHandle(f);
+    }
+    float keep[CU_SLOTS * BONE_REGS][4];
+    memcpy(keep, g_vsc[BONE_REG0], sizeof(keep));
+    IDirect3DVertexDeclaration9* keepDecl = NULL; IDirect3DVertexShader9* keepVS = NULL;
+    d->GetVertexDeclaration(&keepDecl); d->GetVertexShader(&keepVS);
+    d->SetVertexDeclaration(g_kitDecl); d->SetVertexShader(g_kitVS);
+    g_orgSVSCF(d, BONE_REG0, &c[0][0], CU_SLOTS * BONE_REGS);
+    HRESULT hr = drawCustom(d);
+    g_orgSVSCF(d, BONE_REG0, &keep[0][0], CU_SLOTS * BONE_REGS);
+    d->SetVertexDeclaration(keepDecl); d->SetVertexShader(keepVS);
+    if (keepDecl) keepDecl->Release(); if (keepVS) keepVS->Release();
+    return hr;
+}
+
+static HRESULT drawCustom(IDirect3DDevice9* d, bool faceOnly) {
+    CustomModel& M = *g_cuM;
+    IDirect3DVertexBuffer9* keepVB = g_vb; UINT keepOff = g_vbOff, keepSt = g_stride;
+    IDirect3DIndexBuffer9* keepIB = g_ib;
+    IDirect3DBaseTexture9* keepTex = g_tex0;
+    DWORD cull = 0, at = 0, aref = 0, afn = 0, ab = 0, sb = 0, db = 0, zw = 0;
+    d->GetRenderState(D3DRS_CULLMODE, &cull);
+    d->GetRenderState(D3DRS_ALPHATESTENABLE, &at); d->GetRenderState(D3DRS_ALPHAREF, &aref); d->GetRenderState(D3DRS_ALPHAFUNC, &afn);
+    d->GetRenderState(D3DRS_ALPHABLENDENABLE, &ab); d->GetRenderState(D3DRS_SRCBLEND, &sb); d->GetRenderState(D3DRS_DESTBLEND, &db);
+    d->GetRenderState(D3DRS_ZWRITEENABLE, &zw);
+    DWORD dbias = 0, sbias = 0;
+    d->GetRenderState(D3DRS_DEPTHBIAS, &dbias); d->GetRenderState(D3DRS_SLOPESCALEDEPTHBIAS, &sbias);
+    g_orgSSS(d, 0, M.vb, 0, M.stride);
+    g_orgSI(d, M.ib);
+    // 4cc toon models carry an inverted-hull outline shell (black, inflated);
+    // it only reads as an outline with back faces culled. Fox winds
+    // clockwise-front = D3D's native, so cull CCW (flags\\cullcw flips it).
+    DWORD culled = g_cuCullCW ? D3DCULL_CW : D3DCULL_CCW;
+    // fmdl UVs run past 0..1 (Caulifla: u -3..2.5): PES21 samples them wrapped.
+    DWORD au = 0, av = 0;
+    d->GetSamplerState(0, D3DSAMP_ADDRESSU, &au); d->GetSamplerState(0, D3DSAMP_ADDRESSV, &av);
+    if (!g_cuKeepGameTex) { d->SetSamplerState(0, D3DSAMP_ADDRESSU, D3DTADDRESS_WRAP); d->SetSamplerState(0, D3DSAMP_ADDRESSV, D3DTADDRESS_WRAP); }
+    HRESULT hr = D3D_OK;
+    for (UINT i = 0; i < M.nsub; i++) {
+        const CustomSub& S = M.sub[i];
+        // face subs are head-local on the face palette: only at the face draw
+        if (((S.flags & SUB_FACE) != 0) != faceOnly) continue;
+        if (!g_cuKeepGameTex && S.tex < M.ntex && M.tex[S.tex]) g_orgSTEX(d, 0, M.tex[S.tex]);
+        // kit slot: the sheet this player is wearing (its UVs are on PES2012's layout)
+        if ((S.flags & SUB_KIT) && g_runKitTex) g_orgSTEX(d, 0, g_runKitTex);
+        // the material's own states (PES15 .mtl), never the kit draw's leftovers
+        bool atest = (S.flags & SUB_ALPHATEST) != 0, blend = (S.flags & SUB_BLEND) != 0;
+        g_orgRS(d, D3DRS_ALPHATESTENABLE, atest);
+        if (atest) { g_orgRS(d, D3DRS_ALPHAREF, (S.flags >> SUB_REF_SHIFT) & SUB_REF_MASK); g_orgRS(d, D3DRS_ALPHAFUNC, D3DCMP_GREATER); }
+        g_orgRS(d, D3DRS_ALPHABLENDENABLE, blend);
+        if (blend) { g_orgRS(d, D3DRS_SRCBLEND, D3DBLEND_SRCALPHA); g_orgRS(d, D3DRS_DESTBLEND, D3DBLEND_INVSRCALPHA); }
+        g_orgRS(d, D3DRS_ZWRITEENABLE, (S.flags & SUB_NOZWRITE) ? FALSE : TRUE);
+        g_orgRS(d, D3DRS_CULLMODE, (S.flags & SUB_TWOSIDED) ? D3DCULL_NONE : culled);
+        bool outline = (S.flags & SUB_OUTLINE) != 0;
+        float bias = outline ? OUTLINE_DEPTH_BIAS : 0.0f, slope = outline ? OUTLINE_SLOPE_BIAS : 0.0f;
+        g_orgRS(d, D3DRS_DEPTHBIAS, *(DWORD*)&bias); g_orgRS(d, D3DRS_SLOPESCALEDEPTHBIAS, *(DWORD*)&slope);
+        hr = g_orgDIP(d, D3DPT_TRIANGLELIST, 0, 0, M.nv, S.first, S.count / 3);
+    }
+    g_orgRS(d, D3DRS_ALPHABLENDENABLE, ab); g_orgRS(d, D3DRS_SRCBLEND, sb); g_orgRS(d, D3DRS_DESTBLEND, db);
+    g_orgRS(d, D3DRS_ZWRITEENABLE, zw);
+    g_orgRS(d, D3DRS_DEPTHBIAS, dbias); g_orgRS(d, D3DRS_SLOPESCALEDEPTHBIAS, sbias);
+    g_orgRS(d, D3DRS_ALPHATESTENABLE, at); g_orgRS(d, D3DRS_ALPHAREF, aref); g_orgRS(d, D3DRS_ALPHAFUNC, afn);
+    d->SetSamplerState(0, D3DSAMP_ADDRESSU, au); d->SetSamplerState(0, D3DSAMP_ADDRESSV, av);
+    g_orgRS(d, D3DRS_CULLMODE, cull);
+    g_orgSTEX(d, 0, keepTex);
+    g_orgSI(d, keepIB);
+    g_orgSSS(d, 0, keepVB, keepOff, keepSt);
+    return hr;
+}
+
+
+// Part of a run draw, from its vertex bounds; cached per vertex range (the
+// kit model's buffers are static, so one lock per piece per session).
+static const int MAX_PARTCACHE = 1024;
+struct PartKey { void* vb; UINT off, first, nv, stride; };
+static PartKey g_pcKey[MAX_PARTCACHE]; static BYTE g_pcPart[MAX_PARTCACHE]; static int g_npc = 0;
+static int classifyPart(UINT first, UINT nV) {
+    for (int i = 0; i < g_npc; i++) {
+        const PartKey& k = g_pcKey[i];
+        if (k.vb == g_vb && k.off == g_vbOff && k.first == first && k.nv == nV && k.stride == g_stride) return g_pcPart[i];
+    }
+    int part = PART_OTHER;
+    void* p = NULL;
+    if (g_vb && g_stride >= 12 && SUCCEEDED(g_vb->Lock(g_vbOff + first * g_stride, nV * g_stride, &p, D3DLOCK_READONLY)) && p) {
+        float lo[3] = {1e9f, 1e9f, 1e9f}, hi[3] = {-1e9f, -1e9f, -1e9f};
+        for (UINT v = 0; v < nV; v++) {
+            const float* q = (const float*)((BYTE*)p + v * g_stride);
+            for (int c = 0; c < 3; c++) { if (q[c] < lo[c]) lo[c] = q[c]; if (q[c] > hi[c]) hi[c] = q[c]; }
+        }
+        g_vb->Unlock();
+        float ax = hi[0] > -lo[0] ? hi[0] : -lo[0];
+        if (hi[0] - lo[0] > NONPLAYER_MIN_EXTENT || hi[1] - lo[1] > NONPLAYER_MIN_EXTENT) part = PART_OTHER;
+        else if (hi[1] < LOCAL_SPACE_MAX_Y)
+            part = (hi[1] < BOOT_MAX_Y && hi[0] - lo[0] > BOOT_MIN_WIDTH && lo[0] * hi[0] >= 0) ? PART_BOOTS : PART_HEAD;
+        else if (hi[1] < SOCKS_MAX_Y) part = PART_SOCKS;
+        else if (hi[1] < SHORTS_MAX_Y) part = PART_SHORTS;
+        else if (ax > GLOVES_MIN_X && g_stride != 80) part = PART_GLOVES;
+        else if (ax > TORSO_MAX_X) part = PART_SLEEVES;
+        else if (hi[1] > NECK_MIN_Y) part = PART_NECK;
+        else part = PART_SHIRT;
+    }
+    if (g_npc < MAX_PARTCACHE) {
+        PartKey k = { g_vb, g_vbOff, first, nV, g_stride };
+        g_pcKey[g_npc] = k; g_pcPart[g_npc] = (BYTE)part; g_npc++;
+        char m[96]; wsprintfA(m, "part %u/%u -> %d", nV, g_stride, part); logline(m);
+    }
+    return part;
+}
+
+// A custom model's face part at the stock face draw: the game has just
+// uploaded the face palette (head-local bind -> world), which the part's
+// vertices are weighted to (tools/pes15_to_pes12.py SUB_FACE).
+static HRESULT drawCustomFace(IDirect3DDevice9* d) {
+    IDirect3DVertexDeclaration9* keepDecl = NULL; IDirect3DVertexShader9* keepVS = NULL;
+    d->GetVertexDeclaration(&keepDecl); d->GetVertexShader(&keepVS);
+    d->SetVertexDeclaration(g_kitDecl); d->SetVertexShader(g_kitVS);
+    HRESULT hr = drawCustom(d, true);
+    d->SetVertexDeclaration(keepDecl); d->SetVertexShader(keepVS);
+    if (keepDecl) keepDecl->Release(); if (keepVS) keepVS->Release();
+    return hr;
+}
+
+static void hookV(void** vt, int idx, void* fn, void** org) {
+    DWORD prot;
+    if (VirtualProtect(&vt[idx], 4, PAGE_EXECUTE_READWRITE, &prot)) {
+        if (org && !*org) *org = (void*)vt[idx];
+        vt[idx] = fn;
+        VirtualProtect(&vt[idx], 4, prot, &prot);
+    }
+}
+
+static HRESULT STDMETHODCALLTYPE mySSS(IDirect3DDevice9* d, UINT s,
+        IDirect3DVertexBuffer9* vb, UINT off, UINT st) {
+    if (s == 0) { g_vb = vb; g_stride = st; g_vbOff = off; }
+    return g_orgSSS(d, s, vb, off, st);
+}
+static HRESULT STDMETHODCALLTYPE mySVD(IDirect3DDevice9* d, IDirect3DVertexDeclaration9* p) {
+    g_decl = p;
+    return g_orgSVD(d, p);
+}
+static HRESULT STDMETHODCALLTYPE mySFVF(IDirect3DDevice9* d, DWORD f) {
+    g_fvf = f;
+    return g_orgSFVF(d, f);
+}
+static HRESULT STDMETHODCALLTYPE mySI(IDirect3DDevice9* d, IDirect3DIndexBuffer9* ib) {
+    g_ib = ib;
+    return g_orgSI(d, ib);
+}
+static HRESULT STDMETHODCALLTYPE mySTEX(IDirect3DDevice9* d, DWORD s, IDirect3DBaseTexture9* t) {
+    if (s == 0) g_tex0 = t;
+    if (s < 8) g_texStage[s] = t;
+    return g_orgSTEX(d, s, t);
+}
+static HRESULT STDMETHODCALLTYPE mySVSCF(IDirect3DDevice9* d, UINT r, const float* v, UINT n) {
+    if (r < 256) {
+        UINT m = (r + n > 256) ? 256 - r : n;
+        memcpy(g_vsc[r], v, m * 16);
+    }
+    return g_orgSVSCF(d, r, v, n);
+}
+
+static void grabDraw(IDirect3DDevice9* d, D3DPRIMITIVETYPE t, INT bV, UINT mV,
+                     UINT nV, UINT sI, UINT nP) {
+    wchar_t path[MAX_PATH];
+    wsprintfW(path, L"%sgrab\\g%04d.bin", g_root, (int)g_grabSeq++);
+    HANDLE f = CreateFileW(path, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, 0, NULL);
+    if (f == INVALID_HANDLE_VALUE) return;
+    DWORD w;
+    D3DVERTEXELEMENT9 el[64]; UINT ne = 0;
+    if (g_decl) g_decl->GetDeclaration(el, &ne); // ne includes D3DDECL_END
+    D3DINDEXBUFFER_DESC idesc; memset(&idesc, 0, sizeof(idesc));
+    if (g_ib) g_ib->GetDesc(&idesc);
+    UINT isz = (idesc.Format == D3DFMT_INDEX32) ? 4 : 2;
+    UINT nIdx = (t == D3DPT_TRIANGLESTRIP) ? nP + 2 : nP * 3;
+    DWORD hdr[16] = { 0x42415247, (DWORD)t, (DWORD)bV, mV, nV, sI, nP, g_stride,
+                      g_vbOff, isz, nIdx, ne, (DWORD)g_tex0, (DWORD)g_vb, (DWORD)g_ib, 0 };
+    WriteFile(f, hdr, sizeof(hdr), &w, NULL);
+    WriteFile(f, el, ne * sizeof(D3DVERTEXELEMENT9), &w, NULL);
+    WriteFile(f, g_vsc, sizeof(g_vsc), &w, NULL);
+    // vertices: the draw reads [bV+mV, bV+mV+nV) of stream 0
+    DWORD vstatus = 0;
+    if (g_vb) {
+        void* p = NULL;
+        UINT off = g_vbOff + (bV + mV) * g_stride, len = nV * g_stride;
+        if (SUCCEEDED(g_vb->Lock(off, len, &p, D3DLOCK_READONLY)) && p) {
+            WriteFile(f, p, len, &w, NULL); vstatus = 1;
+            g_vb->Unlock();
+        }
+    }
+    DWORD istatus = 0;
+    if (g_ib) {
+        void* p = NULL;
+        if (SUCCEEDED(g_ib->Lock(sI * isz, nIdx * isz, &p, D3DLOCK_READONLY)) && p) {
+            WriteFile(f, p, nIdx * isz, &w, NULL); istatus = 1;
+            g_ib->Unlock();
+        }
+    }
+    DWORD tail[2] = { vstatus, istatus };
+    WriteFile(f, tail, 8, &w, NULL);
+    CloseHandle(f);
+}
+
+static HRESULT STDMETHODCALLTYPE myDIP(IDirect3DDevice9* d, D3DPRIMITIVETYPE t,
+        INT bV, UINT mV, UINT nV, UINT sI, UINT nP) {
+    if (nV == GROUP_START_NV && nP == GROUP_START_NP && g_stride == GROUP_START_STRIDE) {
+        g_group++; g_groupDraw = 0;
+    } else if (g_group >= 0) {
+        g_groupDraw++;
+        if (g_stride == NONPLAYER_STRIDE || nV >= NONPLAYER_MIN_NV || g_groupDraw >= MAX_GROUP_DRAWS)
+            g_group = -1000; // left the player run until the next start
+    }
+    bool inGroup = g_group >= 0 && g_group < 32;
+    LONG di = g_drawIdx++;
+    if (di >= g_hrLo && di < g_hrHi) return D3D_OK;
+    // previous draw = the face when this one is a kit packet 5
+    static IDirect3DVertexBuffer9* lastVB = NULL; static UINT lastOff = 0, lastSt = 0, lastFirst = 0, lastNV = 0;
+    static IDirect3DBaseTexture9* lastTex = NULL; g_prevTex = lastTex; lastTex = g_tex0;
+    static IDirect3DBaseTexture9* lastStage[8]; memcpy(g_prevStage, lastStage, sizeof(lastStage)); memcpy(lastStage, g_texStage, sizeof(lastStage));
+    g_prevVB = lastVB; g_prevOff = lastOff; g_prevStride = lastSt; g_prevFirst = lastFirst; g_prevNV = lastNV;
+    lastVB = g_vb; lastOff = g_vbOff; lastSt = g_stride; lastFirst = (UINT)(bV + (INT)mV); lastNV = nV;
+    // The skin draw (stride 76: arms, legs, neck; 1478 verts on the stock body,
+    // other counts on edited players) precedes the player's kit run and samples
+    // the face atlas. The marked atlas names the model; its mode says whether
+    // the stock skin stays.
+    if (g_stride == FACE_STRIDE && nV < FACE_MAX_NV) {
+        g_runPos = -1;                  // a skin draw opens the next player
+        if (g_runLog) { char m[96]; wsprintfA(m, "run SKIN %u/%u/%u tex=%08x", nV, nP, g_stride, (DWORD)g_tex0); logline(m); }
+        int mk = findMarker(g_tex0);
+        float key[3]; runKey(key);
+        if (mk >= 0) {
+            g_pendingModel = modelForMarker(mk);
+            if (g_pendingModel >= 0 && g_nKeyCur < MAX_KEYS) {
+                for (int c = 0; c < 3; c++) g_keyCur[g_nKeyCur].p[c] = key[c];
+                g_keyCur[g_nKeyCur++].model = g_pendingModel;
+            }
+        } else if (g_pendingModel < 0) g_pendingModel = modelForKey(key);
+        if (g_pendingModel >= 0 && useModel(d, g_pendingModel) && MODE_HIDES_SKIN[g_cuM->flags]) return D3D_OK;
+    }
+    bool hip = nV == KIT_HIP_NV && nP == KIT_HIP_NP && g_stride == KIT_HIP_STRIDE;
+    if (hip) { g_runPos = 0; g_runKitTex = g_tex0; }
+
+    else if (g_runPos >= 0 && ++g_runPos >= MAX_RUN_DRAWS) g_runPos = -1;
+    if (hip) {
+        LONG k = g_kitRun++;
+        if (g_facelog > 0 && g_prevVB) {
+            g_facelog--;
+            void* p = NULL; char m[200]; int n = wsprintfA(m, "face run=%d nV=%u st=%u ", (int)k, g_prevNV, g_prevStride);
+            if (SUCCEEDED(g_prevVB->Lock(g_prevOff + g_prevFirst * g_prevStride, FACE_PRINT_BYTES, &p, D3DLOCK_READONLY)) && p) {
+                for (UINT i = 0; i < FACE_PRINT_BYTES; i++) n += wsprintfA(m + n, "%02x", ((BYTE*)p)[i]);
+                g_prevVB->Unlock();
+            }
+            logline(m);
+            if (g_prevTex && g_prevTex->GetType() == D3DRTYPE_TEXTURE) {
+                IDirect3DTexture9* t = (IDirect3DTexture9*)g_prevTex;
+                DWORD lv = t->GetLevelCount(); D3DSURFACE_DESC sd; t->GetLevelDesc(lv - 1, &sd);
+                D3DSURFACE_DESC s0; t->GetLevelDesc(0, &s0);
+                D3DLOCKED_RECT lr; HRESULT hr = t->LockRect(lv - 1, &lr, NULL, D3DLOCK_READONLY);
+                n = wsprintfA(m, "  tex=%08x %ux%u fmt=%08x pool=%u levels=%u lock=%08x ", (DWORD)t, s0.Width, s0.Height, (DWORD)s0.Format, (UINT)s0.Pool, lv, (DWORD)hr);
+                if (SUCCEEDED(hr)) { for (int i = 0; i < 16; i++) n += wsprintfA(m + n, "%02x", ((BYTE*)lr.pBits)[i]); t->UnlockRect(lv - 1); }
+                logline(m);
+            }
+            for (int st = 1; st < 8; st++) {
+                IDirect3DBaseTexture9* bt = g_prevStage[st];
+                if (!bt || bt->GetType() != D3DRTYPE_TEXTURE) continue;
+                IDirect3DTexture9* t = (IDirect3DTexture9*)bt; D3DSURFACE_DESC s0; t->GetLevelDesc(0, &s0);
+                n = wsprintfA(m, "  stage%d tex=%08x %ux%u fmt=%08x levels=%u", st, (DWORD)t, s0.Width, s0.Height, (DWORD)s0.Format, t->GetLevelCount());
+                logline(m);
+            }
+        }
+        g_curModel = g_pendingModel; g_pendingModel = -1;
+        if (g_curModel >= 0) {
+            memcpy(g_hipM, g_vsc[BONE_REG0 + CU_SRC_SLOT[2] * BONE_REGS], sizeof(g_hipM));
+            if (g_kitDecl) g_kitDecl->Release(); if (g_kitVS) g_kitVS->Release();
+            d->GetVertexDeclaration(&g_kitDecl); d->GetVertexShader(&g_kitVS);
+            if (useModel(d, g_curModel)) patchKit(modelTeam(*g_cuM), g_tex0);
+        }
+    }
+    int part = PART_OTHER;
+    if (g_runPos >= 0 && (g_curModel >= 0 || g_pMask)) {
+        part = classifyPart((UINT)(bV + (INT)mV), nV);
+        if (part == PART_OTHER && !hip) g_runPos = -1;   // left the player
+    }
+    if (g_runLog) { char m[128]; wsprintfA(m, "run%s m=%d pos=%d %u/%u/%u part=%d tex=%08x", hip ? " HIP" : "", g_curModel, (int)g_runPos, nV, nP, g_stride, part, (DWORD)g_tex0); logline(m); }
+    if (g_runPos >= 0 && g_curModel >= 0 && useModel(d, g_curModel)) {
+        bool main = nV == KIT_MAIN_NV && nP == KIT_MAIN_NP && g_stride == KIT_MAIN_STRIDE;
+        bool hidden = (MODE_PART_HIDE[g_cuM->flags] >> part) & 1;
+        bool faceDraw = (nV == FACE_DRAW_NV_A || nV == FACE_DRAW_NV_B) && g_stride == FACE_DRAW_STRIDE;
+        if (faceDraw && g_kitVS) {
+            if (!hidden) g_orgDIP(d, t, bV, mV, nV, sI, nP);
+            return drawCustomFace(d);
+        }
+        if (main) {
+            g_cuDrawn++;
+            if (!hidden) g_orgDIP(d, t, bV, mV, nV, sI, nP);
+            return drawCustomLod0(d);
+        }
+        return hidden ? D3D_OK : g_orgDIP(d, t, bV, mV, nV, sI, nP);
+    }
+    if (g_runPos >= 0 && ((g_pMask >> part) & 1)) return D3D_OK;
+    if (nV == BODY_NV && nP == BODY_NP && g_stride == BODY_STRIDE) {
+        LONG k = g_bodyDraw++;
+        if (k < 32 && ((g_bodyHide >> k) & 1)) return D3D_OK;
+        if (k >= g_cuLo && k < g_cuHi && loadCustom(d)) return drawCustom(d);
+        if (k >= g_swLo && k < g_swHi && g_vb && buildSwapVB(d)) {
+            IDirect3DVertexBuffer9* keepVB = g_vb; UINT keepOff = g_vbOff, keepSt = g_stride;
+            g_orgSSS(d, 0, g_swapVB, 0, BODY_STRIDE);
+            HRESULT hr = g_orgDIP(d, t, bV, mV, nV, sI, nP);
+            g_orgSSS(d, 0, keepVB, keepOff, keepSt);
+            return hr;
+        }
+    }
+    if (nV == GK_BODY_NV && nP == GK_BODY_NP && g_stride == BODY_STRIDE) {
+        if (g_cuGK && loadCustom(d)) return drawCustom(d);
+    }
+    if ((inGroup && g_grabGroup == g_group) || g_grabAll == 2) grabDraw(d, t, bV, mV, nV, sI, nP);
+    if (inGroup && (g_hideMask >> g_group) & 1) return D3D_OK;
+    if (g_dumpLeft > 0) {
+        LONG i = InterlockedIncrement(&g_n) - 1;
+        if (i < MAXR) {
+            g_recs[i].nV = nV; g_recs[i].nP = nP;
+            g_recs[i].stride = g_stride; g_recs[i].fvf = g_fvf;
+            g_recs[i].tex = (DWORD)g_tex0;
+        }
+    }
+    if (g_wire && nV > 2000 && nV < 60000 && g_stride >= 32) {
+        g_orgRS(d, D3DRS_FILLMODE, D3DFILL_WIREFRAME);
+        HRESULT hr = g_orgDIP(d, t, bV, mV, nV, sI, nP);
+        g_orgRS(d, D3DRS_FILLMODE, D3DFILL_SOLID);
+        return hr;
+    }
+    return g_orgDIP(d, t, bV, mV, nV, sI, nP);
+}
+
+// flags\shot: write the frame about to be presented to dllprobe\shots\frame.bmp
+// (XWayland grabs of an occluded window come back black, 27-09).
+static void captureFrame(IDirect3DDevice9* d) {
+    IDirect3DSurface9* bb = NULL; IDirect3DSurface9* sys = NULL;
+    if (FAILED(d->GetBackBuffer(0, 0, D3DBACKBUFFER_TYPE_MONO, &bb)) || !bb) return;
+    D3DSURFACE_DESC sd; bb->GetDesc(&sd);
+    if (SUCCEEDED(d->CreateOffscreenPlainSurface(sd.Width, sd.Height, sd.Format, D3DPOOL_SYSTEMMEM, &sys, NULL))
+        && SUCCEEDED(d->GetRenderTargetData(bb, sys))) {
+        D3DLOCKED_RECT lr;
+        if (SUCCEEDED(sys->LockRect(&lr, NULL, D3DLOCK_READONLY))) {
+            wchar_t dir[MAX_PATH]; CreateDirectoryW(rootFile(dir, L"shots"), NULL);
+            HANDLE f = CreateFileW(SHOT_PATH, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, 0, NULL);
+            if (f != INVALID_HANDLE_VALUE) {
+                const DWORD BMP_BPP = 4, BMP_HDR = 54, BMP_INFO = 40, BMP_PLANES = 1, BMP_BITS = 32;
+                DWORD img = sd.Width * sd.Height * BMP_BPP, w;
+                BYTE h[54] = {0};
+                h[0] = 'B'; h[1] = 'M'; *(DWORD*)(h + 2) = BMP_HDR + img; *(DWORD*)(h + 10) = BMP_HDR;
+                *(DWORD*)(h + 14) = BMP_INFO; *(LONG*)(h + 18) = sd.Width; *(LONG*)(h + 22) = -(LONG)sd.Height;
+                *(WORD*)(h + 26) = BMP_PLANES; *(WORD*)(h + 28) = BMP_BITS; *(DWORD*)(h + 34) = img;
+                WriteFile(f, h, BMP_HDR, &w, NULL);
+                for (UINT y = 0; y < sd.Height; y++) WriteFile(f, (BYTE*)lr.pBits + y * lr.Pitch, sd.Width * BMP_BPP, &w, NULL);
+                CloseHandle(f);
+            }
+            sys->UnlockRect();
+        }
+    }
+    if (sys) sys->Release();
+    bb->Release();
+}
+
+extern "C" __declspec(dllexport) void logic_present(IDirect3DDevice9* d) {
+    if (flagExists(L"shot")) { wchar_t p[MAX_PATH]; lstrcpyW(p, FLAGDIR); lstrcatW(p, L"shot"); DeleteFileW(p); captureFrame(d); }
+    LONG f = InterlockedIncrement(&g_frame);
+    static LONG dumpStart = 0;
+    if (g_grabAll == 2) { g_grabAll = 0; char m[64]; wsprintfA(m, "frame %d grabbed all: %d draws", (int)f, (int)g_grabSeq); logline(m); }
+    if (g_grabAll == 1) g_grabAll = 2;  // arm for the next full frame
+    if (g_grabGroup >= 0) {  // grab covers exactly one frame
+        char m[64]; wsprintfA(m, "frame %d grabbed group %d: %d draws", (int)f, (int)g_grabGroup, (int)g_grabSeq);
+        logline(m);
+        g_grabGroup = -1;
+    }
+    g_group = -1;
+    LONG bodiesLastFrame = g_bodyDraw;
+    g_bodyDraw = 0;
+    g_drawIdx = 0;
+    { static LONG lr = -1, lc = -1; if (g_kitRun != lr || g_cuDrawn != lc) { char m[96]; wsprintfA(m, "kit runs/frame=%d custom drawn=%d ", (int)g_kitRun, (int)g_cuDrawn); logline(m); lr = g_kitRun; lc = g_cuDrawn; } }
+    if (g_runLog && f % 60 != 0) g_runLog = false;
+    g_kitRun = 0; g_cuDrawn = 0; g_runPos = -1;
+    memcpy(g_keyPrev, g_keyCur, sizeof(g_keyCur)); g_nKeyPrev = g_nKeyCur; g_nKeyCur = 0;
+    if (f % 60 == 0) {
+        g_hideMask = readFlagInt(L"hide", 0);
+        g_bodyHide = readFlagInt(L"bodyhide", 0);
+        g_pMask = readFlagInt(L"pmask", 0);
+        g_runLog = flagExists(L"runlog");
+        if (g_runLog) { wchar_t p[MAX_PATH]; lstrcpyW(p, FLAGDIR); lstrcatW(p, L"runlog"); DeleteFileW(p); }
+        readRange(L"hr", &g_hrLo, &g_hrHi);
+        readRange(L"swap", &g_swLo, &g_swHi);
+        readRange(L"custom", &g_cuLo, &g_cuHi);
+        g_cuKeepGameTex = flagExists(L"gametex");
+        g_cuGK = flagExists(L"customgk");
+        g_cuCullCW = flagExists(L"cullcw");
+        readPicks();
+        if (flagExists(L"codedump")) {   // flags\codedump: "hexaddr hexlen" -> dllprobe\codedump.bin
+            wchar_t p[MAX_PATH]; lstrcpyW(p, FLAGDIR); lstrcatW(p, L"codedump");
+            HANDLE f = CreateFileW(p, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE, NULL, OPEN_EXISTING, 0, NULL);
+            char b[64] = {0}; DWORD r = 0; if (f != INVALID_HANDLE_VALUE) { ReadFile(f, b, 63, &r, NULL); CloseHandle(f); }
+            DeleteFileW(p);
+            DWORD addr = 0, len = 0; char* q = b;
+            while (*q && *q != ' ') { char c = *q++; addr = addr * 16 + (c <= '9' ? c - '0' : (c | 32) - 'a' + 10); }
+            while (*q == ' ') q++;
+            while (*q && *q != '\n' && *q != '\r') { char c = *q++; len = len * 16 + (c <= '9' ? c - '0' : (c | 32) - 'a' + 10); }
+            wchar_t cd[MAX_PATH]; HANDLE o = CreateFileW(rootFile(cd, L"codedump.bin"), GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, 0, NULL);
+            MEMORY_BASIC_INFORMATION mbi; DWORD w = 0;
+            if (o != INVALID_HANDLE_VALUE && VirtualQuery((void*)addr, &mbi, sizeof(mbi)) && mbi.State == MEM_COMMIT) WriteFile(o, (void*)addr, len, &w, NULL);
+            if (o != INVALID_HANDLE_VALUE) CloseHandle(o);
+            char m[80]; wsprintfA(m, "codedump %08x +%x -> %u bytes", addr, len, w); logline(m);
+        }
+        if (flagExists(L"facelog")) { wchar_t p[MAX_PATH]; lstrcpyW(p, FLAGDIR); lstrcatW(p, L"facelog"); DeleteFileW(p); g_facelog = 70; }
+        { static LONG lg = 0; if (!lg && g_cuLo >= 0) { lg = 1; } }
+        { static LONG last = -1; if (bodiesLastFrame != last) { char m[64]; wsprintfA(m, "body draws/frame=%d", (int)bodiesLastFrame); logline(m); last = bodiesLastFrame; } }
+        if (flagExists(L"grab")) {
+            LONG gv = readFlagInt(L"grab", 0); g_grabSeq = 0;
+            if (gv == GRAB_ALL) g_grabAll = 1; else g_grabGroup = gv & 31;
+            wchar_t p[MAX_PATH]; lstrcpyW(p, FLAGDIR); lstrcatW(p, L"grab"); DeleteFileW(p);
+            wchar_t gd[MAX_PATH]; CreateDirectoryW(rootFile(gd, L"grab"), NULL);
+        }
+    }
+    if (f % 60 == 0) {
+        LONG w = flagExists(L"wire") ? 1 : 0;
+        if (w != g_wire) { g_wire = w; char m[64]; wsprintfA(m, "frame %d wire=%d", (int)f, (int)w); logline(m); }
+        if (g_dumpLeft == 0 && flagExists(L"dump")) {
+            g_dumpLeft = 3; dumpStart = f + 1; g_n = 0;
+            char m[64]; wsprintfA(m, "frame %d dump armed", (int)f); logline(m);
+            return;
+        }
+    }
+    if (g_dumpLeft > 0) {
+        LONG n = g_n;
+        char m[160];
+        wsprintfA(m, "frame %d draws=%d", (int)f, (int)n);
+        logline(m);
+        for (LONG i = 0; i < n && i < MAXR; i++) {
+            char r[200];
+            wsprintfA(r, "d %u %u st=%u fvf=%08x tex=%08x",
+                      (unsigned)g_recs[i].nV, (unsigned)g_recs[i].nP,
+                      (unsigned)g_recs[i].stride, (unsigned)g_recs[i].fvf,
+                      (unsigned)g_recs[i].tex);
+            logline(r);
+        }
+        g_n = 0;
+        if (InterlockedDecrement(&g_dumpLeft) == 0) {
+            wchar_t p[MAX_PATH];
+            lstrcpyW(p, FLAGDIR); lstrcatW(p, L"dump");
+            DeleteFileW(p);
+            logline("dump done");
+        }
+    }
+}
+
+struct Saved { int idx; void* org; };
+static Saved g_saved[16]; static int g_nsaved = 0;
+static void hookS(void** vt, int idx, void* fn, void** org) {
+    g_saved[g_nsaved].idx = idx; g_saved[g_nsaved].org = vt[idx]; g_nsaved++;
+    *org = NULL; hookV(vt, idx, fn, org);
+}
+extern "C" __declspec(dllexport) void logic_uninstall() {
+    void** vt = *(void***)g_dev;
+    for (int i = g_nsaved - 1; i >= 0; i--) { void* dummy = NULL; hookV(vt, g_saved[i].idx, g_saved[i].org, &dummy); }
+    g_nsaved = 0;
+    if (g_swapVB) { g_swapVB->Release(); g_swapVB = NULL; }
+    if (g_kitDecl) g_kitDecl->Release(); if (g_kitVS) g_kitVS->Release(); g_kitDecl = NULL; g_kitVS = NULL;
+    for (int i = 0; i < g_nmodels; i++) releaseModel(g_models[i]);
+    g_nmodels = 0;
+    releaseModel(g_default); memset(&g_default, 0, sizeof(g_default)); g_cuM = NULL;
+    logline("logic uninstalled");
+    if (g_log != INVALID_HANDLE_VALUE) { CloseHandle(g_log); g_log = INVALID_HANDLE_VALUE; }
+}
+
+extern "C" __declspec(dllexport) void logic_install(IDirect3DDevice9* dev) {
+    initPaths();
+    g_log = CreateFileW(LOGPATH, FILE_APPEND_DATA, FILE_SHARE_READ, NULL,
+                        OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
+    g_dev = dev;
+    void** vt = *(void***)g_dev;
+    hookS(vt, 100, (void*)mySSS, (void**)&g_orgSSS);   // SetStreamSource
+    hookS(vt, 87, (void*)mySVD, (void**)&g_orgSVD);   // SetVertexDeclaration
+    hookS(vt, 89, (void*)mySFVF, (void**)&g_orgSFVF); // SetFVF
+    hookS(vt, 104, (void*)mySI, (void**)&g_orgSI);     // SetIndices
+    hookS(vt, 65, (void*)mySTEX, (void**)&g_orgSTEX);  // SetTexture
+    g_orgRS = (RS_FN)vt[57]; // SetRenderState: read only, NEVER write
+    hookS(vt, 94, (void*)mySVSCF, (void**)&g_orgSVSCF); // SetVertexShaderConstantF
+    hookS(vt, 82, (void*)myDIP, (void**)&g_orgDIP);    // DrawIndexedPrimitive
+    logline("logic installed");
+}
+
