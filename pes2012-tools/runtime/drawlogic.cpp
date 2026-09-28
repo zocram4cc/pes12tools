@@ -4,7 +4,7 @@
 // chain device methods: SetStreamSource, SetIndices, SetFVF,
 // SetVertexDeclaration, SetTexture, SetRenderState,
 // DrawIndexedPrimitive, Present.
-// Control files <kitserver>\4cc-players\flags\ (drawhook.cpp initRoot):
+// Control files <game>\kitserver\4cc-players\flags\ :
 //   wire (exists) -> force wireframe on body-ish draws
 //   dump (exists) -> log draws per frame; removed when dump ends
 #include <windows.h>
@@ -247,7 +247,7 @@ struct CustomModel {
     CustomSub sub[MAX_SUBS]; UINT nsub;
     UINT nv, ni, stride; DWORD flags; bool tried;
 };
-static const int MAX_MODELS = 24, MAX_PICKS = 24;
+static const int MAX_MODELS = 200, MAX_PICKS = 200;
 static CustomModel g_models[MAX_MODELS]; static int g_nmodels = 0;
 static LONG g_pickK[MAX_PICKS]; static int g_pickM[MAX_PICKS]; static int g_npicks = 0;
 static int g_curModel = -1;
@@ -301,7 +301,7 @@ static void readPicks() {
     g_npicks = 0;
     HANDLE f = CreateFileW(p, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE, NULL, OPEN_EXISTING, 0, NULL);
     if (f == INVALID_HANDLE_VALUE) return;
-    char b[1024] = {0}; DWORD r = 0; ReadFile(f, b, 1023, &r, NULL); CloseHandle(f);
+    char b[4096] = {0}; DWORD r = 0; ReadFile(f, b, 4095, &r, NULL); CloseHandle(f);
     char* line = b;
     while (*line && g_npicks < MAX_PICKS) {
         char* e = line; while (*e && *e != '\n' && *e != '\r') e++;
