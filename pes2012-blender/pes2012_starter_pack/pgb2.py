@@ -13,9 +13,9 @@ Vertex (struct '<3f3f4B3f3f3f2f2f', tools/fmdl_to_pes12.py):
   POSITION f3 | BLENDWEIGHT f3 (n-1 explicit) | BLENDINDICES ubyte4 |
   NORMAL f3 | BINORMAL f3 | TANGENT f3 | TEXCOORD0 f2 | TEXCOORD1 f2
 
-Weight convention (tools/fmdl_to_pes12.py): n bones carry n-1 explicit
-weights; the remainder (1 - sum(explicit)) belongs to the last slot, so
-slots are padded by repeating the last bone and.N.B. explicit by zeros.
+Weight convention (tools/fmdl_to_pes12.py skin_pack, PES2012's skin VS):
+blend index 0 takes the remainder 1 - (w0 + w1 + w2), index k + 1 takes
+w[k]; the heaviest influence sits in index 0 and padding repeats it.
 """
 import struct
 
@@ -59,22 +59,21 @@ N_FACE_SLOTS = 27
 
 
 def influences_to_slots(infl):
-    """[(slot, weight)] -> (4 slots, 3 explicit f32 weights). The shader's
-    implicit remainder lands on the last slot, so padded slots repeat the
-    last explicit slot (tools/fmdl_to_pes12.py)."""
+    """[(slot, weight)] -> (4 slots, 3 explicit f32 weights). The shader
+    gives slot 0 the remainder and slot k + 1 explicit weight k, so the
+    heaviest influence goes first and padding repeats it."""
     top = sorted(infl.items(), key=lambda kv: -kv[1])[:MAX_INFLUENCES]
     tw = sum(w for _, w in top) or 1.0
     top = [(s, w / tw) for s, w in top]
     slots = [s for s, _ in top]
-    while len(slots) < MAX_INFLUENCES:
-        slots.append(slots[-1])
-    ws = [w for _, w in top][:-1] + [0.0] * MAX_INFLUENCES
+    slots += [slots[0]] * (MAX_INFLUENCES - len(slots))
+    ws = [w for _, w in top][1:] + [0.0] * MAX_INFLUENCES
     return tuple(slots[:MAX_INFLUENCES]), tuple(ws[:3])
 
 
 def slots_to_influences(slots, explicit):
-    """Inverse: remainder (1 - sum(explicit)) lands on the last slot."""
-    full = tuple(explicit) + (1.0 - sum(explicit),)
+    """Inverse: slot 0 takes the remainder (1 - sum(explicit))."""
+    full = (1.0 - sum(explicit),) + tuple(explicit)
     out = {}
     for s, w in zip(slots, full):
         out[s] = out.get(s, 0.0) + w

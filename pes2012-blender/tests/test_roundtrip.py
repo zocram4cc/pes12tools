@@ -107,8 +107,11 @@ def test_pgb2():
     raw = open(os.path.join(P272101, 'body.bin'), 'rb').read()
     parsed, rebuilt = pgb2.round_trip(raw)
     assert rebuilt == raw, 'PGB2 parse-compare failed'
-    tpath = os.path.join(P272101, 'body_0.tex')
-    t = open(tpath, 'rb').read()
+    # bodies now ship DDS textures (tools/pes15_to_pes12.py write_tex copies
+    # the packs' own DXT); PGT1 stays a format drawlogic loads, so its codec
+    # round-trips on a synthetic 4x2 sheet (full mip chain down to 1x1)
+    mips = [bytes(range(4 * 2 * 4)), bytes(2 * 1 * 4), bytes(1 * 1 * 4)]
+    t = pgb2.build_tex(4, 2, mips)
     q = pgb2.parse_tex(t)
     assert pgb2.build_tex(q['w'], q['h'], q['mips']) == t
     print('pgb2 p272101: %d verts %d tris %d subs mode %s OK'
@@ -269,11 +272,33 @@ def test_stadium_edited_topology():
     print('stadium edited-topology: %d verts / %d tris OK' % (len(keep), len(tris)))
 
 
+def test_skin_order():
+    """PES2012's skin VS: blend index 0 takes 1 - (w0 + w1 + w2), index k + 1
+    takes w[k]. The converter (fmdl_to_pes12.skin_pack) and the add-on
+    (pgb2) must both produce weights the shader reads back as authored."""
+    import fmdl_to_pes12 as F
+    for infl in ([(8, 1.0)], [(8, 0.76), (7, 0.24)], [(3, 0.5), (1, 0.3), (0, 0.2)],
+                 [(9, 0.4), (8, 0.3), (7, 0.2), (6, 0.1)]):
+        ws, slots = F.skin_pack(infl)
+        gpu = {}
+        for s, w in zip(slots, [1.0 - sum(ws)] + list(ws)):
+            gpu[s] = gpu.get(s, 0.0) + w
+        want = dict(infl)
+        assert all(abs(gpu.get(s, 0.0) - w) < 1e-6 for s, w in want.items()), (infl, slots, ws)
+        assert all(s in want for s, w in gpu.items() if w > 1e-6), (infl, slots, ws)
+        a_slots, a_ws = pgb2.influences_to_slots(want)
+        assert (list(a_slots), list(a_ws)) == (slots, ws), 'pgb2 and skin_pack disagree'
+        back = pgb2.slots_to_influences(slots, ws)
+        assert all(abs(back[s] - w) < 1e-6 for s, w in want.items())
+    print('skin order: converter and add-on match the skin VS OK')
+
+
 if __name__ == '__main__':
     test_ball()
     test_ball_edited_topology()
     test_generic()
     test_pgb2()
+    test_skin_order()
     test_pack_body()
     test_stadium()
     test_stadium_edited_topology()

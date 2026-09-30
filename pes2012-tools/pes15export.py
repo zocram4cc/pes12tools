@@ -38,7 +38,40 @@ PLAYER_REC = 0x70 + 0x44
 PLAYER_NAME_OFF = 0x30
 POSITIONS = ['GK', 'CB', 'LB', 'RB', 'DMF', 'CMF', 'LMF', 'RMF', 'AMF', 'LWF', 'RWF', 'SS', 'CF']
 STARTERS = 11
-COLOUR_TAG = re.compile(r'^\x11c([0-9a-fA-F]{6})[0-9a-fA-F]{2}')  # name colour escape: 0x11 'c' RRGGBBAA (4cc medal colours)
+COLOUR_TAG = re.compile(r'\x11c([0-9a-fA-F]{6})[0-9a-fA-F]{2}')  # name colour escape: 0x11 'c' RRGGBBAA (4cc medal colours)
+COLOUR_ESC = re.compile(r'\x11(?:c[0-9a-fA-F]{8}|d)')  # every colour escape; 0x11 'd' ends a colour run
+
+
+def split_colour(raw):
+    """Name -> (name without colour escapes, first colour RRGGBB or None).
+    Escapes may sit mid-name (/vst/: '"<0x11 c..>99% Chance to hit.<0x11 d>"')."""
+    m = COLOUR_TAG.search(raw)
+    return COLOUR_ESC.sub('', raw), (m.group(1) if m else None)
+
+
+# 4ccEditor aatf.cpp: player rating = max of the ability stats; goldRate 99
+# marks gold medals, silverRate 88 silver medals (giant penalties default 0,
+# so the thresholds are exactly 99 and 88).
+GOLD_RATE_AATF = 99
+SILVER_RATE_AATF = 88
+# aatf.cpp:186-210 with pesVersion 15: drib, gk, finish, lowpass, loftpass,
+# header, swerve, catching, body_ctrl, kick_pwr, exp_pwr, ball_ctrl, ball_win,
+# jump, place_kick, stamina, speed. atk/def are derived, never inputs.
+ABILITY_STATS = ('drib', 'gk', 'finish', 'lowpass', 'loftpass', 'header',
+                 'swerve', 'catching', 'body_ctrl', 'kick_pwr', 'exp_pwr',
+                 'ball_ctrl', 'ball_win', 'jump', 'place_kick', 'stamina', 'speed')
+
+
+def medal(p, stats=ABILITY_STATS):
+    """'gold' / 'silver' / None per 4ccEditor aatf.cpp."""
+    rating = max(p[s] for s in stats)
+    if rating >= GOLD_RATE_AATF:
+        return 'gold'
+    if rating >= SILVER_RATE_AATF:
+        return 'silver'
+    return None
+
+
 PLAN_POS_OFF = 4            # tactics: u32 team id, then 11 codes (slot 0 = GK)
 PLAN_COORD_OFF = PLAN_POS_OFF + STARTERS
 CAPTAIN_OFF = 0x1FA          # tactics: captain = roster index
@@ -102,9 +135,8 @@ def read_player(d, at):
     p['ball_win'] = b.read(0, 7); p['kick_pwr'] = b.read(7, 7)
     p['strong_foot'] = (d[at + 0x2C] >> 2) & 1
     raw = d[at + PLAYER_NAME_OFF:at + PLAYER_NAME_OFF + 0x2E].split(b'\0')[0].decode('utf-8', 'replace')
-    m = COLOUR_TAG.match(raw)
-    p['name'] = raw[m.end():] if m else raw
-    p['name_colour'] = m.group(1) if m else None
+    p['name'], p['name_colour'] = split_colour(raw)
+    p['medal'] = medal(p)
     p['shirt'] = d[at + 0x5E:at + 0x5E + 0x12].split(b'\0')[0].decode('utf-8', 'replace')
     return p
 

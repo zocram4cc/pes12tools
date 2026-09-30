@@ -4,13 +4,15 @@
 // chain device methods: SetStreamSource, SetIndices, SetFVF,
 // SetVertexDeclaration, SetTexture, SetRenderState,
 // DrawIndexedPrimitive, Present.
-// Control files <game>\kitserver\4cc-players\flags\ :
+// Control files in <kitserver>\4cc-players\flags\ (drawhook.cpp initRoot):
 //   wire (exists) -> force wireframe on body-ish draws
 //   dump (exists) -> log draws per frame; removed when dump ends
 #include <windows.h>
 #include <stdio.h>
 #include <d3d9.h>
+#include <math.h>
 #include "kitmap.h"
+#include "custom_ps.h"
 
 // Paths hang off drawhook's root (<kitserver>\4cc-players\, drawhook.cpp initRoot).
 static wchar_t g_root[MAX_PATH], LOGPATH[MAX_PATH], FLAGDIR[MAX_PATH], CUSTOM_DIR[MAX_PATH], KIT_DIR[MAX_PATH], SHOT_PATH[MAX_PATH];
@@ -77,6 +79,13 @@ static const UINT GK_BODY_NP = 5739;
 // (696 / 1929 / 72 B) the other 18 main bones. Bones live at c20 + 3*slot.
 static const UINT KIT_HIP_NV = 755, KIT_HIP_NP = 1857, KIT_HIP_STRIDE = 80;
 static const UINT KIT_MAIN_NV = 696, KIT_MAIN_NP = 1929, KIT_MAIN_STRIDE = 72;
+// stock detail hands/boots, drawn apart from the kit run (30-09 grab)
+static const UINT DETAIL_HANDS_NV = 466, DETAIL_HANDS_NP = 565;        // both hands, stride 68
+static const UINT DETAIL_BOOTS_NV = 930, DETAIL_BOOTS_NP = 1907;       // both feet, stride 64
+static const UINT DETAIL_BOOT_NV = 228, DETAIL_BOOT_L_NP = 579, DETAIL_BOOT_R_NP = 573;   // one foot each, stride 68
+// owner match: 30-09 replay, hidden players' boots sat 0.17-0.33 m from their
+// projected feet, every other player's 3 m or more
+static const float DETAIL_OWNER_MAX_M = 0.5f;
 static const UINT BONE_REG0 = 20;
 static const UINT BONE_REGS = 3;
 static const UINT CU_SLOTS = 21;           // 19 main bones + 2 finger bones (kitmap.h)
@@ -191,7 +200,7 @@ static const DWORD TEX_MAGIC = 0x31544750;      // 'PGT1'
 static const DWORD CUSTOM_MAGIC = 0x31424750;   // 'PGB1': one texture, u16 indices
 static const DWORD CUSTOM2_MAGIC = 0x32424750;  // 'PGB2': submeshes, u32 indices, flags
 // PGB2 header flags = which stock parts the custom model replaces (PES21 Full
-// Player Customization's four cases). dllprobe\custom\<name>\mode ("head",
+// Player Customization's four cases). 4cc-players\custom\<name>\mode ("head",
 // "body", "kit", "boots") overrides the header.
 enum { MODE_BODY = 0, MODE_HEAD = 1, MODE_KIT = 2, MODE_BOOTS = 3, MODE_COUNT };
 // The stock player, measured 26-09 from grabbed stock frames (tools/grab.py,
@@ -227,6 +236,34 @@ static const float NECK_MIN_Y = 1.6f;           // the neck (170 verts) rises to
 static const float NONPLAYER_MIN_EXTENT = 5.0f; // stadium geometry: the run is over
 // submesh flags (tools/pes15_to_pes12.py sub_flags, from the PES15 .mtl states)
 static const DWORD SUB_ALPHATEST = 1, SUB_BLEND = 2, SUB_TWOSIDED = 4, SUB_NOZWRITE = 8, SUB_KIT = 16, SUB_OUTLINE = 32, SUB_FACE = 64;
+// material shading (bits above the alpha ref): PES Shadeless/Constant draw
+// the texture unlit, Pony cel-shaded - our pixel shaders (custom_ps.hlsl)
+// replace the game's lit kit shader for those submeshes in the colour pass.
+static const DWORD SUB_SHADELESS = 1u << 16, SUB_TOON = 1u << 17;
+static const DWORD SUB_HAIR = 1u << 18;   // PES Hair shader: opaque, plus the alpha fringe pass
+static IDirect3DPixelShader9 *g_psShadeless = NULL, *g_psToon = NULL;
+// Is vs the game's colour-pass kit shader (it outputs the UVs in TEXCOORD4;
+// the depth and shadow passes' shaders do not)? Parsed from its dcl tokens.
+static const DWORD D3DSIO_DCL_OP = 0x1F, USAGE_TEXCOORD = 5, UV_OUT_INDEX = 4, REG_OUTPUT = 6;   // vs_3_0 outputs are register type 6 (D3DSPR_TEXCRDOUT)
+static bool isColourVS(IDirect3DVertexShader9* vs) {
+    static void* known[16]; static bool val[16]; static int n = 0;
+    if (!vs) return false;
+    for (int i = 0; i < n; i++) if (known[i] == vs) return val[i];
+    UINT sz = 0; bool colour = false;
+    if (SUCCEEDED(vs->GetFunction(NULL, &sz)) && sz) {
+        DWORD* t = (DWORD*)HeapAlloc(GetProcessHeap(), 0, sz); vs->GetFunction(t, &sz);
+        for (UINT k = 1; k + 2 < sz / 4; k++) {
+            if ((t[k] & 0xFFFF) != D3DSIO_DCL_OP) continue;
+            DWORD usage = t[k + 1] & 0x1F, index = (t[k + 1] >> 16) & 0xF;
+            DWORD reg = ((t[k + 2] >> 28) & 7) | ((t[k + 2] >> 8) & 0x18);
+            if (usage == USAGE_TEXCOORD && index == UV_OUT_INDEX && reg == REG_OUTPUT) colour = true;
+            k += 2;
+        }
+        HeapFree(GetProcessHeap(), 0, t);
+    }
+    if (n < 16) { known[n] = vs; val[n] = colour; n++; }
+    return colour;
+}
 // the stock face mesh (dt0c face BIN, packet 3): drawn 669 or 670 verts, stride 88 (26-09 grabs)
 static const UINT FACE_DRAW_NV_A = 669, FACE_DRAW_NV_B = 670, FACE_DRAW_STRIDE = 88;
 // Outline shells sit a few mm outside the body; at match camera distance that
@@ -236,6 +273,9 @@ static const UINT FACE_DRAW_NV_A = 669, FACE_DRAW_NV_B = 670, FACE_DRAW_STRIDE =
 static const float OUTLINE_DEPTH_BIAS = 0.0002f;
 static const float OUTLINE_SLOPE_BIAS = 2.0f;
 static IDirect3DBaseTexture9* g_runKitTex = NULL;   // kit sheet bound for the current run (packet 5)
+// kit sheet of the current player run, when it is one of ours (kitOfSheet)
+static bool g_runKitOk = false; static int g_runTid = 0; static const wchar_t* g_runSlot = NULL;
+static bool g_kitForceOff = false;                  // flags\\nokitforce: the game's own kit draws (A/B)
 static const DWORD SUB_REF_SHIFT = 8, SUB_REF_MASK = 0xFF;
 static LONG g_cuLo = -1, g_cuHi = -1;           // body occurrences drawn as custom
 struct CustomSub { UINT first, count, tex, flags; };
@@ -246,11 +286,15 @@ struct CustomModel {
     IDirect3DTexture9* tex[MAX_TEXS]; UINT ntex;
     CustomSub sub[MAX_SUBS]; UINT nsub;
     UINT nv, ni, stride; DWORD flags; bool tried;
+    LONG pid, lastUsed;                          // resident-cache key, frame of last use
 };
-static const int MAX_MODELS = 200, MAX_PICKS = 200;
-static CustomModel g_models[MAX_MODELS]; static int g_nmodels = 0;
-static LONG g_pickK[MAX_PICKS]; static int g_pickM[MAX_PICKS]; static int g_npicks = 0;
-static int g_curModel = -1;
+// Bodies are keyed by player id (the face marker IS the pid, tools/mark_face.py)
+// and hot-loaded from custom\p<pid>\ on first draw; the cache holds this many
+// and evicts the least recently drawn. Two teams' starters (22) plus menu and
+// cutscene players fit with room to spare; any number can be installed.
+static const int MAX_RESIDENT = 48;
+static CustomModel g_models[MAX_RESIDENT]; static int g_nmodels = 0;
+static LONG g_curModel = -1;                    // pid of the player whose run is open
 static CustomModel* g_cuM = NULL;               // model drawCustom() draws
 static bool g_cuKeepGameTex = false;
 static bool g_cuGK = false;
@@ -273,13 +317,43 @@ static BYTE* readAll(const wchar_t* path, DWORD* size) {
     return b;
 }
 
-// body.tex: u32 magic, w, h, mips, then BGRA8 mips largest first.
+// body_<k>.tex: either PGT1 (u32 magic, w, h, mips, then BGRA8 mips largest
+// first; tools/fmdl_to_pes12.py) or a DXT1/3/5 DDS uploaded as is
+// (tools/pes15_to_pes12.py: the packs' own compression, full size).
+static const DWORD DDS_MAGIC = 0x20534444;             // 'DDS '
+static const UINT DDS_HEADER_BYTES = 128, DDS_H_OFF = 12, DDS_W_OFF = 16, DDS_MIPS_OFF = 28, DDS_FOURCC_OFF = 84;
+static const UINT DXT_BLOCK_PX = 4, DXT1_BLOCK_BYTES = 8, DXT35_BLOCK_BYTES = 16;
+static IDirect3DTexture9* loadDDS(IDirect3DDevice9* d, BYTE* b, DWORD n) {
+    UINT h = *(DWORD*)(b + DDS_H_OFF), w = *(DWORD*)(b + DDS_W_OFF), mips = *(DWORD*)(b + DDS_MIPS_OFF);
+    DWORD four = *(DWORD*)(b + DDS_FOURCC_OFF);
+    D3DFORMAT fmt = (D3DFORMAT)four;           // D3DFMT_DXTn are the fourcc codes
+    UINT blk = four == MAKEFOURCC('D', 'X', 'T', '1') ? DXT1_BLOCK_BYTES : DXT35_BLOCK_BYTES;
+    if (four != MAKEFOURCC('D', 'X', 'T', '1') && four != MAKEFOURCC('D', 'X', 'T', '3') && four != MAKEFOURCC('D', 'X', 'T', '5')) return NULL;
+    if (!mips) mips = 1;
+    IDirect3DTexture9* t = NULL;
+    if (FAILED(d->CreateTexture(w, h, mips, 0, fmt, D3DPOOL_MANAGED, &t, NULL))) return NULL;
+    BYTE* src = b + DDS_HEADER_BYTES;
+    for (UINT m = 0; m < mips; m++) {
+        UINT mw = w >> m, mh = h >> m; if (!mw) mw = 1; if (!mh) mh = 1;
+        UINT rows = (mh + DXT_BLOCK_PX - 1) / DXT_BLOCK_PX, rowBytes = (mw + DXT_BLOCK_PX - 1) / DXT_BLOCK_PX * blk;
+        if (src + rows * rowBytes > b + n) break;
+        D3DLOCKED_RECT lr;
+        if (SUCCEEDED(t->LockRect(m, &lr, NULL, 0))) {
+            // one pitch step per ROW OF BLOCKS, not per pixel row
+            for (UINT r = 0; r < rows; r++) memcpy((BYTE*)lr.pBits + r * lr.Pitch, src + r * rowBytes, rowBytes);
+            t->UnlockRect(m);
+        }
+        src += rows * rowBytes;
+    }
+    return t;
+}
 static IDirect3DTexture9* loadTex(IDirect3DDevice9* d, const wchar_t* path) {
     DWORD n = 0; BYTE* b = readAll(path, &n);
     if (!b) return NULL;
     DWORD* hd = (DWORD*)b;
     IDirect3DTexture9* t = NULL;
-    if (hd[0] == TEX_MAGIC && SUCCEEDED(d->CreateTexture(hd[1], hd[2], hd[3], 0, D3DFMT_A8R8G8B8, D3DPOOL_MANAGED, &t, NULL))) {
+    if (n >= DDS_HEADER_BYTES && hd[0] == DDS_MAGIC) t = loadDDS(d, b, n);
+    else if (hd[0] == TEX_MAGIC && SUCCEEDED(d->CreateTexture(hd[1], hd[2], hd[3], 0, D3DFMT_A8R8G8B8, D3DPOOL_MANAGED, &t, NULL))) {
         BYTE* src = b + 16;
         for (DWORD m = 0; m < hd[3]; m++) {
             UINT mw = hd[1] >> m, mh = hd[2] >> m; if (!mw) mw = 1; if (!mh) mh = 1;
@@ -295,29 +369,6 @@ static IDirect3DTexture9* loadTex(IDirect3DDevice9* d, const wchar_t* path) {
     return t;
 }
 
-// flags\picks: one "k name" per line; name = folder under dllprobe\custom\.
-static void readPicks() {
-    wchar_t p[MAX_PATH]; lstrcpyW(p, FLAGDIR); lstrcatW(p, L"picks");
-    g_npicks = 0;
-    HANDLE f = CreateFileW(p, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE, NULL, OPEN_EXISTING, 0, NULL);
-    if (f == INVALID_HANDLE_VALUE) return;
-    char b[4096] = {0}; DWORD r = 0; ReadFile(f, b, 4095, &r, NULL); CloseHandle(f);
-    char* line = b;
-    while (*line && g_npicks < MAX_PICKS) {
-        char* e = line; while (*e && *e != '\n' && *e != '\r') e++;
-        char save = *e; *e = 0;
-        LONG k = 0; char* q = line; bool any = false;
-        while (*q >= '0' && *q <= '9') { k = k * 10 + (*q - '0'); q++; any = true; }
-        while (*q == ' ') q++;
-        if (any && *q) {
-            int m = -1;
-            for (int i = 0; i < g_nmodels; i++) if (!lstrcmpA(g_models[i].name, q)) m = i;
-            if (m < 0 && g_nmodels < MAX_MODELS) { m = g_nmodels++; memset(&g_models[m], 0, sizeof(CustomModel)); lstrcpynA(g_models[m].name, q, 32); }
-            if (m >= 0) { g_pickK[g_npicks] = k; g_pickM[g_npicks] = m; g_npicks++; }
-        }
-        *e = save; line = e; while (*line == '\n' || *line == '\r') line++;
-    }
-}
 // ---- player identity: fserv serves each custom player (GDB map.txt, keyed by
 // player id) a face.bin stamped by tools/mark_face.py; the game builds it into
 // the face atlas drawn right before his kit, where the PGB tag is searched.
@@ -326,10 +377,23 @@ static const UINT FACE_MAX_NV = 4000;                  // head/hair draws are be
 static const UINT MARKER_SEARCH_LEVELS = 5;            // smallest atlas mips searched
 static const int MAX_TEXCACHE = 256;
 static DWORD g_tcTex[MAX_TEXCACHE]; static int g_tcMark[MAX_TEXCACHE]; static int g_ntc = 0;
-static int g_pendingModel = -1;                         // set by a marked face draw
+static LONG g_pendingModel = -1;                        // pid set by a marked face draw
+// marker unit (tools/mark_face.py): 'P' 'G' 'D' pid (u24 LE) sum ~sum, sum = byte sum of the pid
+static const UINT MARKER_BYTES = 8;
+static int readMarker(const BYTE* q) {
+    if (q[0] != 'P' || q[1] != 'G' || q[2] != 'D') return -1;
+    BYTE s = (BYTE)(q[3] + q[4] + q[5]);
+    if (q[6] != s || (BYTE)(q[6] + q[7]) != 0xFF) return -1;
+    return q[3] | q[4] << 8 | q[5] << 16;
+}
 static int findMarker(IDirect3DBaseTexture9* bt) {
     if (!bt) return -1;
     for (int i = 0; i < g_ntc; i++) if (g_tcTex[i] == (DWORD)bt) return g_tcMark[i];
+    // keyed by texture pointer, so it only lives one frame (logic_present
+    // clears it): the game frees a match's face atlases and the next match's
+    // reuse their addresses - a cache that outlived the frame drew the
+    // previous match's /g/ bodies on /u/ in the pre-match screen (29-09).
+    if (g_ntc == MAX_TEXCACHE) g_ntc = 0;
     int mark = -1;
     if (bt->GetType() == D3DRTYPE_TEXTURE) {
         IDirect3DTexture9* t = (IDirect3DTexture9*)bt;
@@ -342,16 +406,16 @@ static int findMarker(IDirect3DBaseTexture9* bt) {
             BYTE* b = (BYTE*)lr.pBits;
             UINT rows = (sd.Height + 3) / 4, rowBytes = ((sd.Width + 3) / 4) * 16;
             for (UINT r = 0; r < rows && mark < 0; r++)
-                for (UINT i = 0; i + 5 <= rowBytes; i++) {
-                    BYTE* q = b + r * lr.Pitch + i;
-                    if (q[0] == 'P' && q[1] == 'G' && q[2] == 'B' && (BYTE)(q[3] + q[4]) == 255) { mark = q[3]; break; }
+                for (UINT i = 0; i + MARKER_BYTES <= rowBytes; i++) {
+                    int v = readMarker(b + r * lr.Pitch + i);
+                    if (v >= 0) { mark = v; break; }
                 }
             t->UnlockRect(l);
             (void)bytes;
         }
     }
-    if (g_ntc < MAX_TEXCACHE) { g_tcTex[g_ntc] = (DWORD)bt; g_tcMark[g_ntc] = mark; g_ntc++; }
-    if (mark >= 0) { char m[80]; wsprintfA(m, "marker %d on face tex %08x", mark, (DWORD)bt); logline(m); }
+    g_tcTex[g_ntc] = (DWORD)bt; g_tcMark[g_ntc] = mark; g_ntc++;
+    if (mark >= 0 && g_frame % 300 == 0) { char m[80]; wsprintfA(m, "marker %d on face tex %08x", mark, (DWORD)bt); logline(m); }
     return mark;
 }
 // ---- team kits: kserv cannot serve the 4cc DLC teams (ids 701+ are not in
@@ -380,6 +444,20 @@ static DWORD kitHash(IDirect3DTexture9* t) {
 }
 static const int MAX_KITCACHE = 64;
 static DWORD g_kcTex[MAX_KITCACHE], g_kcHash[MAX_KITCACHE]; static int g_nkc = 0;
+static const wchar_t* g_kcSlot[MAX_KITCACHE];   // which team kit patchKit wrote into that texture
+// the kit last identified for a team: replays and cutscenes bind a 512 x 512
+// DXT5 kit sheet patchKit cannot identify (30-09), worn by the same team
+static const int MAX_TEAM_SLOTS = 16;
+static int g_tsTeam[MAX_TEAM_SLOTS]; static const wchar_t* g_tsSlot[MAX_TEAM_SLOTS]; static int g_nts = 0;
+static void noteTeamSlot(int tid, const wchar_t* slot) {
+    for (int i = 0; i < g_nts; i++) if (g_tsTeam[i] == tid) { g_tsSlot[i] = slot; return; }
+    if (g_nts < MAX_TEAM_SLOTS) { g_tsTeam[g_nts] = tid; g_tsSlot[g_nts++] = slot; }
+}
+static const wchar_t* kitSlotOf(IDirect3DBaseTexture9* t, int tid) {
+    for (int i = 0; i < g_nkc; i++) if (g_kcTex[i] == (DWORD)t) return g_kcSlot[i];
+    for (int i = 0; i < g_nts; i++) if (g_tsTeam[i] == tid) return g_tsSlot[i];
+    return NULL;
+}
 static void patchKit(int tid, IDirect3DBaseTexture9* bt) {
     if (tid <= 0 || !bt || bt->GetType() != D3DRTYPE_TEXTURE) return;
     IDirect3DTexture9* t = (IDirect3DTexture9*)bt;
@@ -397,7 +475,18 @@ static void patchKit(int tid, IDirect3DBaseTexture9* bt) {
     if (!slot) {
         static DWORD warned[16]; static int nw = 0; bool seen = false;
         for (int i = 0; i < nw; i++) seen |= warned[i] == h;
-        if (!seen && nw < 16) { warned[nw++] = h; char m[96]; wsprintfA(m, "kit: unknown strip hash %08x (team %d)", h, tid); logline(m); }
+        if (!seen && nw < 16) {
+            warned[nw++] = h; char m[96]; wsprintfA(m, "kit: unknown strip hash %08x (team %d)", h, tid); logline(m);
+            // the sheet itself, level 0 raw A8R8G8B8, to tell which kit it is:
+            // custom\kits\unknown_<hash>.raw (1024 x 512)
+            wchar_t p[MAX_PATH]; wsprintfW(p, L"%sunknown_%08x.raw", KIT_DIR, h);
+            D3DLOCKED_RECT lr;
+            if (SUCCEEDED(t->LockRect(0, &lr, NULL, D3DLOCK_READONLY))) {
+                HANDLE f = CreateFileW(p, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, 0, NULL);
+                DWORD w; for (UINT y = 0; y < KIT_H; y++) WriteFile(f, (BYTE*)lr.pBits + y * lr.Pitch, KIT_W * 4, &w, NULL);
+                CloseHandle(f); t->UnlockRect(0);
+            }
+        }
         return;
     }
     wchar_t path[MAX_PATH]; wsprintfW(path, L"%s%d\\%s.tex", KIT_DIR, tid, slot);
@@ -420,18 +509,36 @@ static void patchKit(int tid, IDirect3DBaseTexture9* bt) {
         int k = -1;
         for (int i = 0; i < g_nkc; i++) if (g_kcTex[i] == (DWORD)t) k = i;
         if (k < 0 && g_nkc < MAX_KITCACHE) k = g_nkc++;
-        if (k >= 0) { g_kcTex[k] = (DWORD)t; g_kcHash[k] = after; }
+        if (k >= 0) { g_kcTex[k] = (DWORD)t; g_kcHash[k] = after; g_kcSlot[k] = slot; }
+        noteTeamSlot(tid, slot);
         char m[128]; wsprintfA(m, "kit: team %d %S -> tex %08x", tid, slot, (DWORD)t); logline(m);
     }
     HeapFree(GetProcessHeap(), 0, b);
 }
-// custom model name p<(2000 + tid) * 100 + n> (tools/pes12_import_team.py)
+// custom model p<pid>, pid = (2000 + tid) * 100 + n (tools/pes12_import_team.py)
 static const int PLACEHOLDER_TEAM_BASE = 2000, PLAYERS_PER_TEAM = 100;
-static int modelTeam(const CustomModel& M) {
-    int v = 0; const char* q = M.name + 1;
-    if (M.name[0] != 'p') return 0;
-    while (*q >= '0' && *q <= '9') v = v * 10 + (*q++ - '0');
-    return v / PLAYERS_PER_TEAM - PLACEHOLDER_TEAM_BASE;
+static int modelTeam(const CustomModel& M) { return M.pid / PLAYERS_PER_TEAM - PLACEHOLDER_TEAM_BASE; }
+// ---- full-resolution kits for custom models. The game's kit sheet is
+// 1024 x 512 and a custom model's kit UVs reach it through a second remap
+// (tools/pes15_kits.py), so its kit came out blurry (30-09). Its kit
+// submeshes keep the pack's own UVs in TEXCOORD0 (the remap in TEXCOORD1)
+// and are drawn with the pack's own sheet, custom\kits\<tid>\<slot>_hi.dds,
+// for the kit patchKit wrote into the texture the game bound.
+static const wchar_t* HI_KIT_SUFFIX = L"_hi.dds";        // tools/pes15_kits.py HI_KIT_SUFFIX
+// the kit vertex shader's UV output is c176.x * TEXCOORD0 + c176.y * TEXCOORD1
+static const UINT UV_SELECT_REG = 176;
+static const float UV_SELECT_SET0[4] = { 1, 0, 0, 0 }, UV_SELECT_SET1[4] = { 0, 1, 0, 0 };
+static const int MAX_HIKITS = 16;
+struct HiKit { int tid; const wchar_t* slot; IDirect3DTexture9* tex; };
+static HiKit g_hiKits[MAX_HIKITS]; static int g_nHiKits = 0;
+static IDirect3DTexture9* hiKit(IDirect3DDevice9* d, int tid, const wchar_t* slot) {
+    if (!slot) return NULL;
+    for (int i = 0; i < g_nHiKits; i++) if (g_hiKits[i].tid == tid && g_hiKits[i].slot == slot) return g_hiKits[i].tex;
+    wchar_t path[MAX_PATH]; wsprintfW(path, L"%s%d\\%s%s", KIT_DIR, tid, slot, HI_KIT_SUFFIX);
+    IDirect3DTexture9* t = loadTex(d, path);
+    if (g_nHiKits < MAX_HIKITS) { g_hiKits[g_nHiKits].tid = tid; g_hiKits[g_nHiKits].slot = slot; g_hiKits[g_nHiKits++].tex = t; }
+    char m[128]; wsprintfA(m, "kit: team %d %S full-res sheet %s", tid, slot, t ? "loaded" : "missing"); logline(m);
+    return t;
 }
 
 // ---- identity outside the colour pass. A frame draws every player four
@@ -445,10 +552,10 @@ static int modelTeam(const CustomModel& M) {
 // key -> model, the next frame's depth pass looks it up.
 static const int MAX_KEYS = 64;
 static const float KEY_MATCH_DIST = 0.25f;      // metres moved per frame, well above a sprint (~0.15)
-struct PlayerKey { float p[3]; int model; };
+struct PlayerKey { float p[3]; LONG model; };   // model = pid
 static PlayerKey g_keyCur[MAX_KEYS], g_keyPrev[MAX_KEYS]; static int g_nKeyCur = 0, g_nKeyPrev = 0;
 static void runKey(float out[3]) { for (int c = 0; c < 3; c++) out[c] = g_vsc[BONE_REG0 + c][3]; }
-static int modelForKey(const float k[3]) {
+static LONG modelForKey(const float k[3]) {
     int best = -1; float bd = KEY_MATCH_DIST * KEY_MATCH_DIST;
     for (int i = 0; i < g_nKeyPrev; i++) {
         float d = 0; for (int c = 0; c < 3; c++) { float e = g_keyPrev[i].p[c] - k[c]; d += e * e; }
@@ -457,16 +564,12 @@ static int modelForKey(const float k[3]) {
     return best;
 }
 
-static int modelForMarker(int mk) {
-    for (int i = 0; i < g_npicks; i++) if (g_pickK[i] == mk) return g_pickM[i];
-    return -1;
-}
 static void releaseModel(CustomModel& M) {
     if (M.vb) M.vb->Release(); if (M.ib) M.ib->Release();
     for (UINT i = 0; i < M.ntex; i++) if (M.tex[i]) M.tex[i]->Release();
     M.vb = NULL; M.ib = NULL; M.ntex = 0;
 }
-// dllprobe\custom\<name>\mode: first word head|body|kit|boots, else -1
+// 4cc-players\custom\<name>\mode: first word head|body|kit|boots, else -1
 static int readModeFile(const wchar_t* dir) {
     wchar_t p[MAX_PATH]; lstrcpyW(p, dir); lstrcatW(p, L"mode");
     HANDLE f = CreateFileW(p, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE, NULL, OPEN_EXISTING, 0, NULL);
@@ -518,10 +621,24 @@ static bool loadModel(IDirect3DDevice9* d, CustomModel& M, const wchar_t* dir) {
     if (!ok) releaseModel(M);
     return ok;
 }
-// select model m: load on first use
-static bool useModel(IDirect3DDevice9* d, int m) {
-    if (m < 0) return false;
+// select the body of player pid: resident, else hot-loaded into a free or
+// the least recently drawn slot
+static bool useModel(IDirect3DDevice9* d, LONG pid) {
+    if (pid < 0) return false;
+    int m = -1, lru = -1;
+    for (int i = 0; i < g_nmodels && m < 0; i++) {
+        if (g_models[i].pid == pid) m = i;
+        else if (lru < 0 || g_models[i].lastUsed < g_models[lru].lastUsed) lru = i;
+    }
+    if (m < 0) {
+        m = g_nmodels < MAX_RESIDENT ? g_nmodels++ : lru;
+        CustomModel& E = g_models[m];
+        if (E.vb) { char l[64]; wsprintfA(l, "custom %s evicted", E.name); logline(l); }
+        releaseModel(E); memset(&E, 0, sizeof(E));
+        E.pid = pid; wsprintfA(E.name, "p%ld", pid);
+    }
     CustomModel& M = g_models[m];
+    M.lastUsed = g_frame;
     if (!M.vb && !M.tried) {
         M.tried = true;
         wchar_t dir[MAX_PATH]; wsprintfW(dir, L"%s%S\\", CUSTOM_DIR, M.name);
@@ -546,11 +663,63 @@ static const UINT FACE_PRINT_BYTES = 32;        // vertex bytes fingerprinting a
 static IDirect3DBaseTexture9* g_prevTex = NULL;
 static IDirect3DVertexBuffer9* g_prevVB = NULL; static UINT g_prevOff = 0, g_prevStride = 0, g_prevFirst = 0, g_prevNV = 0;
 static int g_facelog = 0;
+
+// ---- stock detail hands and boots. Close to the camera PES2012 draws each
+// player's hands (466 v, both hands) and boots (930 v, both feet; 228 v per
+// foot) as separate meshes, batched in their own world space (shared camera in
+// c16-c19) rather than inside the player's kit run (30-09 grab: stock hands
+// and boots poking out of Kurisu's mode-body model). They are matched to their
+// player on screen: each hidden custom player's feet and hands are projected
+// with exactly what its custom draw uses, each detail draw by its slot-0 bone.
+struct Extremity { float x, y, w; int model; };
+static const int MAX_EXTREMITIES = 64;
+static Extremity g_feet[2][MAX_EXTREMITIES], g_hands[2][MAX_EXTREMITIES];
+static int g_nFeet[2], g_nHands[2], g_extCur = 0;
+static const float FOOT_BIND_L[3] = { 0.09f, 0.11f, -0.059f };   // probe/body349b2_bones.json bone 7 (sk_foot_l)
+static const float FOOT_BIND_R[3] = { -0.09f, 0.11f, -0.059f };  // bone 8 (sk_foot_r)
+static const float HAND_BIND_L[3] = { 0.704f, 1.455f, -0.016f }; // bone 17 (sk_hand_l)
+static const float HAND_BIND_R[3] = { -0.704f, 1.455f, -0.016f };// bone 18 (sk_hand_r)
+static const UINT SLOT_FOOT_L = 5, SLOT_FOOT_R = 6, SLOT_HAND_R = 7, SLOT_HAND_L = 11;   // pgb2.SLOT_BONES
+static Extremity projectBone(const float (*M)[4], const float* p) {
+    float w[4] = { 0, 0, 0, 1 };
+    for (int r = 0; r < 3; r++) w[r] = M[r][0] * p[0] + M[r][1] * p[1] + M[r][2] * p[2] + M[r][3];
+    float c[4];
+    for (int r = 0; r < 4; r++) c[r] = g_vsc[16 + r][0] * w[0] + g_vsc[16 + r][1] * w[1] + g_vsc[16 + r][2] * w[2] + g_vsc[16 + r][3] * w[3];
+    Extremity e = { c[3] != 0 ? c[0] / c[3] : 0, c[3] != 0 ? c[1] / c[3] : 0, c[3], -1 };
+    return e;
+}
+static void noteExtremities(const float (*c)[4], unsigned hideParts, bool hideSkin, int model) {
+    int k = g_extCur;
+    if ((hideParts >> PART_BOOTS) & 1) {
+        const UINT sl[2] = { SLOT_FOOT_L, SLOT_FOOT_R }; const float* bp[2] = { FOOT_BIND_L, FOOT_BIND_R };
+        for (int i = 0; i < 2 && g_nFeet[k] < MAX_EXTREMITIES; i++) { Extremity e = projectBone(c + sl[i] * BONE_REGS, bp[i]); e.model = model; g_feet[k][g_nFeet[k]++] = e; }
+    }
+    if (hideSkin) {
+        const UINT sl[2] = { SLOT_HAND_L, SLOT_HAND_R }; const float* bp[2] = { HAND_BIND_L, HAND_BIND_R };
+        for (int i = 0; i < 2 && g_nHands[k] < MAX_EXTREMITIES; i++) { Extremity e = projectBone(c + sl[i] * BONE_REGS, bp[i]); e.model = model; g_hands[k][g_nHands[k]++] = e; }
+    }
+}
+// nearest recorded extremity (this frame and the last) to this draw's slot-0 bone, in metres at its depth
+static float nearestExtremity(bool feet, int* model) {
+    float o[3] = { 0, 0, 0 }; Extremity me = projectBone(&g_vsc[BONE_REG0], o);
+    float best = 1e9f; *model = -1;
+    for (int f = 0; f < 2; f++) {
+        int n = feet ? g_nFeet[f] : g_nHands[f]; Extremity* a = feet ? g_feet[f] : g_hands[f];
+        for (int i = 0; i < n; i++) {
+            float dx = (a[i].x - me.x) * me.w, dy = (a[i].y - me.y) * me.w, dw = a[i].w - me.w;
+            float dd = sqrtf(dx * dx + dy * dy + dw * dw);
+            if (dd < best) { best = dd; *model = a[i].model; }
+        }
+    }
+    return best;
+}
+
 static HRESULT drawCustomLod0(IDirect3DDevice9* d) {
     float c[CU_SLOTS * BONE_REGS][4];
     for (UINT k = 0; k < CU_SLOTS; k++)
         for (UINT r = 0; r < BONE_REGS; r++)
             memcpy(c[k * BONE_REGS + r], CU_SRC_PKT[k] == 0 ? g_hipM[r] : g_vsc[BONE_REG0 + CU_SRC_SLOT[k] * BONE_REGS + r], 16);
+    noteExtremities(c, MODE_PART_HIDE[g_cuM->flags], MODE_HIDES_SKIN[g_cuM->flags], g_curModel);
     if (flagExists(L"dumpc")) {
         wchar_t p[MAX_PATH]; lstrcpyW(p, FLAGDIR); lstrcatW(p, L"dumpc"); DeleteFileW(p);
         wchar_t up[MAX_PATH]; HANDLE f = CreateFileW(rootFile(up, L"uploaded.bin"), GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, 0, NULL);
@@ -569,8 +738,65 @@ static HRESULT drawCustomLod0(IDirect3DDevice9* d) {
     return hr;
 }
 
+// flags\shaderdump: write every distinct vertex/pixel shader pair bound at
+// custom draws (depth, shadow and colour passes differ) to
+// 4cc-players\shaders\vs_<n>.bin / ps_<n>.bin (disassemble with vkd3d-compiler
+// -x d3dbc -b d3d-asm); the flag is removed after SHADER_DUMP_MAX pairs.
+static const int SHADER_DUMP_MAX = 8;
+static void dumpShaders(IDirect3DDevice9* d) {
+    static void* seen[SHADER_DUMP_MAX][2]; static int nseen = 0;
+    wchar_t p[MAX_PATH], dir[MAX_PATH]; CreateDirectoryW(rootFile(dir, L"shaders"), NULL);
+    IDirect3DVertexShader9* vs = NULL; IDirect3DPixelShader9* ps = NULL;
+    d->GetVertexShader(&vs); d->GetPixelShader(&ps);
+    bool known = false;
+    for (int i = 0; i < nseen; i++) known |= seen[i][0] == vs && seen[i][1] == ps;
+    if (!known && nseen < SHADER_DUMP_MAX) {
+        seen[nseen][0] = vs; seen[nseen][1] = ps;
+        for (int k = 0; k < 2; k++) {
+            UINT n = 0; HRESULT hr = k ? (ps ? ps->GetFunction(NULL, &n) : E_FAIL) : (vs ? vs->GetFunction(NULL, &n) : E_FAIL);
+            if (FAILED(hr) || !n) continue;
+            BYTE* b = (BYTE*)HeapAlloc(GetProcessHeap(), 0, n);
+            if (k) ps->GetFunction(b, &n); else vs->GetFunction(b, &n);
+            wchar_t rel[64]; wsprintfW(rel, k ? L"shaders\\ps_%d.bin" : L"shaders\\vs_%d.bin", nseen);
+            HANDLE f = CreateFileW(rootFile(p, rel), GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, 0, NULL);
+            DWORD w; WriteFile(f, b, n, &w, NULL); CloseHandle(f); HeapFree(GetProcessHeap(), 0, b);
+        }
+        char m[64]; wsprintfA(m, "shaders dumped: pair %d", nseen); logline(m);
+        if (++nseen == SHADER_DUMP_MAX) { lstrcpyW(p, FLAGDIR); lstrcatW(p, L"shaderdump"); DeleteFileW(p); }
+    }
+    if (vs) vs->Release(); if (ps) ps->Release();
+}
+static bool g_shaderDump = false;              // flags\shaderdump, polled every 60 frames
+// The game's lit kit pixel shader (ps_1, dumped 30-09) perturbs the normal by
+// two normal maps, samplers s4 and s9 (DXT5nm: xy = .wy * 2 - 1, blended by
+// c27.x), through the kit UV set. A custom model drawn with it inherited the
+// kit draw's cloth-wrinkle maps on its own UVs: fold ridges across Feynman's
+// neck and many other players' skin. Custom subs get a flat normal instead
+// (the pack models' own normal maps are not converted).
+static const DWORD NORMAL_MAP_STAGES[] = { 4, 9 };
+static const D3DCOLOR FLAT_NORMAL_ARGB = 0x808080FF;   // .w = .y = 128: x = y = 0 -> the vertex normal
+static IDirect3DTexture9* g_flatNormal = NULL;
+static bool g_keepNormalMaps = false;
+// Hair: PES hair-tube materials alpha-test at ref 254, keeping only the fully
+// opaque core, and draw the filtered strand edges in a second, blended pass.
+// Drawn once, the cut left 4cc hair matte and chunky (Feynman, 30-09). A sub
+// alpha-tested at or above HAIR_CORE_MIN_REF gets that fringe pass: alpha in
+// (FRINGE_MIN_ALPHA, ref], blended over, depth tested, no depth write.
+static const DWORD HAIR_CORE_MIN_REF = 200;   // PES hair tubes use 254; body/face cut-outs 0-128
+static const DWORD FRINGE_MIN_ALPHA = 8;      // below this the fringe is noise
+static const DWORD HAIR_CORE_REF = 254;       // the PES hair-tube core cut (materials' own alpharef)
+static bool g_noHairFringe = false;           // flags\\nohairfringe: single pass (A/B)   // flags\\gamenormals: the kit draw's normal maps (A/B)
+static IDirect3DTexture9* flatNormal(IDirect3DDevice9* d) {
+    if (!g_flatNormal && SUCCEEDED(d->CreateTexture(1, 1, 1, 0, D3DFMT_A8R8G8B8, D3DPOOL_MANAGED, &g_flatNormal, NULL))) {
+        D3DLOCKED_RECT lr;
+        if (SUCCEEDED(g_flatNormal->LockRect(0, &lr, NULL, 0))) { *(D3DCOLOR*)lr.pBits = FLAT_NORMAL_ARGB; g_flatNormal->UnlockRect(0); }
+    }
+    return g_flatNormal;
+}
+
 static HRESULT drawCustom(IDirect3DDevice9* d, bool faceOnly) {
     CustomModel& M = *g_cuM;
+    if (g_shaderDump) dumpShaders(d);
     IDirect3DVertexBuffer9* keepVB = g_vb; UINT keepOff = g_vbOff, keepSt = g_stride;
     IDirect3DIndexBuffer9* keepIB = g_ib;
     IDirect3DBaseTexture9* keepTex = g_tex0;
@@ -592,17 +818,34 @@ static HRESULT drawCustom(IDirect3DDevice9* d, bool faceOnly) {
     d->GetSamplerState(0, D3DSAMP_ADDRESSU, &au); d->GetSamplerState(0, D3DSAMP_ADDRESSV, &av);
     if (!g_cuKeepGameTex) { d->SetSamplerState(0, D3DSAMP_ADDRESSU, D3DTADDRESS_WRAP); d->SetSamplerState(0, D3DSAMP_ADDRESSV, D3DTADDRESS_WRAP); }
     HRESULT hr = D3D_OK;
+    if (!g_psShadeless) d->CreatePixelShader(PS_SHADELESS, &g_psShadeless);
+    if (!g_psToon) d->CreatePixelShader(PS_TOON, &g_psToon);
+    IDirect3DVertexShader9* curVS = NULL; d->GetVertexShader(&curVS);
+    bool colour = isColourVS(curVS); if (curVS) curVS->Release();
+    IDirect3DPixelShader9* gamePS = NULL; d->GetPixelShader(&gamePS);
+    float uvSel[4]; memcpy(uvSel, g_vsc[UV_SELECT_REG], sizeof(uvSel));   // the game's, for non-kit subs
+    const int NNS = sizeof(NORMAL_MAP_STAGES) / sizeof(NORMAL_MAP_STAGES[0]);
+    IDirect3DBaseTexture9* keepNrm[NNS];
+    for (int k = 0; k < NNS; k++) { keepNrm[k] = NULL; d->GetTexture(NORMAL_MAP_STAGES[k], &keepNrm[k]); if (!g_keepNormalMaps && flatNormal(d)) g_orgSTEX(d, NORMAL_MAP_STAGES[k], g_flatNormal); }
     for (UINT i = 0; i < M.nsub; i++) {
         const CustomSub& S = M.sub[i];
         // face subs are head-local on the face palette: only at the face draw
         if (((S.flags & SUB_FACE) != 0) != faceOnly) continue;
         if (!g_cuKeepGameTex && S.tex < M.ntex && M.tex[S.tex]) g_orgSTEX(d, 0, M.tex[S.tex]);
-        // kit slot: the sheet this player is wearing (its UVs are on PES2012's layout)
-        if ((S.flags & SUB_KIT) && g_runKitTex) g_orgSTEX(d, 0, g_runKitTex);
+        // kit slot: the pack's own sheet for the kit this player is wearing, at
+        // full resolution through TEXCOORD0; else the game's bound sheet
+        // through TEXCOORD1 (the remapped UVs)
+        if ((S.flags & SUB_KIT) && g_runKitTex) {
+            IDirect3DTexture9* hi = g_runKitOk && !g_kitForceOff ? hiKit(d, g_runTid, g_runSlot) : NULL;
+            g_orgSTEX(d, 0, hi ? (IDirect3DBaseTexture9*)hi : g_runKitTex);
+            g_orgSVSCF(d, UV_SELECT_REG, hi ? UV_SELECT_SET0 : UV_SELECT_SET1, 1);
+        } else g_orgSVSCF(d, UV_SELECT_REG, uvSel, 1);
         // the material's own states (PES15 .mtl), never the kit draw's leftovers
         bool atest = (S.flags & SUB_ALPHATEST) != 0, blend = (S.flags & SUB_BLEND) != 0;
-        g_orgRS(d, D3DRS_ALPHATESTENABLE, atest);
+        bool hairCore = (S.flags & SUB_HAIR) && !g_noHairFringe;   // opaque core only, the fringe follows
+        g_orgRS(d, D3DRS_ALPHATESTENABLE, atest || hairCore);
         if (atest) { g_orgRS(d, D3DRS_ALPHAREF, (S.flags >> SUB_REF_SHIFT) & SUB_REF_MASK); g_orgRS(d, D3DRS_ALPHAFUNC, D3DCMP_GREATER); }
+        else if (hairCore) { g_orgRS(d, D3DRS_ALPHAREF, HAIR_CORE_REF); g_orgRS(d, D3DRS_ALPHAFUNC, D3DCMP_GREATER); }
         g_orgRS(d, D3DRS_ALPHABLENDENABLE, blend);
         if (blend) { g_orgRS(d, D3DRS_SRCBLEND, D3DBLEND_SRCALPHA); g_orgRS(d, D3DRS_DESTBLEND, D3DBLEND_INVSRCALPHA); }
         g_orgRS(d, D3DRS_ZWRITEENABLE, (S.flags & SUB_NOZWRITE) ? FALSE : TRUE);
@@ -610,8 +853,24 @@ static HRESULT drawCustom(IDirect3DDevice9* d, bool faceOnly) {
         bool outline = (S.flags & SUB_OUTLINE) != 0;
         float bias = outline ? OUTLINE_DEPTH_BIAS : 0.0f, slope = outline ? OUTLINE_SLOPE_BIAS : 0.0f;
         g_orgRS(d, D3DRS_DEPTHBIAS, *(DWORD*)&bias); g_orgRS(d, D3DRS_SLOPESCALEDEPTHBIAS, *(DWORD*)&slope);
+        IDirect3DPixelShader9* ps = !colour ? gamePS : (S.flags & SUB_SHADELESS) && g_psShadeless ? g_psShadeless
+                                  : (S.flags & SUB_TOON) && g_psToon ? g_psToon : gamePS;
+        d->SetPixelShader(ps);
         hr = g_orgDIP(d, D3DPT_TRIANGLELIST, 0, 0, M.nv, S.first, S.count / 3);
+        DWORD ref = (S.flags >> SUB_REF_SHIFT) & SUB_REF_MASK;
+        bool hairSub = (S.flags & SUB_HAIR) != 0;
+        if (((atest && !blend && ref >= HAIR_CORE_MIN_REF) || hairSub) && !g_noHairFringe) {
+            g_orgRS(d, D3DRS_ALPHATESTENABLE, TRUE); g_orgRS(d, D3DRS_ALPHAFUNC, D3DCMP_GREATER);
+            g_orgRS(d, D3DRS_ALPHAREF, FRINGE_MIN_ALPHA);
+            g_orgRS(d, D3DRS_ALPHABLENDENABLE, TRUE);
+            g_orgRS(d, D3DRS_SRCBLEND, D3DBLEND_SRCALPHA); g_orgRS(d, D3DRS_DESTBLEND, D3DBLEND_INVSRCALPHA);
+            g_orgRS(d, D3DRS_ZWRITEENABLE, FALSE);
+            hr = g_orgDIP(d, D3DPT_TRIANGLELIST, 0, 0, M.nv, S.first, S.count / 3);
+        }
     }
+    d->SetPixelShader(gamePS); if (gamePS) gamePS->Release();
+    for (int k = 0; k < NNS; k++) { g_orgSTEX(d, NORMAL_MAP_STAGES[k], keepNrm[k]); if (keepNrm[k]) keepNrm[k]->Release(); }
+    g_orgSVSCF(d, UV_SELECT_REG, uvSel, 1);
     g_orgRS(d, D3DRS_ALPHABLENDENABLE, ab); g_orgRS(d, D3DRS_SRCBLEND, sb); g_orgRS(d, D3DRS_DESTBLEND, db);
     g_orgRS(d, D3DRS_ZWRITEENABLE, zw);
     g_orgRS(d, D3DRS_DEPTHBIAS, dbias); g_orgRS(d, D3DRS_SLOPESCALEDEPTHBIAS, sbias);
@@ -715,6 +974,26 @@ static HRESULT STDMETHODCALLTYPE mySVSCF(IDirect3DDevice9* d, UINT r, const floa
     return g_orgSVSCF(d, r, v, n);
 }
 
+#include "kitforce.h"
+// the stock kit draw, with forced PES14+ UVs and the pack's own sheet when
+// the run wears one of our kits; else the game's draw
+static HRESULT kitDraw(IDirect3DDevice9* d, D3DPRIMITIVETYPE t, INT bV, UINT mV, UINT nV, UINT sI, UINT nP) {
+    IDirect3DTexture9* hi = NULL; Forced* F = NULL;
+    if (g_runKitOk && g_tex0 == g_runKitTex && !g_kitForceOff && (hi = hiKit(d, g_runTid, g_runSlot)) != NULL)
+        F = forcedFor(d, t, (UINT)(bV + (INT)mV), mV, nV, sI, nP);
+    if (!F) return g_orgDIP(d, t, bV, mV, nV, sI, nP);
+    IDirect3DVertexBuffer9* keepVB = g_vb; UINT keepOff = g_vbOff, keepSt = g_stride;
+    IDirect3DIndexBuffer9* keepIB = g_ib; IDirect3DBaseTexture9* keepTex = g_tex0;
+    g_orgSSS(d, 0, F->vb, 0, F->stride);
+    g_orgSI(d, F->ib);
+    g_orgSTEX(d, 0, hi);
+    HRESULT hr = g_orgDIP(d, D3DPT_TRIANGLELIST, 0, 0, F->nverts, 0, F->ntris);
+    g_orgSSS(d, 0, keepVB, keepOff, keepSt);
+    g_orgSI(d, keepIB);
+    g_orgSTEX(d, 0, keepTex);
+    return hr;
+}
+
 static void grabDraw(IDirect3DDevice9* d, D3DPRIMITIVETYPE t, INT bV, UINT mV,
                      UINT nV, UINT sI, UINT nP) {
     wchar_t path[MAX_PATH];
@@ -784,7 +1063,7 @@ static HRESULT STDMETHODCALLTYPE myDIP(IDirect3DDevice9* d, D3DPRIMITIVETYPE t,
         int mk = findMarker(g_tex0);
         float key[3]; runKey(key);
         if (mk >= 0) {
-            g_pendingModel = modelForMarker(mk);
+            g_pendingModel = mk;
             if (g_pendingModel >= 0 && g_nKeyCur < MAX_KEYS) {
                 for (int c = 0; c < 3; c++) g_keyCur[g_nKeyCur].p[c] = key[c];
                 g_keyCur[g_nKeyCur++].model = g_pendingModel;
@@ -830,6 +1109,7 @@ static HRESULT STDMETHODCALLTYPE myDIP(IDirect3DDevice9* d, D3DPRIMITIVETYPE t,
             d->GetVertexDeclaration(&g_kitDecl); d->GetVertexShader(&g_kitVS);
             if (useModel(d, g_curModel)) patchKit(modelTeam(*g_cuM), g_tex0);
         }
+        g_runKitOk = kitOfSheet(g_tex0, g_runTid, g_runSlot);
     }
     int part = PART_OTHER;
     if (g_runPos >= 0 && (g_curModel >= 0 || g_pMask)) {
@@ -837,6 +1117,15 @@ static HRESULT STDMETHODCALLTYPE myDIP(IDirect3DDevice9* d, D3DPRIMITIVETYPE t,
         if (part == PART_OTHER && !hip) g_runPos = -1;   // left the player
     }
     if (g_runLog) { char m[128]; wsprintfA(m, "run%s m=%d pos=%d %u/%u/%u part=%d tex=%08x", hip ? " HIP" : "", g_curModel, (int)g_runPos, nV, nP, g_stride, part, (DWORD)g_tex0); logline(m); }
+    {
+        bool detailBoots = (nV == DETAIL_BOOTS_NV && nP == DETAIL_BOOTS_NP) || (nV == DETAIL_BOOT_NV && (nP == DETAIL_BOOT_L_NP || nP == DETAIL_BOOT_R_NP));
+        bool detailHands = nV == DETAIL_HANDS_NV && nP == DETAIL_HANDS_NP;
+        if (detailBoots || detailHands) {
+            int who; float dm = nearestExtremity(detailBoots, &who);
+            if (g_runLog) { char m[128]; wsprintfA(m, "  detail %s %u/%u/%u: nearest hidden model %d at %d mm", detailBoots ? "boots" : "hands", nV, nP, g_stride, who, (int)(dm * 1000)); logline(m); }
+            if (dm < DETAIL_OWNER_MAX_M) return D3D_OK;   // a hidden custom player's own
+        }
+    }
     if (g_runPos >= 0 && g_curModel >= 0 && useModel(d, g_curModel)) {
         bool main = nV == KIT_MAIN_NV && nP == KIT_MAIN_NP && g_stride == KIT_MAIN_STRIDE;
         bool hidden = (MODE_PART_HIDE[g_cuM->flags] >> part) & 1;
@@ -847,12 +1136,13 @@ static HRESULT STDMETHODCALLTYPE myDIP(IDirect3DDevice9* d, D3DPRIMITIVETYPE t,
         }
         if (main) {
             g_cuDrawn++;
-            if (!hidden) g_orgDIP(d, t, bV, mV, nV, sI, nP);
+            if (!hidden) kitDraw(d, t, bV, mV, nV, sI, nP);
             return drawCustomLod0(d);
         }
-        return hidden ? D3D_OK : g_orgDIP(d, t, bV, mV, nV, sI, nP);
+        return hidden ? D3D_OK : kitDraw(d, t, bV, mV, nV, sI, nP);
     }
     if (g_runPos >= 0 && ((g_pMask >> part) & 1)) return D3D_OK;
+    if (g_runPos >= 0 && g_runKitOk && g_tex0 == g_runKitTex) return kitDraw(d, t, bV, mV, nV, sI, nP);
     if (nV == BODY_NV && nP == BODY_NP && g_stride == BODY_STRIDE) {
         LONG k = g_bodyDraw++;
         if (k < 32 && ((g_bodyHide >> k) & 1)) return D3D_OK;
@@ -887,7 +1177,7 @@ static HRESULT STDMETHODCALLTYPE myDIP(IDirect3DDevice9* d, D3DPRIMITIVETYPE t,
     return g_orgDIP(d, t, bV, mV, nV, sI, nP);
 }
 
-// flags\shot: write the frame about to be presented to dllprobe\shots\frame.bmp
+// flags\shot: write the frame about to be presented to 4cc-players\shots\frame.bmp
 // (XWayland grabs of an occluded window come back black, 27-09).
 static void captureFrame(IDirect3DDevice9* d) {
     IDirect3DSurface9* bb = NULL; IDirect3DSurface9* sys = NULL;
@@ -934,8 +1224,9 @@ extern "C" __declspec(dllexport) void logic_present(IDirect3DDevice9* d) {
     g_drawIdx = 0;
     { static LONG lr = -1, lc = -1; if (g_kitRun != lr || g_cuDrawn != lc) { char m[96]; wsprintfA(m, "kit runs/frame=%d custom drawn=%d ", (int)g_kitRun, (int)g_cuDrawn); logline(m); lr = g_kitRun; lc = g_cuDrawn; } }
     if (g_runLog && f % 60 != 0) g_runLog = false;
-    g_kitRun = 0; g_cuDrawn = 0; g_runPos = -1;
+    g_kitRun = 0; g_cuDrawn = 0; g_runPos = -1; g_ntc = 0;
     memcpy(g_keyPrev, g_keyCur, sizeof(g_keyCur)); g_nKeyPrev = g_nKeyCur; g_nKeyCur = 0;
+    g_extCur ^= 1; g_nFeet[g_extCur] = g_nHands[g_extCur] = 0;
     if (f % 60 == 0) {
         g_hideMask = readFlagInt(L"hide", 0);
         g_bodyHide = readFlagInt(L"bodyhide", 0);
@@ -948,8 +1239,11 @@ extern "C" __declspec(dllexport) void logic_present(IDirect3DDevice9* d) {
         g_cuKeepGameTex = flagExists(L"gametex");
         g_cuGK = flagExists(L"customgk");
         g_cuCullCW = flagExists(L"cullcw");
-        readPicks();
-        if (flagExists(L"codedump")) {   // flags\codedump: "hexaddr hexlen" -> dllprobe\codedump.bin
+        g_kitForceOff = flagExists(L"nokitforce");
+        g_keepNormalMaps = flagExists(L"gamenormals");
+        g_noHairFringe = flagExists(L"nohairfringe");
+        g_shaderDump = flagExists(L"shaderdump");
+        if (flagExists(L"codedump")) {   // flags\codedump: "hexaddr hexlen" -> 4cc-players\codedump.bin
             wchar_t p[MAX_PATH]; lstrcpyW(p, FLAGDIR); lstrcatW(p, L"codedump");
             HANDLE f = CreateFileW(p, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE, NULL, OPEN_EXISTING, 0, NULL);
             char b[64] = {0}; DWORD r = 0; if (f != INVALID_HANDLE_VALUE) { ReadFile(f, b, 63, &r, NULL); CloseHandle(f); }
@@ -1021,6 +1315,8 @@ extern "C" __declspec(dllexport) void logic_uninstall() {
     for (int i = 0; i < g_nmodels; i++) releaseModel(g_models[i]);
     g_nmodels = 0;
     releaseModel(g_default); memset(&g_default, 0, sizeof(g_default)); g_cuM = NULL;
+    if (g_flatNormal) { g_flatNormal->Release(); g_flatNormal = NULL; }
+    if (g_psShadeless) g_psShadeless->Release(); if (g_psToon) g_psToon->Release(); g_psShadeless = g_psToon = NULL;
     logline("logic uninstalled");
     if (g_log != INVALID_HANDLE_VALUE) { CloseHandle(g_log); g_log = INVALID_HANDLE_VALUE; }
 }

@@ -1,15 +1,17 @@
 """Stamp a custom-body marker into a PES2012 face.bin (kitserver GDB face).
 
-    python3 mark_face.py <template face.bin> <marker 0-255> <out face.bin>
+    python3 mark_face.py <template face.bin> <player id> <out face.bin>
 
 drawlogic.dll identifies a player's draws by the face texture drawn just
 before his kit (all faces share one head mesh, 24-09). fserv serves this file
-for the player id in GDB/faces/map.txt, so the marker is keyed by player id.
+for the player id in GDB/faces/map.txt; the marker IS that player id, and
+drawlogic loads the body from custom/p<id>/ - no table, no count limit.
 
 The marker fills every block of the MARKED_MIPS smallest mips of every DXT
 texture in the file - invisible at play distances, and the face is hidden when
 the body is swapped. Each 8-byte unit (DXT1 colour block / DXT5 alpha and
-colour halves) becomes  'P' 'G' 'B' marker ~marker 0 0 0.  The game rebuilds
+colour halves) becomes  'P' 'G' 'D' id0 id1 id2 sum ~sum  (id = u24 LE,
+sum = id0 + id1 + id2 mod 256; drawlogic.cpp readMarker).  The game rebuilds
 faces into a 512x512 DXT5 atlas at load, so the tag is searched for, not
 addressed.
 """
@@ -17,7 +19,8 @@ import struct
 import sys
 import zlib
 
-MARKER_TAG = b'PGB'
+MARKER_TAG = b'PGD'
+MARKER_ID_MAX = 0xFFFFFF       # u24 player id
 MARKED_MIPS = 4               # 1x1 .. 8x8
 DDS_HEADER_BYTES = 128
 WESYS_HEADER_BYTES = 16
@@ -35,7 +38,11 @@ def rewesys(template, body):
 
 
 def marker_block(n):
-    return MARKER_TAG + bytes([n, 255 - n, 0, 0, 0])
+    if not 0 <= n <= MARKER_ID_MAX:
+        raise ValueError('player id %d does not fit the u24 marker' % n)
+    idb = n.to_bytes(3, 'little')
+    s = sum(idb) & 0xFF
+    return MARKER_TAG + idb + bytes([s, 0xFF - s])
 
 
 def mip_ranges(body, dds):
@@ -70,7 +77,7 @@ def mark(template_path, n, out_path):
     if not stamped:
         raise ValueError('no DXT texture in %s' % template_path)
     open(out_path, 'wb').write(rewesys(raw, bytes(body)))
-    print('stamped marker %d into %d texture(s) -> %s' % (n, stamped, out_path))
+    print('stamped player id %d into %d texture(s) -> %s' % (n, stamped, out_path))
 
 
 if __name__ == '__main__':

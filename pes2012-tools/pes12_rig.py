@@ -45,9 +45,23 @@ def face_rig(game=GAME):
     data = zlib.decompress(raw[16:]) if raw[3:8] == b'WESYS' else raw
     model = K.parse_bytes(data[data.find(b'KTMDL'):])
     joints = [np.array(b['matrix'], float).reshape(4, 4)[3, :3].round(5).tolist() for b in model['bones']]
+    packet = model['packets'][FACE_PACKET]
+    pal = packet['bonePalette']
+    # The stock face's own skinned vertices (head-local, per-vertex weights
+    # on rig bones): pes15_to_pes12 transfers them onto custom faces.
+    verts = []
+    for v in packet['vertices']:
+        ex = list(v.get('BLENDWEIGHT', []))
+        ws = [1.0 - sum(ex)] + ex        # skin VS: index 0 takes the remainder
+        w = {}
+        for k, x in zip(v['BLENDINDICES'], ws):
+            if x > 0:
+                w[pal[k]] = round(w.get(pal[k], 0.0) + x, 4)
+        verts.append([[round(c, 5) for c in v['POSITION'][:3]], w])
     return {'joints': joints,
             'parents': [b['parentIndex'] for b in model['bones']],
-            'palette': model['packets'][FACE_PACKET]['bonePalette']}
+            'palette': pal,
+            'verts': verts}
 
 
 def load_face_rig(path=None):
@@ -57,11 +71,13 @@ def load_face_rig(path=None):
     return json.load(open(path))
 
 
-BODY_IMG, BODY_ENTRY, BODY_BLOCK = 'dt09.img', 349, 2
+BODY_IMG, BODY_ENTRY, BODY_BLOCK = 'dt09.img', 349, 2    # the 19-bone in-match body (24-09)
 BODY_JSON = os.path.join(OUT_DIR, 'body349b2_bones.json')
 
 
 def body_bones(game=GAME):
+    """The 19 bones + their palette slots in dt09 #349 block 2: bone index,
+    palette slot, parent, StrCode-like id, bind position (metres)."""
     K = ktmdl_reader()
     raw = afs.read(os.path.join(game, 'img', BODY_IMG), BODY_ENTRY)
     data = zlib.decompress(raw[16:]) if raw[3:8] == b'WESYS' else raw
@@ -77,11 +93,12 @@ def body_bones(game=GAME):
     return {'palette': palette,
             'bones': [{'bone': i, 'slot': palette.index(i),
                        'parent': b['parentIndex'], 'id': b['nameIdHex'],
-                       'pos': [np.array(b['matrix'], float).reshape(4, 4)[3, :3].round(3).tolist()][0]}
+                       'pos': np.array(b['matrix'], float).reshape(4, 4)[3, :3].round(3).tolist()}
                       for i, b in enumerate(model['bones'])]}
 
 
 def load_body_bones(path=None):
+    """The 19 body bones this script extracted (BODY_JSON unless given)."""
     path = path or BODY_JSON
     if not os.path.exists(path):
         raise SystemExit('no %s: run pes12_rig.py <game dir> first' % path)

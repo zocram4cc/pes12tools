@@ -126,8 +126,8 @@ body palette):
   `pgb2_face` submeshes use these; their positions are head-local
   (minus `HEAD_POS`) on export.
 
-Weights follow the PGB2 convention (tools/fmdl_to_pes12.py): n bones
-carry n-1 explicit weights, the remainder lands on the last slot.
+Weights follow PES2012's skin VS (tools/fmdl_to_pes12.py skin_pack):
+slot 0 takes the remainder 1 - (w0 + w1 + w2), slot k + 1 takes w[k].
 
 ### KTMDL objects (from PES2012 BIN import)
 

@@ -11,10 +11,9 @@ Attribute dict per vertex (all optional except pos):
   pos (x,y,z) file coords, nrm, tan, uv [(u,v) per TEXCOORD channel],
   w [(slot, weight)] skinning, col D3DCOLOR float4 if the decl has one.
 
-Skinning rule (tools/fmdl_to_pes12.py): n bones carry n-1 explicit
-weights with the remainder on the last slot: BLENDWEIGHT FLOATn takes
-the first n sorted weights, BLENDINDICES UBYTE4 the slots padded by
-repeating the last. Unweighted templates keep their bytes (balls).
+Skinning rule (PES2012's skin VS, tools/fmdl_to_pes12.py skin_pack):
+slot 0 takes the remainder, BLENDWEIGHT FLOATn the weights of slots
+1..n. Unweighted templates keep their bytes (balls).
 """
 import struct
 

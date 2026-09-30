@@ -15,8 +15,7 @@ drawlogic.dll PGB2 format:
 flags: which stock parts the model replaces (drawlogic MODE_*): 0 BODY all of
 them, 1 HEAD the head only (face-slot players: head, hair and accessories over
 the stock body), 2 KIT all but shirt/shorts/socks/boots, 3 BOOTS all but the
-boots. <game>/kitserver/4cc-players/custom/<name>/mode (head|body|kit|boots)
-overrides it.
+boots. <game>/kitserver/4cc-players/custom/<name>/mode (head|body|kit|boots) overrides it.
 subFlags (drawlogic SUB_*), from the material's .mtl states: bit0 alpha test
 (ref = bits 8-15, pass alpha > ref), bit1 alpha blend, bit2 two-sided, bit3 no
 depth write, bit4 kit slot (UVs on PES2012's kit sheet; drawlogic binds the
@@ -57,6 +56,11 @@ MODE_NAMES = ('body', 'head', 'kit', 'boots')
 # y -0.17.., boots id 55 = none).
 OWN_FEET_Y = 0.05
 SUB_ALPHATEST, SUB_BLEND, SUB_TWOSIDED, SUB_NOZWRITE, SUB_KIT, SUB_OUTLINE, SUB_FACE = 1, 2, 4, 8, 16, 32, 64
+SUB_SHADELESS, SUB_TOON = 1 << 16, 1 << 17   # drawlogic's own pixel shaders (custom_ps.hlsl)
+# PES material shaders drawn unlit / cel-shaded instead of with PES2012's lit
+# kit shader (739 Shadeless, 177 Constant, 382 Pony materials in the packs).
+SHADELESS_SHADERS = ('Shadeless', 'Constant')
+TOON_SHADERS = ('Pony',)
 # toon outline shells (inverted hulls) by material name: drawlogic pushes them
 # back in depth so they only show past the silhouette
 OUTLINE_MATERIAL = re.compile(r'outline', re.I)
@@ -65,9 +69,35 @@ SUB_REF_SHIFT = 8
 # alpha: median 0, 90th percentile 39 on DEVELOPERS, 27-09): drawn with its
 # alphablend state the hair vanished. Drawn opaque and two-sided instead.
 OPAQUE_SHADERS = ('Hair',)
+# ... but its soft strand edges exist (hair_col partial alpha 11-38 % on
+# Stallman, Rossmann, No Time For Love): drawlogic draws a SUB_HAIR sub opaque
+# and adds a blended fringe pass from its alpha (30-09: matte hair).
+SUB_HAIR = 1 << 18
+# A Hair texture whose alpha is mostly empty is not an opacity map (DEVELOPERS'
+# hair_col: 87 % zero, drawn by alpha the hair vanished, 27-09); one with this
+# share of solid texels is (Stallman 55 %, No Time For Love 56 %).
+HAIR_MIN_SOLID = 0.25
+HAIR_SOLID_ALPHA = 250
+
+
+def hair_has_opacity(tex):
+    """True when a hair texture's alpha channel is a real opacity map."""
+    try:
+        import numpy as np
+        from PIL import Image
+        a = np.asarray(Image.open(tex).convert('RGBA'))[..., 3]
+    except Exception:
+        return False
+    return (a >= HAIR_SOLID_ALPHA).mean() >= HAIR_MIN_SOLID
 SHADER_KEY = '_shader'              # parse_mtl stores the material's shader among its states
 KIT_TEXTURE = '<kit slot>'     # tex_index key of the kit-slot stand-in texture
-MAX_TEX_PX = 512                # textures downscaled: 22 bodies must fit a 32-bit process
+# Textures stay DXT-compressed at their own size up to this (drawlogic uploads
+# the DDS as is; PES2015/2017, also 32-bit, hold these packs the same way).
+# 4096 atlases (/u/'s players.dds) drop one mip level. Provisional: 2048 is
+# the stadium tool's cap too; raise it if memory allows (48 bodies resident).
+MAX_TEX_PX = 2048
+DDS_SIZE_OFF, DDS_FOURCC_OFF = 12, 84      # DDS header: u32 height, width; pixel-format fourcc
+DDS_DXT = (b'DXT1', b'DXT3', b'DXT5')
 WHOLE_BODY_NAMES = re.compile(r'parts_body|oral_kit|oral_nagi')
 WHOLE_BODY_MIN_VERTS = 20000    # a single model this big is a body, not an accessory
 SKIP_MATERIALS = re.compile(r'occlusion|antiblur|antiglow', re.I)
@@ -95,7 +125,7 @@ def joint(bone):
 # PES2012's in-match body has one bone per hand; its own hands are modelled
 # curled. A 4cc PES15 hand is authored flat on finger bones this game does not
 # have, so it is bent into PES's relaxed hand before being baked onto the hand
-# bone: the flexion of PES's normal.gani (mcp 15,
+# bone: the flexion of PES's normal.gani (GameplayFootball AGENTS.md: mcp 15,
 # pip 32, dip 20 degrees). The thumb is left as authored.
 # ponytail: one fixed pose; per-player grips (fists, keepers) would need the finger bones
 FINGER_CURL_DEG = {'mcp': 15.0, 'pip': 32.0, 'dip': 20.0}
@@ -198,9 +228,10 @@ def parse_mtl(path):
 
 def sub_flags(states):
     """PES15 material states -> drawlogic submesh flags."""
-    f = 0
-    if states.get(SHADER_KEY) in OPAQUE_SHADERS:
-        return SUB_TWOSIDED
+    shader = states.get(SHADER_KEY)
+    f = SUB_SHADELESS if shader in SHADELESS_SHADERS else SUB_TOON if shader in TOON_SHADERS else 0
+    if shader in OPAQUE_SHADERS:
+        return SUB_TWOSIDED | SUB_HAIR
     if states.get('alphatest') == '1':
         f |= SUB_ALPHATEST | (int(states.get('alpharef') or 0) << SUB_REF_SHIFT)
     if states.get('alphablend') == '1':
@@ -212,27 +243,73 @@ def sub_flags(states):
     return f
 
 
+COMMON_MTL = 'model/character/uniform/common/'   # engine path a PES17 pack ships as its Common/ dir
+
+
+def common_dir(folder):
+    """The pack's Common/ dir, sibling of Faces/."""
+    return os.path.normpath(os.path.join(os.path.dirname(os.path.abspath(folder)), '..', 'Common'))
+
+
+def pack_mtl(folder, material):
+    """face.xml material attribute -> parsed mtl: ./file in the face folder,
+    or an engine uniform/common/<tid>/file.mtl the pack ships in Common/ (/u/
+    points its face, hands and body at common/756/player.mtl). Common/ mtl
+    paths are relative to Common/, so its ./ samplers are rewritten to the
+    engine path resolve_texture already maps there. None: nothing to parse."""
+    if material.startswith('./'):
+        return parse_mtl(os.path.join(folder, material[2:]))
+    if material.startswith(COMMON_MTL):
+        path = os.path.join(common_dir(folder), material.rsplit('/', 1)[-1])
+        if os.path.isfile(path):
+            return {k: (COMMON_MTL + 'XXX/' + d[2:] if d and d.startswith('./') else d, s)
+                    for k, (d, s) in parse_mtl(path).items()}
+    return None
+
+
+KIT0_MODEL = re.compile(r'(.*u0(?:xxx|\d{3})p)0(\.model)$', re.I)
+
+
+def xml_model_pattern(path):
+    """face.xml model path (after './') -> regex over the folder's files. The
+    per-strip 4cc trick names kit slot 0 (u0XXXp0.model: the strip being
+    worn) and ships u0XXXp1..p5; kit 1 stands in, as for p0 textures
+    (XXX20 - Handcrafting, 30-09)."""
+    m = KIT0_MODEL.match(path)
+    if m:
+        path = m.group(1) + '1' + m.group(2)
+    return re.compile('^' + re.escape(path).replace('\\*', '.*') + '$', re.I)
+
+
 def model_materials(folder):
     """-> {model file: {material: (diffuse, states)}}. face.xml names the mtl
     for the models it lists; the standard hair_high it does not list takes its
     materials from every .mtl in the folder."""
     xml = os.path.join(folder, 'face.xml')
     models = sorted(f for f in os.listdir(folder) if f.endswith('.model'))
+    # Which file's material wins: PES's own hair (hair.mtl, eye.mtl, ...) is
+    # authoritative; face.mtl's leftovers (head_phong with a missing sampler)
+    # are the empties face_diff.bin fills in game.
     shared = {}
-    for f in sorted(os.listdir(folder)):
-        if f.endswith('.mtl'):
-            try:
-                shared.update(parse_mtl(os.path.join(folder, f)))
-            except ET.ParseError:   # 4cc folders carry stale/binary .mtl copies no model uses
-                print('skipping unparseable %s' % f)
+    files = sorted((f for f in os.listdir(folder) if f.endswith('.mtl')),
+                   key=lambda f: (0, f) if f in OWN_MTLS else (1, f))
+    for f in files:
+        try:
+            for k, v in parse_mtl(os.path.join(folder, f)).items():
+                shared.setdefault(k, v)
+        except ET.ParseError:   # 4cc folders carry stale/binary .mtl copies no model uses
+            print('skipping unparseable %s' % f)
     if os.path.exists(xml):
         text = read_text(xml)
         mapping = {}
-        for m in re.finditer(r'<model[^>]*path="\./([^"]+)"[^>]*material="\./([^"]+)"', text, re.S):
-            pat = re.compile('^' + re.escape(m.group(1)).replace('\\*', '.*') + '$')
+        for m in re.finditer(r'<model[^>]*path="\./([^"]+)"[^>]*material="([^"]+)"', text, re.S):
+            pat = xml_model_pattern(m.group(1))
+            mtl = pack_mtl(folder, m.group(2))
+            if mtl is None:
+                continue
             for f in models:
                 if pat.match(f):
-                    mapping[f] = parse_mtl(os.path.join(folder, m.group(2)))
+                    mapping[f] = mtl
         # PES loads what face.xml lists plus the standard hair; anything else
         # in the folder is a leftover it never draws (Terry's unweighted
         # oral_head, the grey "modD_phone" hair_d copied into four folders),
@@ -246,7 +323,16 @@ def model_materials(folder):
 # oral_hair, y -0.15..0.17 around the head joint; placed at the origin it lay
 # on the pitch).
 HEAD_TYPES = ('head',)
-STANDARD_HAIR = re.compile(r'hair_high_.*\.model$')   # PES15 loads it without a face.xml entry
+# face.xml types whose diffuse PES replaces with the kit texture (Rigged Wiki
+# Blender tutorials: a "uniform" line's diffuse "will always be forced to the
+# kit texture"; the rest are PES's own garment parts).
+KIT_TYPES = ('uniform', 'uniform_sub', 'shirt', 'collar', 'sleeve_sub', 'pants_sub',
+             'pants_nocloth', 'thigh_short', 'thigh_long')
+STANDARD_HAIR = re.compile(r'hair_high_.*\.model$')
+# The pack's own .mtl files: their material samplers are authoritative over
+# face.mtl leftovers of the same name (face_diff.bin fills them in game).
+OWN_MTLS = ('hair.mtl', 'eye.mtl', 'eye_occlusion.mtl', 'hair_parts.mtl')
+   # PES15 loads it without a face.xml entry
 HEAD_BONE = 'sk_head'
 
 
@@ -258,11 +344,14 @@ def model_types(folder):
     text = read_text(xml)
     models = sorted(f for f in os.listdir(folder) if f.endswith('.model'))
     out = {}
-    for m in re.finditer(r'<model[^>]*type="([^"]+)"[^>]*path="\./([^"]+)"', text, re.S):
-        pat = re.compile('^' + re.escape(m.group(2)).replace('\\*', '.*') + '$')
+    for tag in re.findall(r'<model\b[^>]*>', text, re.S):   # attributes in any order
+        attr = dict(re.findall(r'(\w+)="([^"]*)"', tag))
+        if 'type' not in attr or not attr.get('path', '').startswith('./'):
+            continue
+        pat = xml_model_pattern(attr['path'][2:])
         for f in models:
             if pat.match(f):
-                out[f] = m.group(1)
+                out[f] = attr['type']
     return out
 
 
@@ -290,11 +379,32 @@ FACE_CONTROLLER_BONES = (25, 26, 27, 28)
 FACE_BONE = re.compile(r'skf_')
 FACE_SIDE_EPS_M = 0.005     # |x| below this is the centre line
 FACE_MATCH_MAX_M = 0.03     # a PES15 face bone farther than this from every PES2012 one rides the skull
+# PES15 face bone -> PES2012 face rig bone, by role. Nearest-joint alone sent
+# upper and lower lip (and both eyelids) to one bone, so mouths could not open
+# and lids blinked as one, and missed the brows/cheeks entirely (PES2012 pivots
+# them deep in the head): janky faces on /sci/ Feynman and every PES-template
+# face (30-09). Roles read off the rig's joint tree (dt0c #132, head-local,
+# pes12_rig.face_rig; every stock face shares it): 1 jaw pivot -> 2 lower
+# mouth -> 3/4 lower lip L/R; 7 upper mouth -> 8/9 upper lip L/R; 22/23 mouth
+# corners L/R; 12/13 upper eyelids L/R, 14/15 lower; 16/17 inner brows L/R,
+# 18/19 outer; 10/11 cheeks L/R; 20/21 nostrils L/R. L = +x (PES15 '_l').
+JAW_BONE = 'skf_jaw'
+THROAT_BONES = ('sk_neck', 'dsk_scm', 'sk_chest')
+JAW_THROAT_NECK_SHARE = 0.5   # provisional: the chin underside half follows the neck
+FACE_ROLES = {
+    'skf_jaw': 1, 'skf_doublechin': 2, 'skf_lip_b_c': 2, 'skf_lip_t_c': 7, 'skf_lip_volume': 7,
+    'skf_lip_b_l': 3, 'skf_lip_b_r': 4, 'skf_lip_t_l': 8, 'skf_lip_t_r': 9,
+    'skf_lip_s_l': 22, 'skf_lip_s_r': 23,
+    'skf_eyelid_t_l': 12, 'skf_eyelid_t_r': 13, 'skf_eyelid_b_l': 14, 'skf_eyelid_b_r': 15,
+    'skf_orbicularisoculi_b_l': 14, 'skf_orbicularisoculi_b_r': 15,
+    'skf_brow_i_l': 16, 'skf_brow_i_r': 17, 'skf_brow_o_l': 18, 'skf_brow_o_r': 19,
+    'skf_cheek_l': 10, 'skf_cheek_r': 11, 'skf_nosewing_l': 20, 'skf_nosewing_r': 21,
+}
 
 
 def face_slots(bind, rig):
-    """{PES15 skf_* bone: PES2012 face palette slot}, nearest joint on the same
-    side of the face; head-local = render bind minus sk_head (the head's
+    """{PES15 skf_* bone: PES2012 face palette slot}: by role (FACE_ROLES),
+    else the nearest joint on the same side of the face; head-local = render bind minus sk_head (the head's
     PES_ALIGN is identity)."""
     head = bind.get(HEAD_BONE)
     if head is None:
@@ -310,41 +420,306 @@ def face_slots(bind, rig):
         best = min(((sum((a - c) ** 2 for a, c in zip(loc, cj)), sl) for sl, cj in cands if side(cj[0]) == side(loc[0])),
                    default=(1e9, None))
         out[name] = best[1] if best[0] <= FACE_MATCH_MAX_M ** 2 else pal.index(FACE_SKULL_BONE)
+        if FACE_ROLES.get(name) in pal:
+            out[name] = pal.index(FACE_ROLES[name])
     return out
 
 
-def pack_face_vertex(pos, head_pos, raw, fslots, skull_slot, rest):
+# Face weights come from PES2012's own face, not from mapping bones. PES
+# pivots its lip/jaw bones differently from PES2012's (PES2012's lower lip
+# joints sit 2 cm from where their vertices are, and move 20 mm when the jaw
+# opens), so every bone-to-bone mapping tore Feynman's mouth open (30-09).
+# Instead each custom face vertex takes the rig weights of the stock face
+# (pes12_rig face_rig 'verts', head-local) blended from its nearest
+# FACE_TRANSFER_K stock vertices, scaled by how much PES's own rig moves it
+# (its non-sk_head share); the rest rides the skull.
+FACE_TRANSFER_K = 4
+FACE_TRANSFER_EPS_M = 0.002     # inverse-distance floor
+FACE_TRANSFER_MAX_M = 0.02      # farther from the stock face than this: skull only (helmets, hair)
+_face_tree = {}
+
+
+# The custom face is laid onto the stock one before the lookup: each axis is
+# mapped piecewise-linearly through landmarks both rigs name (PES bone on the
+# custom face -> centroid of the stock vertices weighted to the matching rig
+# bones, measured on dt0c #132 30-09). Feynman's mouth sits 1.3 cm lower and
+# 1.7 cm further forward than the stock mouth; unaligned, his lips read the
+# stock chin.
+FACE_LANDMARKS = (          # (PES15 bone, stock landmark head-local x, y, z)
+    ('skf_lip_s_l', (0.019, -0.021, 0.100)), ('skf_lip_s_r', (-0.019, -0.021, 0.100)),
+    ('skf_lip_t_c', (0.0, -0.017, 0.106)), ('skf_lip_b_c', (0.0, -0.023, 0.106)),
+    ('skf_eyelid_t_l', (0.031, 0.054, 0.097)), ('skf_eyelid_t_r', (-0.031, 0.054, 0.097)),
+)
+
+
+def face_align(bind):
+    """PES head-local -> stock-face head-local, per axis piecewise linear."""
+    head = bind.get(HEAD_BONE)
+    pairs = [([a - b for a, b in zip(bind[n], head)], t) for n, t in FACE_LANDMARKS if n in bind and head]
+    if len(pairs) < 3:
+        return None
+    axes = []
+    for k in range(3):
+        pts = sorted({round(src[k], 4): tgt[k] for src, tgt in pairs}.items())
+        axes.append(([a for a, _ in pts], [b for _, b in pts]))
+
+    def f(p):
+        import numpy as np
+        return [float(np.interp(p[k], *axes[k])) + (p[k] - axes[k][0][0] if p[k] < axes[k][0][0] else
+                (p[k] - axes[k][0][-1] if p[k] > axes[k][0][-1] else 0.0)) if len(axes[k][0]) > 1 else
+                p[k] + axes[k][1][0] - axes[k][0][0] for k in range(3)]
+    return f
+
+
+def stock_face_weights(rig, loc):
+    """Head-local point (on the stock face) -> {rig bone: weight} blended from
+    its stock vertices; the neck/eye controllers are left out (they move the
+    stock face relative to its own skull, which our face copy rides)."""
+    key = id(rig)
+    if key not in _face_tree:
+        from scipy.spatial import cKDTree
+        pts = [v[0] for v in rig['verts']]
+        _face_tree[key] = (cKDTree(pts), [{int(b): w for b, w in v[1].items() if int(b) not in FACE_CONTROLLER_BONES}
+                                          for v in rig['verts']])
+    tree, ws = _face_tree[key]
+    d, ii = tree.query(loc, k=FACE_TRANSFER_K)
+    if d[0] > FACE_TRANSFER_MAX_M:
+        return None
+    out, tot = {}, 0.0
+    for dist, i in zip(d, ii):
+        f = 1.0 / max(dist, FACE_TRANSFER_EPS_M)
+        tot += f
+        for b, w in ws[i].items():
+            out[b] = out.get(b, 0.0) + f * w
+    tot = sum(out.values()) or 1.0
+    return {b: w / tot for b, w in out.items()}
+
+
+def face_bone_dist(m, bind, align, rig):
+    """{PES15 skf_* bone: {face palette slot: share}}: what the stock face does
+    where this bone moves the custom face. Every vertex the bone weights looks
+    up the stock face at its aligned position; the bone's share of those
+    stock weights, summed over its vertices, is the bone's recipe. Per BONE,
+    not per vertex: a per-vertex lookup copied the stock face's seams onto
+    the custom one (inner mouth folded into spikes, 30-09), while this keeps
+    the pack's own smooth weights and only swaps what each bone drives."""
+    head = bind.get(HEAD_BONE)
+    if not rig or 'verts' not in rig or head is None:
+        return {}
+    pal = rig['palette']
+    acc = {}
+    for mesh in m.meshes:
+        bones = mesh.boneGroup.bones if mesh.boneGroup else []
+        for v in mesh.vertices:
+            skf = [(bones[k].name, w) for k, w in (v.boneMapping or {}).items()
+                   if k < len(bones) and FACE_BONE.match(bones[k].name)]
+            if not skf:
+                continue
+            loc = [a - b for a, b in zip((v.position.x, v.position.y, v.position.z), head)]
+            stock = stock_face_weights(rig, align(loc) if align else loc)
+            if stock is None:
+                continue
+            for name, w in skf:
+                d = acc.setdefault(name, {})
+                for b, x in stock.items():
+                    if b in pal:
+                        d[pal.index(b)] = d.get(pal.index(b), 0.0) + w * x
+    out = {}
+    for name, d in acc.items():
+        tot = sum(d.values()) or 1.0
+        out[name] = {sl: x / tot for sl, x in d.items() if x / tot >= FACE_DIST_MIN_SHARE}
+    return out
+
+
+FACE_DIST_MIN_SHARE = 0.05      # drop a bone's minor stock influences (keeps 4 per vertex usable)
+
+
+def pack_face_vertex(pos, head_pos, raw, fslots, skull_slot, rest, dist=None):
     """The face-local copy of a head-only vertex: position minus the PES2012
-    head joint, weights on face palette slots (PES2012 convention: n bones =
-    n-1 explicit weights, padding repeats the last slot). rest = the packed
-    normal/binormal/tangent/uv tail of the body vertex."""
+    head joint, weights on face palette slots (packed by F.skin_pack). rest =
+    the packed normal/binormal/tangent/uv tail of the body vertex. With the
+    bone's recipe (face_bone_dist), its weight spreads as the stock face
+    spreads it; else the role/nearest slot (face_slots)."""
     w = {}
     for name, wt in raw:
-        sl = fslots.get(name, skull_slot)
-        w[sl] = w.get(sl, 0.0) + wt
+        recipe = (dist or {}).get(name)
+        if recipe:
+            tot = sum(recipe.values())
+            for sl, x in recipe.items():
+                w[sl] = w.get(sl, 0.0) + wt * x / tot
+        else:
+            sl = fslots.get(name, skull_slot)
+            w[sl] = w.get(sl, 0.0) + wt
     if not w:
         w = {skull_slot: 1.0}
     top = sorted(w.items(), key=lambda kv: -kv[1])[:F.MAX_INFLUENCES]
     tw = sum(x for _, x in top) or 1.0
-    slots = [sl for sl, _ in top]
-    ws = [x / tw for _, x in top][:-1]
-    slots += [slots[-1]] * (F.MAX_INFLUENCES - len(slots))
-    ws += [0.0] * (F.MAX_INFLUENCES - len(ws))
-    return struct.pack('<3f3f4B', *[a - b for a, b in zip(pos, head_pos)], *ws[:3], *slots) + rest
+    ws, slots = F.skin_pack([(sl, x / tw) for sl, x in top])
+    return struct.pack('<3f3f4B', *[a - b for a, b in zip(pos, head_pos)], *ws, *slots) + rest
+
+
+# PES's deform helpers (dsk_*) turn part of the way between the two bones of
+# a joint; PES2012's skeleton has no such bones. Glued onto one neighbour
+# (fmdl_to_pes12.main_bone) a knee helper swings wholly with the shin and the
+# knee pinches when the leg bends (/u/, 29-09 replay), skirt hems shatter.
+# Split its weight between the joint's two bones instead: a vertex weighted
+# half to each follows the joint at about half its angle, as a half-rotation
+# helper does. Provisional: PES's per-helper ratios are not read, 0.5 is the
+# half-angle convention. dsk_forearm_t is not a joint helper: it carries the
+# hand's roll along the forearm, and split into sk_hand it bent half the
+# forearm with every wrist flex (cuffs pulled off the hands, Kurisu 30-09);
+# it stays on the forearm (main_bone).
+HELPER_SHARE = 0.5
+HELPER_JOINTS = (   # helper pattern -> (bone above, bone below); \1 = side
+    (re.compile(r'dsk_knee_([lr])$'), ('sk_thigh_\\1', 'sk_leg_\\1')),
+    (re.compile(r'dsk_elbow_([lr])$'), ('sk_upperarm_\\1', 'sk_forearm_\\1')),
+    (re.compile(r'dsk_wrist_([lr])$'), ('sk_forearm_\\1', 'sk_hand_\\1')),
+    (re.compile(r'dsk_hem_([lr])$'), ('dsk_hip', 'sk_thigh_\\1')),
+)
+
+
+def helper_split(name):
+    """Deform helper -> [(bone, share), ...] across its joint, else None."""
+    for pat, (above, below) in HELPER_JOINTS:
+        m = pat.match(name)
+        if m:
+            return [(m.expand(above), 1.0 - HELPER_SHARE), (m.expand(below), HELPER_SHARE)]
+    return None
+
+
+# Joint seams. Each bone carries its geometry rigidly from PES's render bind
+# onto PES2012's bone (PES_ALIGN rotation about its own head), but the two
+# skeletons' proportions differ, so the joint a parent's piece reaches is
+# not where PES2012 puts the child: chest->shoulder 10 cm, shoulder->upper
+# arm 8, knee 7, hip 6.5, wrist 5, neck 4 (30-09). Every limb then tore or
+# creased at its joints. The parent's piece is warped instead: a vertex moves
+# by each child joint's error, scaled by how far along that child's segment
+# it sits (0 at the parent's own head, 1 at the joint) and shared between
+# children by inverse distance, so the piece meets every child exactly and
+# is untouched at its own head. Only toward children the model has geometry
+# on: with no child piece there is no seam, and the clamped warp bends flat
+# faces (XXX20 - Handcrafting: a block character all on sk_belly, whose face
+# decal the belly->chest warp tilted 2.6 cm into the head, 30-09).
+def _seam_table(p12, used):
+    parent = {b: retarget.PES_RENDER_BIND[b][1] for b in F.FOX_TO_PES12 if b in retarget.PES_RENDER_BIND}
+    out = {}
+    for bone in parent:
+        head = retarget.PES_RENDER_BIND[bone][0]
+        kids = []
+        for child, par in parent.items():
+            if par != bone or child not in F.FOX_TO_PES12 or child not in used:
+                continue
+            j = retarget.PES_RENDER_BIND[child][0]
+            placed = _place(bone, j, p12)
+            err = [a - b for a, b in zip(p12[F.FOX_TO_PES12[child]], placed)]
+            seg = [a - b for a, b in zip(j, head)]
+            ln2 = sum(c * c for c in seg)
+            if ln2 > 0 and any(abs(c) > 0 for c in err):
+                kids.append((j, seg, ln2, err))
+        if kids:
+            out[bone] = (head, kids)
+    return out
+
+
+def used_bones(folder, mats):
+    """Main Fox bones carrying any weight in the models convert() loads."""
+    used = set()
+    for fname in mats:
+        if SKIP_FILES.search(fname):
+            continue
+        m = load_model(os.path.join(folder, fname))
+        bind = {b.name: joint(b) for b in m.bones}
+        for mesh in m.meshes:
+            bones = mesh.boneGroup.bones if mesh.boneGroup else []
+            for v in mesh.vertices:
+                for bi in (v.boneMapping or {}):
+                    if bi >= len(bones):
+                        continue
+                    name = bones[bi].name
+                    try:
+                        used.update(b for b, _ in (helper_split(name) or [(F.main_bone(name, bind), 1.0)]))
+                    except KeyError:
+                        pass
+    return used
+
+
+def _place(bone, p, p12):
+    a = retarget.PES_RENDER_BIND[bone][0]
+    q = retarget.PES_ALIGN.get(bone, (0.0, 0.0, 0.0, 1.0))
+    r = retarget._q_rot(q, tuple(pi - ai for pi, ai in zip(p, a)))
+    t = p12[F.FOX_TO_PES12[bone]]
+    return [t[k] + r[k] for k in range(3)]
+
+
+def seam_offset(bone, p, seams):
+    """PES2012-space displacement of source point p carried by `bone`."""
+    got = seams.get(bone)
+    if got is None:
+        return (0.0, 0.0, 0.0)
+    head, kids = got
+    d = [pi - hi for pi, hi in zip(p, head)]
+    acc, wsum = [0.0, 0.0, 0.0], 0.0
+    for j, seg, ln2, err in kids:
+        t = min(1.0, max(0.0, sum(a * b for a, b in zip(d, seg)) / ln2))
+        dist2 = sum((pi - ji) ** 2 for pi, ji in zip(p, j)) + SEAM_EPS_M2
+        w = 1.0 / dist2
+        for k in range(3):
+            acc[k] += w * t * err[k]
+        wsum += w
+    return tuple(c / wsum for c in acc)
+
+
+# keeps the inverse-distance share finite at a joint (1 cm squared)
+SEAM_EPS_M2 = 1e-4
+
+
+KIT_STAND_INS = ('kit.dds',)
+SKIN_MATERIALS = ('face_phong', 'head_phong', 'fox_skin_mat')   # PES face / head base meshes
 
 
 def resolve_texture(folder, diffuse, material, kit_dds):
-    """Local ./file.dds; engine paths (model/character/uniform/...) -> the team kit."""
+    """Local ./file.dds; a PES17 pack's sibling Common/ dir (the
+    uniform/common/XXX/*.dds its materials.mtl point at - 4ccg's cracks,
+    grim, eslking ...; dummy_kit.dds is the only one that stays the team
+    kit); other engine uniform paths -> the team kit."""
     if diffuse and diffuse.startswith('./'):
-        # PES runs on Windows, where ./temple.dds opens Terry's Temple.dds
+        # PES runs on Windows, where ./temple.dds opens Terry's Temple.dds.
+        # PES17 packs write the team number as an XXX placeholder and point
+        # at kit slot 0 (./u0XXXp0, ./u0769p0); see below.
         want = diffuse[2:].lower()
+        cands = [want]
+        # PES17 packs point at kit slot 0 (./u0XXXp0, ./u0769p0) but ship
+        # only slots 1..4 (u0768p1, garshirt_u0xxxp1, skin_u0XXXp1, ...):
+        # resolve to the kit-1 file, the stand-in the kit slot also uses.
+        m = re.match(r'(.*)u0(xxx|\d{3})p0(\.dds)$', want)
+        if m:
+            pre, _, ext = m.groups()
+            pat = re.compile(re.escape(pre) + r'u0(?:xxx|\d{3})p1' + re.escape(ext))
+            for f in sorted(os.listdir(folder)):
+                if pat.fullmatch(f.lower()):
+                    cands.append(f.lower())
         for f in os.listdir(folder):
             p = os.path.join(folder, f)
-            if f.lower() == want and os.path.getsize(p) > 128:
+            if f.lower() in cands and os.path.getsize(p) > 128:
                 return p
+    if diffuse and diffuse.startswith(COMMON_MTL):
+        leaf = diffuse.rsplit('/', 1)[-1]
+        if leaf != 'dummy_kit.dds':
+            p = os.path.join(common_dir(folder), leaf)
+            if os.path.isfile(p) and os.path.getsize(p) > 128:
+                return p
+            for cand in (os.path.join(folder, leaf),):
+                if os.path.isfile(cand) and os.path.getsize(cand) > 128:
+                    return cand
     if (material.startswith(('uni_', 'kit')) or (diffuse or '').startswith('model/character/uniform')) and kit_dds:
         return kit_dds  # engine uniform texture (dummy_kit.dds, ...) = the team kit
-    if 'skin' in material:
+    leaf = (diffuse or '').rsplit('/', 1)[-1].lower()
+    if leaf in KIT_STAND_INS and kit_dds:
+        return kit_dds   # a local ./kit.dds the pack never ships: PES's kit
+    # PES paints the face and head from the player's own skin (face_diff.bin);
+    # packs that keep PES's face_high / hair_high meshes ship no texture for
+    # them, so the folder's skin colour stands in.
+    if 'skin' in material or leaf == 'face.dds' or material in SKIN_MATERIALS:
         for cand in ('skin_color.dds', 'face.dds'):
             p = os.path.join(folder, cand)
             if os.path.exists(p):
@@ -352,21 +727,37 @@ def resolve_texture(folder, diffuse, material, kit_dds):
     return None
 
 
+def _pow2_floor(v):
+    return 1 << max(0, int(v).bit_length() - 1)
+
+
 def write_tex(src, dst):
+    """Texture -> a DDS drawlogic uploads as is (DXT1/DXT5, full mip chain).
+    A source DDS already in DXT1/3/5 at a power-of-two size within
+    MAX_TEX_PX is copied byte for byte (the pack's own compression and
+    mips); anything else is re-encoded: DXT5 if it has transparency."""
+    import subprocess
+    import tempfile
     from PIL import Image
-    if src is None:
+    if isinstance(src, str):
+        raw = read_bytes(src)
+        if raw[:4] == b'DDS ' and raw[DDS_FOURCC_OFF:DDS_FOURCC_OFF + 4] in DDS_DXT:
+            h, w = struct.unpack_from('<II', raw, DDS_SIZE_OFF)
+            if w == _pow2_floor(w) and h == _pow2_floor(h) and max(w, h) <= MAX_TEX_PX:
+                open(dst, 'wb').write(raw)
+                return
+        im = Image.open(__import__('io').BytesIO(raw)).convert('RGBA')
+    elif src is None:
         im = Image.new('RGBA', (4, 4), GREY_BGRA[2::-1] + (255,))
-    elif isinstance(src, Image.Image):
-        im = src.convert('RGBA')
     else:
-        im = Image.open(__import__('io').BytesIO(read_bytes(src))).convert('RGBA')
-    if max(im.size) > MAX_TEX_PX:
-        s = MAX_TEX_PX / max(im.size)
-        im = im.resize((max(1, int(im.size[0] * s)), max(1, int(im.size[1] * s))), Image.LANCZOS)
-    tmp = dst + '.png'
-    im.save(tmp)
-    F.write_tex(tmp, dst)
-    os.remove(tmp)
+        im = src.convert('RGBA')
+    w, h = (min(_pow2_floor(n), MAX_TEX_PX) for n in im.size)
+    comp = 'dxt5' if im.getchannel('A').getextrema()[0] < 255 else 'dxt1'
+    with tempfile.TemporaryDirectory() as tmp:
+        png = os.path.join(tmp, 'in.png')
+        im.resize((w, h), Image.LANCZOS).save(png)
+        subprocess.run(['magick', png, '-define', 'dds:compression=' + comp, 'DDS:' + dst],
+                       check=True, capture_output=True)
 
 
 def convert(folder, kit_dds, out_dir, hide_body=None):
@@ -379,6 +770,7 @@ def convert(folder, kit_dds, out_dir, hide_body=None):
     types = model_types(folder)
     head_world = head_to_world(folder)
     rig = pes12_rig.load_face_rig()
+    seams = _seam_table(p12, used_bones(folder, mats))
     skull_slot = rig['palette'].index(FACE_SKULL_BONE)
     head_p12 = p12[F.FOX_TO_PES12[HEAD_BONE]]
     verts, idx, subs, textures = [], [], [], []
@@ -394,13 +786,18 @@ def convert(folder, kit_dds, out_dir, hide_body=None):
         bind = {b.name: joint(b) for b in m.bones}
         on_head = types.get(fname) in HEAD_TYPES and head_world is not None
         fslots = face_slots(bind, rig)
+        fdist = face_bone_dist(m, bind, face_align(bind), rig)
         for mesh in m.meshes:
             if SKIP_MATERIALS.search(mesh.material or '') or len(mesh.faces) < 1:
                 continue
             diffuse, states = mtl.get(mesh.material, (None, {}))
             if diffuse == NO_TEXTURE:
                 continue
-            tex = resolve_texture(folder, diffuse, mesh.material or '', kit_dds)
+            # face.xml type "uniform" (and PES's own garment types): PES forces
+            # the diffuse to the team kit - the 4cc trick that re-makes the kit
+            # on a custom shape (165 models across the packs, 29-09).
+            tex = (kit_dds if kit_dds and types.get(fname) in KIT_TYPES
+                   else resolve_texture(folder, diffuse, mesh.material or '', kit_dds))
             # The kit slot: PES paints the team's kit sheet onto these. Their
             # UVs move from the PES14+ sheet to PES2012's (pes15_kits inverse
             # table) and drawlogic binds the kit the player is wearing; the
@@ -411,6 +808,9 @@ def convert(folder, kit_dds, out_dir, hide_body=None):
                 tex = KIT_TEXTURE
             elif engine is not None:
                 tex = diffuse
+            elif tex is None:
+                print('  unresolved texture: %s material %r diffuse %r (grey stand-in)'
+                      % (fname, mesh.material, diffuse))
             if tex not in tex_index:
                 tex_index[tex] = len(textures)
                 textures.append(K.convert_kit(kit_dds, kit_fwd()) if kit_slot else engine if engine is not None else tex)
@@ -418,6 +818,7 @@ def convert(folder, kit_dds, out_dir, hide_body=None):
             bones = mesh.boneGroup.bones if mesh.boneGroup else []
             index_of = {id(v): k for k, v in enumerate(mesh.vertices)}
             face_of = {}                 # body vertex index -> face-local copy (bytes)
+            face_src = {}                # body vertex index -> (position, packed tail) of its face copy
             for v in mesh.vertices:
                 infl, raw = {}, []
                 for bi, w in (v.boneMapping or {}).items():
@@ -425,11 +826,19 @@ def convert(folder, kit_dds, out_dir, hide_body=None):
                         continue
                     name = bones[bi].name
                     try:
-                        fox = F.main_bone(name, bind)
+                        shares = helper_split(name) or [(F.main_bone(name, bind), 1.0)]
                     except KeyError:
                         continue
-                    key = F.slot_key(name, fox)
-                    infl[key] = infl.get(key, 0.0) + w
+                    # The jaw opens only in the face draw; a vertex it shares
+                    # with the neck/chest is drawn by the body, where the jaw
+                    # share would pin it to the skull and crease the throat
+                    # (Feynman, 30-09). There the share hangs halfway, split
+                    # between head and neck, like PES's own chin blend.
+                    if name == JAW_BONE and any(bones[k].name in THROAT_BONES for k in v.boneMapping if k < len(bones)):
+                        shares = [(HEAD_BONE, 1.0 - JAW_THROAT_NECK_SHARE), ('sk_neck', JAW_THROAT_NECK_SHARE)]
+                    for fox, share in shares:
+                        key = F.slot_key(name, fox)
+                        infl[key] = infl.get(key, 0.0) + w * share
                     raw.append((name, w))
                 if not infl and on_head:
                     infl = {(HEAD_BONE, False): 1.0}
@@ -456,6 +865,7 @@ def convert(folder, kit_dds, out_dir, hide_body=None):
                     q = retarget.PES_ALIGN.get(fox, (0.0, 0.0, 0.0, 1.0))
                     r = retarget._q_rot(q, tuple(pi - ai for pi, ai in zip(p, a)))
                     t = p12[F.FOX_TO_PES12[fox]]
+                    t = [tk + sk for tk, sk in zip(t, seam_offset(fox, p, seams))]
                     rn, rt = retarget._q_rot(q, n), retarget._q_rot(q, tg)
                     for k in range(3):
                         pos[k] += w * (t[k] + r[k])
@@ -467,19 +877,19 @@ def convert(folder, kit_dds, out_dir, hide_body=None):
                 tan = [c / lt for c in tan]
                 bin_ = [nrm[1] * tan[2] - nrm[2] * tan[1], nrm[2] * tan[0] - nrm[0] * tan[2],
                         nrm[0] * tan[1] - nrm[1] * tan[0]]
-                slots = [F.key_slot(b, slot_of) for b, _ in top]
-                ws = [w for _, w in top][:-1]
-                while len(slots) < F.MAX_INFLUENCES:
-                    slots.append(slots[-1])
-                while len(ws) < F.MAX_INFLUENCES:
-                    ws.append(0.0)
+                ws, slots = F.skin_pack([(F.key_slot(b, slot_of), w) for b, w in top])
                 uv = v.uv[0] if v.uv else None
                 u, vv = (uv.u, uv.v) if uv is not None else (0.0, 0.0)
-                if kit_slot:
-                    u, vv = kit_uv(u, vv)
-                packed = struct.pack('<3f3f4B3f3f3f2f2f', *pos, *ws[:3], *slots, *nrm, *bin_, *tan, u, vv, u, vv)
+                if not (math.isfinite(u) and math.isfinite(vv)):
+                    u, vv = 0.0, 0.0   # /mlp/ MLP11's "monitor" ships 24 NaN UVs; sampling NaN is undefined
+                # kit slot: TEXCOORD0 keeps the pack's own UVs (drawlogic draws
+                # it with the full-resolution source sheet), TEXCOORD1 carries
+                # them re-mapped onto PES2012's sheet (the game's bound kit)
+                u2, v2 = kit_uv(u, vv) if kit_slot else (u, vv)
+                packed = struct.pack('<3f3f4B3f3f3f2f2f', *pos, *ws[:3], *slots, *nrm, *bin_, *tan, u, vv, u2, v2)
                 if all(fox == HEAD_BONE for (fox, _) in infl):
-                    face_of[len(verts)] = pack_face_vertex(pos, head_p12, raw, fslots, skull_slot, packed[F.FACE_REST_OFF:])
+                    face_of[len(verts)] = pack_face_vertex(pos, head_p12, raw, fslots, skull_slot, packed[F.FACE_REST_OFF:], fdist)
+                    face_src[len(verts)] = (pos, packed[F.FACE_REST_OFF:])
                 verts.append(packed)
             face_tris, body_tris = [], []
             for face in mesh.faces:
@@ -491,7 +901,17 @@ def convert(folder, kit_dds, out_dir, hide_body=None):
                 # outline shell draws over its body.
                 tri = [base + index_of[id(face.vertices[k])] for k in (0, 2, 1)]
                 (face_tris if all(t in face_of for t in tri) else body_tris).append(tri)
+            # A vertex on the face/body border has a face copy (facial bones)
+            # and a body copy (the head bone): as the jaw opened they parted
+            # and holes showed the back of the head (Feynman's cheeks, 30-09).
+            # Its face copy rides the skull, which moves exactly with the head
+            # bone, so the border stays welded and the face stretches to it.
+            border = {t for tri in body_tris for t in tri if t in face_of} & {t for tri in face_tris for t in tri}
+            for t in border:
+                face_of[t] = pack_face_vertex(face_src[t][0], head_p12, [], fslots, skull_slot, face_src[t][1])
             flags = sub_flags(states) | (SUB_KIT if kit_slot else 0) | (SUB_OUTLINE if OUTLINE_MATERIAL.search(mesh.material or '') else 0)
+            if flags & SUB_HAIR and not hair_has_opacity(tex):
+                flags &= ~SUB_HAIR       # PES's Hair shader ignores this texture's alpha: plain opaque
             if body_tris:
                 subs.append((len(idx), 3 * len(body_tris), tex_index[tex], flags))
                 idx.extend(t for tri in body_tris for t in tri)
@@ -505,6 +925,18 @@ def convert(folder, kit_dds, out_dir, hide_body=None):
                 subs.append((len(idx), 3 * len(face_tris), tex_index[tex], flags | SUB_FACE))
                 idx.extend(remap[t] for tri in face_tris for t in tri)
     subs.sort(key=lambda s: bool(s[3] & SUB_BLEND))
+    # Faces parked below HIDDEN_Y are skipped but leave their vertices behind;
+    # parked verts (vt Nene: 3 at y -998) blow up preview framing, so compact.
+    keep = sorted({i for s in subs for i in idx[s[0]:s[0] + s[1]]})
+    remap = {old: new for new, old in enumerate(keep)}
+    verts = [verts[old] for old in keep]
+    at = 0
+    compact = []
+    for first, count, tex, flags in subs:
+        compact.append((at, count, tex, flags))
+        at += count
+    idx = [remap[i] for s in subs for i in idx[s[0]:s[0] + s[1]]]
+    subs = compact
     os.makedirs(out_dir, exist_ok=True)
     for f in os.listdir(out_dir):
         if f.startswith('body'):
@@ -523,8 +955,11 @@ def convert(folder, kit_dds, out_dir, hide_body=None):
             o.write(struct.pack('<4I', *s))
         o.write(b''.join(verts))
         o.write(struct.pack('<%dI' % len(idx), *idx))
-    for k, t in enumerate(textures):
-        write_tex(t, os.path.join(out_dir, 'body_%d.tex' % k))
+    # magick encodes in its own processes: one per texture at once
+    from concurrent.futures import ThreadPoolExecutor
+    with ThreadPoolExecutor() as pool:
+        list(pool.map(lambda kt: write_tex(kt[1], os.path.join(out_dir, 'body_%d.tex' % kt[0])),
+                      enumerate(textures)))
     print('%s: %d verts, %d tris, %d submeshes, %d textures, mode %s, y %.2f..%.2f' % (
         os.path.basename(folder), len(verts), len(idx) // 3, len(subs), len(textures),
         MODE_NAMES[mode], min(ys), max(ys)))

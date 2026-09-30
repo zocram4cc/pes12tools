@@ -1,29 +1,38 @@
 # pes2012-tools
 
-4cc PES2012 toolchain: PES2015 face/kit/team exports and PES21 fmdl meshes
-into PES2012 custom bodies (`drawlogic.dll` PGB1/PGB2), kits, balls, and
-the 4cc DLC base. Self-contained source: every tool plus its vendored
-deps; nothing here is measured from game files.
+4cc PES2012 toolchain: PES2015/PES2017 team, face and kit exports, PES21 fmdl
+meshes and PES15/PES21 stadiums into PES2012 custom bodies (`drawlogic.dll`
+PGB1/PGB2), kits, balls, stadiums and the 4cc DLC base. Self-contained
+source: every tool plus its vendored deps; nothing here is measured from game
+files, and nothing PES- or 4cc-derived ships.
 
 ## Layout
 
 | path | what |
 |---|---|
-| `pes12_import_team.py` | team import: squad, formation, bodies, kits |
+| `pes12_import_team.py` | team import: squad, lineup, formation, bodies, kits |
 | `pes15_to_pes12.py` | PES2015 face folder -> custom body |
-| `fmdl_to_pes12.py` | PES21 fmdl -> custom body |
-| `pes15export.py`, `pes15crypt.py` | 4cc tactical export reader + crypto |
-| `pes15_kits.py` | kit textures -> PES2012 kitserver kits |
+| `fmdl_to_pes12.py` | PES21 fmdl -> custom body; skin-weight packing (`skin_pack`) |
+| `pes15export.py`, `pes15crypt.py` | 4cc PES2015 tactical export reader + crypto |
+| `pes17export.py`, `pes17crypt.py` | PES2017 TEXPORT reader + crypto (`--pes17`) |
+| `pes12edit.py`, `pes12crypt.py` | the game's `save/EDIT.bin` (squads, names, stats) |
+| `pes15_kits.py` | kit textures -> PES2012 kitserver kits + the pack's own PES14+ sheet |
 | `pes12_rig.py` | **extract rig tables from your game** (run first) |
 | `pes12_ball.py` | ball mesh + texture -> dt0b ball BIN |
-| `ktmdl_write.py` | KTMDL geometry replacer (balls) |
+| `pes12_stadium.py` | PES15/PES21 stadium -> dt07/dt08 overrides of one slot |
+| `ktmdl_write.py` | KTMDL geometry replacer (balls, stadiums) |
 | `pes12_4cc_dlc.py` (+ `pes12db`, `pes12emblem`, `pes12strings`, `cpk`, `afs`, `ktmdl`) | 4cc DLC builder |
-| `mark_face.py` | stamp custom-body marker into a face.bin |
+| `mark_face.py` | stamp the custom-body marker (player id, u24) into a face.bin |
 | `pes12player.py` | PES2012 player record fields |
 | `pgb_preview.py` | front/side preview of a body |
 | `vendor/` | vendored deps (see `VENDORED.md`) |
-| `runtime/` | player runtime sources + build + prebuilt DLLs |
+| `runtime/` | player runtime sources + build scripts + prebuilt DLLs |
 | `requirements.txt` | `numpy`, `scipy`, `Pillow` |
+
+External programs: `7z` (the importer unpacks `.7z`/`.zip`/`.rar` packs),
+ImageMagick `magick` (DXT re-encoding of textures that are not already
+DXT), and, only to rebuild the runtime, `i686-w64-mingw32-g++` and
+`vkd3d-compiler`.
 
 ## Setup (your PES2012 install)
 
@@ -37,28 +46,55 @@ head-local space + the face packet's 27-slot palette) and `img/dt09.img`
 entry 349 block 2 (body: bone index, palette slot, parent, id, pos) with
 the vendored KTMDL reader. Both tables come from your game; none ship here.
 
+The kit layout tables (`kitmap/kitmap.npz`, `kitmap/fwd.bin`) build once
+from your **PES2015** Data dir (its own kit garments: shirt, collar, short
+and long sleeves, shorts, socks): pass it as the last argument of
+`pes15_kits.py` or as the importer's `--pes15=`; without a cache the tools
+exit telling you so. Point `PES12_KITMAP` at
+`<game>/kitserver/4cc-players/kitmap` (or copy `fwd.bin` there):
+drawlogic reads `fwd.bin` from that folder to draw stock-bodied 4cc
+players in the pack's own PES14+ kit sheet. `--pes21=<PES2021 Data dir>`
+supplies the engine textures some 4cc faces name (eyelashes).
+
 ## Convert one face
 
 ```sh
 python3 pes15_to_pes12.py "<Faces>/<pid> - <name>/" <kit.dds> <out dir> [hide|keep]
 ```
 
-The kit layout tables (`kitmap/kitmap.npz`) build once from your PES2021
-Data dir: pass it as the first arg of `pes15_kits.py` (or the team
-importer `--pes21=`); without a cache the tools exit telling you so.
-
 ## Team import
 
 ```sh
-python3 pes12_import_team.py <export.bin> <Faces dir> <kit.dds> <db dir> \
-    <custom dir> <GDB dir> <first marker> [--pes21=<PES2021 Data dir>]
+python3 pes12_import_team.py <aesthetics folder or archive> <save/EDIT.bin> \
+    <game>/kitserver/4cc-players/custom <game>/kitserver/GDB \
+    [--export=<tactical export>] [--tid=N] [--pes17] [--tactics=<dt04 dir>] \
+    [--rename=<name>] [--all] [--pes21=<PES2021 Data dir>] [--pes15=<PES2015 Data dir>]
 ```
 
-The player runtime lives at `<game>/kitserver/4cc-players/`
-(`custom/`, `flags/`, `custom/kits/`, `rig/`; see `runtime/drawhook.cpp`
-`initRoot`). Copy `runtime/draw*.dll` there, or rebuild with
-`runtime/build.sh` (`i686-w64-mingw32-g++ -O2 -shared -static`;
-`drawlogic` needs `-ld3d9`, `drawhook` `-lwinmm`).
+Squads, names and stats go into `EDIT.bin` (close the game first); the DLC
+base keeps its PLACEHOLDER rows. Bodies and kits land in the custom dir,
+faces and markers in the GDB. See the script's docstring for every option.
+After reinstalling a team's kits, restart the game: it keeps the old kit
+sheets in memory across matches.
+
+## Balls and stadiums
+
+```sh
+python3 pes12_ball.py ...      # see its docstring
+python3 pes12_stadium.py ...   # see its docstring (and the repo's 10-stadiums.md)
+```
+
+## Runtime
+
+The player runtime lives at `<game>/kitserver/4cc-players/`: `custom/p<pid>/`
+(bodies), `custom/kits/<tid>/` (`<slot>.tex` + `<slot>_hi.dds`), `kitmap/`
+(`fwd.bin`), `flags/` (control files; see `runtime/drawlogic.cpp`), and the
+debug outputs `shots/`, `grab/`, `shaders/`. Copy `runtime/draw*.dll` there,
+or rebuild with `runtime/build.sh` (`i686-w64-mingw32-g++ -O2 -shared
+-static`; `drawlogic` needs `-ld3d9`, `drawhook` `-lwinmm`). The Pony /
+Shadeless pixel shaders are `runtime/custom_ps.hlsl`, compiled into
+`custom_ps.h` by `runtime/build_shaders.sh` (vkd3d-compiler); rerun it after
+editing the HLSL, before `build.sh`.
 
 ## Paths
 
@@ -66,4 +102,5 @@ Every path is an argument or relative to the package: `PES12_GAME`
 (defaults `<pkg>/game`), `PES12_RIG` (`<pkg>/rig`), `PES12_KITMAP`
 (`<pkg>/kitmap`), `PES12_BODY_BONES` (`<rig>/body349b2_bones.json`),
 `PES12_VENDOR` (`<pkg>/vendor`), `PES12_MODEL_FILE`
-(`<vendor>/ModelFile.py`), `PES12_DT0B` (`<game>/img/dt0b.img`).
+(`<vendor>/ModelFile.py`), `PES12_KTMDL_READER` (`<vendor>/ktmdl_moth.py`),
+`PES12_DT0B` (`<game>/img/dt0b.img`).

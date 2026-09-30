@@ -1,6 +1,6 @@
 """PES2014-eFootball kit textures -> PES2012 (PES2008-13 layout) kitserver kits.
 
-    python3 pes15_kits.py <PES21 Data dir> <Kit Textures dir> <kits dir> <pes12 team id>
+    python3 pes15_kits.py <PES21 Data dir> <Kit Textures dir> <kits dir> <pes12 team id> [<PES2015 Data dir>]
 
 Writes <kits dir>/<tid>/{pa,pb,ga,gb}.tex (+ .png to look at) from the export's
 u0XXXp1/p2/g1/g2.dds; drawlogic writes them into the game's kit texture.
@@ -11,22 +11,22 @@ hand-drawn panels:
   PES2012  dt0c.img #3, block 0 = the LOD0 kit (45 KTMDL sections). The kit
            texture rides TEXCOORD1 (TEXCOORD0 is a detail map): shirt,
            collar, sleeves, shorts, socks, each a chart of the 1024x512 sheet.
-  PES2021  the stock pieces that wear a u0XXXpN sheet (tools/pes21_import
-           pes_base_body): bibs.fmdl mod_latest_uni_shirts (torso),
-           undershirt.fmdl torso_mat (sleeves), pants_out_sub, socks_middle.
-           Same UV layout as PES14-20's kit sheets.
+  PES2015  the kit garments PES itself dresses a player in (dt32/dt35
+           uniform): shirt_out_high + collar_001 (torso), sleeve_short_001,
+           sleeve_long_001, pants_001, socks_middle_high. The 4cc packs paint
+           their sheets for these: PES2021's own sleeve_short covers only the
+           top of the sleeve chart (no cuff, badge cut off, 30-09).
 
-The PES21 pieces are re-posed into PES2012's bind (fmdl_to_pes12's rigid
+The PES2015 pieces are re-posed into PES2012's bind (fmdl_to_pes12's rigid
 per-bone re-pose), then every PES2012 texel is traced to the body surface and
-across to the nearest PES21 surface point of the same garment facing the same
+across to the nearest PES2015 surface point of the same garment facing the same
 way; that point's UV is where the texel reads from. The inverse table (PES21
 UV -> PES2012 UV) re-maps the UVs of 4cc models that paint the kit sheet
 (pes15_to_pes12.py), so they wear whatever kit the game has bound.
 
 Both tables are derived from the user's own game files and cached in
-kitmap/ next to this script (built once, never distributed).
+kitmap/ next to this script (PES12_KITMAP; built once, never distributed).
 """
-import glob
 import math
 import os
 import struct
@@ -43,7 +43,6 @@ import afs  # noqa: E402
 import ktmdl  # noqa: E402
 import fmdl_to_pes12 as F  # noqa: E402
 import retarget  # noqa: E402
-import FmdlFile  # noqa: E402
 
 GAME = os.environ.get('PES12_GAME', os.path.join(HERE, 'game'))
 KIT_IMG, KIT_ENTRY = os.path.join(GAME, 'img', 'dt0c.img'), 3
@@ -59,16 +58,15 @@ PES15_GRID = 1024                     # inverse table resolution over the square
 # UVs spread over the torso chart as well, left out.
 PES12_PARTS = {
     'shirt': [6, 9, 10, 11, 12, 13, 14],   # 6 = collar, cut from the torso chart
-    'sleeves': [29, 30, 31, 32, 35, 38, 39, 40],
+    'sleeves': [29, 30, 31, 32],
+    'sleeves_long': [35, 38, 39, 40],
     'shorts': [5],
     'socks': [18],
 }
 PES12_OFFSETS = {80: (28, 72), 96: (28, 72), 72: (20, 64)}
 
-# PES21 garment pieces (path under the extracted Data, material or None = all)
+# PES21 extracts: the engine textures below (face_eyelash) and common_package
 PES21_CPK = {'common': ('dt00_x64.cpk.bak', 'common_package'),
-             'shirts': ('dt32_g4.cpk', 'parts/undershirt'),
-             'bibs': ('dt32_g4.cpk', 'parts/bibs'),
              'eyelash': ('dt00_x64.cpk.bak', 'face_eyelash_alp')}
 # Engine-side textures 4cc models name instead of shipping (PES15 path ->
 # PES21 ftex, same art): without them the eyelash cards draw grey.
@@ -76,16 +74,27 @@ ENGINE_TEXTURES = {
     'model/character/face/common/face_eyelash.dds':
         'Asset/model/character/common/sourceimages/#windx11/face_eyelash_alp.ftex',
 }
-PES21_PARTS = {
-    'shirt': ('Asset/model/character/parts/bibs/scenes/#Win/bibs.fmdl', 'mod_latest_uni_shirts'),
-    'sleeves': ('Asset/model/character/parts/undershirt/scenes/#Win/undershirt.fmdl', 'torso_mat'),
-    'shorts': ('cp/**/pants_out_sub.fmdl', None),
-    'socks': ('cp/**/socks_middle.fmdl', None),
+# PES2015 kit garments (paths under the extracted Data). PES21's bibs/undershirt
+# used before put the pack's tie and badge on the stock shoulders and armpits
+# (red splinters PES never shows, 30-09).
+PES15_CPK = {'dt32': ('dt32.cpk', 'character1/model/character/uniform/nocloth/'),
+             'dt35': ('dt35.cpk', 'character0/model/character/uniform/')}
+UNI1 = 'common/character1/model/character/uniform/'
+UNI0 = 'common/character0/model/character/uniform/'
+PES15_PARTS = {
+    'shirt': [UNI1 + 'nocloth/shirt_out_high.model', UNI0 + 'nocloth/collar_001.model'],
+    'sleeves': [UNI0 + 'nocloth/sleeve_short_001.model'],
+    'sleeves_long': [UNI0 + 'nocloth/sleeve_long_001.model'],
+    # cloth/pants_NNN are cloth-sim models; the nocloth shorts PES ships are
+    # these (the 4cc patch's nocloth pants_001 is a byte-level copy: 672 verts)
+    'shorts': [UNI0 + 'nocloth/referee_pants_001.model'],
+    'socks': [UNI1 + 'nocloth/socks_middle_high.model'],
 }
 SAMPLE_SPACING_M = 0.002    # surface sample spacing for the nearest-point search
 NEAREST_K = 12              # candidates checked for a same-facing match
 FILL_ITER = 24              # gutter dilation passes (keeps mips from bleeding)
 KIT_SLOTS = {'p1': 'pa', 'p2': 'pb', 'g1': 'ga', 'g2': 'gb'}
+HI_KIT_SUFFIX = '_hi.dds'    # full-resolution source sheet beside <slot>.tex (drawlogic HI_KIT_SUFFIX)
 
 
 # ---------- geometry ----------
@@ -116,14 +125,21 @@ def pes12_kit():
     return out
 
 
-def extract_pes21(data_dir, work):
+def extract_cpks(table, data_dir, work):
+    """{name: (cpk, pattern)} -> files under work, once (a marker per name)."""
+    sys.path.insert(0, F.VENDOR)
     import cpk
-    import fpk
-    for name, (arc, pattern) in PES21_CPK.items():
+    for name, (arc, pattern) in table.items():
         marker = os.path.join(work, '.' + name)
         if not os.path.exists(marker):
             cpk.extract(os.path.join(data_dir, arc), work, pattern=pattern)
             open(marker, 'w').close()
+
+
+def extract_pes21(data_dir, work):
+    sys.path.insert(0, F.VENDOR)
+    import fpk
+    extract_cpks(PES21_CPK, data_dir, work)
     cp = os.path.join(work, 'Asset/model/character/#Win/common_package.fpk')
     if not os.path.isdir(os.path.join(work, 'cp')):
         fpk.extract(cp, os.path.join(work, 'cp'))
@@ -135,6 +151,7 @@ def engine_texture(path):
     src = rel and os.path.join(CACHE, 'pes21', rel)
     if not src or not os.path.exists(src):
         return None
+    sys.path.insert(0, F.VENDOR)
     import io
     import ftex
     return Image.open(io.BytesIO(ftex.to_dds(open(src, 'rb').read()))).convert('RGBA')
@@ -153,24 +170,26 @@ def repose(p, n, top, p12):
     return pos, nrm / (np.linalg.norm(nrm) or 1.0)
 
 
-def pes21_part(path, material):
-    """-> (P, N, UV, tris) re-posed into PES12 bind."""
+def pes15_part(path):
+    """PES2015 .model garment -> (P, N, UV, tris) re-posed into PES12 bind."""
     import json
+    import pes15_to_pes12 as C
     table = json.load(open(F.BONES_JSON))
     p12 = {b['bone']: b['pos'] for b in table['bones']}
-    f = FmdlFile.FmdlFile()
-    f.readFile(path)
-    bind = {b.name: (b.globalPosition.x, b.globalPosition.y, b.globalPosition.z) for b in f.bones}
+    m = C.load_model(path)
+    bind = {b.name: C.joint(b) for b in m.bones}
     P, N, UV, T = [], [], [], []
-    for m in f.meshes:
-        if material and m.materialInstance.name != material:
-            continue
+    for mesh in m.meshes:
+        bones = mesh.boneGroup.bones if mesh.boneGroup else []
         base = len(P)
-        index_of = {id(v): k for k, v in enumerate(m.vertices)}
-        for v in m.vertices:
+        index_of = {id(v): k for k, v in enumerate(mesh.vertices)}
+        for v in mesh.vertices:
             infl = {}
-            for bone, w in v.boneMapping.items():
-                fox = F.main_bone(bone.name, bind)
+            for bi, w in (v.boneMapping or {}).items():
+                try:     # pes15_to_pes12: stale indices past the group, unmapped helpers
+                    fox = F.main_bone(bones[bi].name, bind)
+                except (IndexError, KeyError):
+                    continue
                 infl[fox] = infl.get(fox, 0.0) + w
             infl = {b: w for b, w in infl.items() if w >= F.MIN_WEIGHT} or infl
             tw = sum(infl.values()) or 1.0
@@ -179,8 +198,23 @@ def pes21_part(path, material):
             P.append(p)
             N.append(n)
             UV.append((v.uv[0].u, v.uv[0].v))
-        T += [[base + index_of[id(fv)] for fv in fa.vertices] for fa in m.faces]
+        T += [[base + index_of[id(fv)] for fv in fa.vertices] for fa in mesh.faces]
     return np.array(P), np.array(N), np.array(UV), np.array(T, dtype=np.int64)
+
+
+# PES2015 garments carry inner faces (collar and cuff turn-ups): a stock point
+# matched onto one reads the inside of the garment. Few per garment (30-09:
+# shirt 64 of 3158, sleeves 19 of 900, long sleeves 129 of 1836).
+LINING_PROBE_M = 0.015    # look this far in front of a face along its normal ...
+LINING_RADIUS_M = 0.010   # ... for the garment's own surface: found = the face is lining
+
+
+def drop_lining(P, T, n):
+    """Triangles of a garment minus those with its own shell right in front."""
+    c = P[T].mean(1)
+    tree = cKDTree(c)
+    hit = np.array([len(x) > 0 for x in tree.query_ball_point(c + n * LINING_PROBE_M, LINING_RADIUS_M)])
+    return T[~hit], n[~hit]
 
 
 def face_normals(P, T):
@@ -202,11 +236,16 @@ def surface_samples(P, T, attrs, normals):
 
 
 # Garments of the two games differ in cut (PES2012's shorts reach 9 cm lower,
-# y 0.61 vs 0.70): each PES21 garment is scaled per axis onto the PES2012 one's
-# box first, so a hem meets a hem instead of the lower shorts all reading the
-# PES21 hem's last row. Percentiles, not extremes: the bibs carry a stray
-# flap to z 0.22 that would skew a min/max box.
+# y 0.61 vs 0.70 on PES21's pants_out_sub): each PES2015 garment is scaled per
+# axis onto the PES2012 one's box first, so a hem meets a hem instead of the
+# lower shorts all reading the reference hem's last row. Percentiles, not
+# extremes, so a stray flap cannot skew the box.
 BOX_PCT = (1, 99)
+# Only where the cut differs: the re-posed PES2015 sleeves already sit within
+# 1-2 cm of PES2012's, and boxing them onto the whole part (armpit to cuff)
+# lifts the tube 3-4 cm at the cuff, onto the PES2015 underside (31 % of the
+# stock sleeve read the grey cuff lining, 30-09).
+FIT_BOX_PARTS = {'shirt', 'shorts', 'socks'}
 
 
 def fit_box(P, target):
@@ -268,29 +307,62 @@ def dilate(grid, mask):
     return grid, mask
 
 
-def build_maps(data_dir):
-    """-> (fwd: (H12, W12, 2) PES15 uv per PES12 texel, inv: (G, G, 2) PES12 uv per PES15 texel)."""
+FWD_BIN = os.path.join(CACHE, 'fwd.bin')   # drawlogic's copy of fwd (kitforce)
+FWD_MAGIC = 0x31445746                    # 'FWD1': u32 magic, w, h; then h x w x 2 f32
+
+
+def write_fwd(fwd):
+    """fwd -> <PES12_KITMAP>/fwd.bin (drawlogic reads 4cc-players/kitmap/fwd.bin): drawlogic re-maps the stock kit's
+    UVs onto the PES14+ sheet per vertex with it (forced kit UVs)."""
+    h, w = fwd.shape[:2]
+    with open(FWD_BIN, 'wb') as o:
+        o.write(struct.pack('<3I', FWD_MAGIC, w, h))
+        o.write(np.ascontiguousarray(fwd, np.float32).tobytes())
+
+
+def build_maps(pes15=None):
+    """-> (fwd: (H12, W12, 2) PES15 uv per PES12 texel, inv: (G, G, 2) PES12 uv per PES15 texel).
+    pes15: the PES2015 Data dir, needed only while the cache is not built."""
+    return _maps(pes15)[:2]
+
+
+def kit_layout_mask(pes15=None):
+    """(G, G) bool over the PES14+ kit sheet: texels some stock garment's UVs
+    cover, i.e. where PES paints the team kit (G = PES15_GRID)."""
+    return _maps(pes15)[2]
+
+
+def _maps(pes15):
     os.makedirs(CACHE, exist_ok=True)
     cached = os.path.join(CACHE, 'kitmap.npz')
     if os.path.exists(cached):
         z = np.load(cached)
-        return z['fwd'], z['inv']
-    if not data_dir:
-        raise SystemExit('kit layout tables not built yet: pass the PES2021 Data dir (--pes21=)')
-    work = os.path.join(CACHE, 'pes21')
-    extract_pes21(data_dir, work)
+        if 'mask' in z.files:
+            return z['fwd'], z['inv'], z['mask']
+    work = os.path.join(CACHE, 'pes15')
+    if not pes15 and not all(os.path.exists(os.path.join(work, '.' + n)) for n in PES15_CPK):
+        raise SystemExit('kit layout tables not built yet: pass the PES2015 Data dir (--pes15=)')
+    if pes15:
+        extract_cpks(PES15_CPK, pes15, work)
     k12 = pes12_kit()
     fwd = np.zeros((PES12_H, PES12_W, 2), np.float32)
     fmask = np.zeros((PES12_H, PES12_W), bool)
     inv = np.zeros((PES15_GRID, PES15_GRID, 2), np.float32)
     imask = np.zeros((PES15_GRID, PES15_GRID), bool)
-    for part, (rel, mat) in PES21_PARTS.items():
-        P21, N21, UV21, T21 = pes21_part(glob.glob(os.path.join(work, rel), recursive=True)[0], mat)
+    for part, pieces in PES15_PARTS.items():
+        got = [pes15_part(os.path.join(work, rel)) for rel in pieces]
+        base = np.cumsum([0] + [len(g[0]) for g in got])[:-1]
+        P21, N21, UV21 = (np.concatenate([g[k] for g in got]) for k in range(3))
+        T21 = np.concatenate([g[3] + b for g, b in zip(got, base)])
         P12, N12, UV12, T12 = k12[part]
-        P21 = fit_box(P21, P12)
+        if part in FIT_BOX_PARTS:
+            P21 = fit_box(P21, P12)
         n21 = face_normals(P21, T21)
         if np.einsum('ij,ij->i', n21, N21[T21[:, 0]]).mean() < 0:
             n21 = -n21
+        keep = len(T21)
+        T21, n21 = drop_lining(P21, T21, n21)
+        print('%-8s lining faces dropped %d of %d' % (part, keep - len(T21), keep))
         n12 = face_normals(P12, T12)
         if np.einsum('ij,ij->i', n12, N12[T12[:, 0]]).mean() < 0:
             n12 = -n12
@@ -314,8 +386,8 @@ def build_maps(data_dir):
         print('%-8s pes15 texels %6d' % (part, m.sum()))
     fwd, _ = dilate(fwd, fmask)
     inv, _ = dilate(inv, imask)
-    np.savez_compressed(cached, fwd=fwd, inv=inv)
-    return fwd, inv
+    np.savez_compressed(cached, fwd=fwd, inv=inv, mask=imask)
+    return fwd, inv, imask
 
 
 # ---------- kits ----------
@@ -337,12 +409,37 @@ def convert_kit(dds, fwd):
     return Image.fromarray(np.clip(sample(src, fwd), 0, 255).astype(np.uint8), 'RGB')
 
 
-def install(data_dir, textures, kits_dir, tid):
+DDS_MAGIC = b'DDS '
+
+
+GUTTER_TOL = 12   # 8-bit per channel: a texel this close to the sheet's background is gutter (DXT noise ~4-8)
+
+
+def hi_sheet(src, pes15=None):
+    """The pack's sheet with its gutters filled from the nearest painted
+    texel: its mips would otherwise pull the gutter colour into the border
+    of every chart (thin grey lines along the seams of the forced kit, 30-09).
+    Gutter = background-coloured (the sheet's most common colour) AND outside
+    every stock PES garment's coverage; packs paint past that coverage (lapel
+    tips, banners), so the layout alone would erase design."""
+    img = np.asarray(Image.open(src).convert('RGBA'), np.uint8)
+    h, w = img.shape[:2]
+    lay = kit_layout_mask(pes15)
+    lay = lay[(np.arange(h) * lay.shape[0]) // h][:, (np.arange(w) * lay.shape[1]) // w]
+    rgb = img[..., :3].reshape(-1, 3)
+    keys, counts = np.unique(rgb[~lay.ravel()] // GUTTER_TOL, axis=0, return_counts=True)
+    bg = (keys[counts.argmax()] * GUTTER_TOL + GUTTER_TOL // 2).astype(int)
+    gutter = ~lay & (np.abs(img[..., :3].astype(int) - bg).max(-1) <= GUTTER_TOL)
+    return Image.fromarray(dilate(img, ~gutter)[0], 'RGBA')
+
+
+def install(data_dir, textures, kits_dir, tid, pes15=None):
     """Every u0XXX{p,g}N.dds in <textures> -> <kits_dir>/<tid>/<slot>.tex, the
     PES2012-layout sheet drawlogic writes over the kit texture the game binds
     for that team (kserv's GDB cannot serve the DLC teams: selecting one
     crashes the game, 26-09)."""
-    fwd, _ = build_maps(data_dir)
+    fwd, _ = build_maps(pes15)
+    write_fwd(fwd)
     if data_dir:
         extract_pes21(data_dir, os.path.join(CACHE, 'pes21'))
     out = os.path.join(kits_dir, str(tid))
@@ -353,12 +450,25 @@ def install(data_dir, textures, kits_dir, tid):
         if not f.lower().endswith('.dds') or len(stem) != 7 or stem[5:] not in KIT_SLOTS:
             continue
         slot = KIT_SLOTS[stem[5:]]
+        src = os.path.join(textures, f)
+        if open(src, 'rb').read(len(DDS_MAGIC)) != DDS_MAGIC:
+            # /u/'s u0000g1.dds is no DDS at all (packs ship broken files)
+            print('skipped %s: not a DDS' % f)
+            continue
         png = os.path.join(out, slot + '.png')
-        convert_kit(os.path.join(textures, f), fwd).save(png)
+        convert_kit(src, fwd).save(png)
         F.write_tex(png, os.path.join(out, slot + '.tex'))
+        # The source sheet at its own resolution too (2048 px in every 4cc
+        # pack): drawlogic draws the stock kit with forced PES14+ UVs and
+        # custom models with the pack's own, both on this sheet.
+        hi_png = os.path.join(out, slot + '_hi.png')
+        hi_sheet(src, pes15).save(hi_png)
+        from pes15_to_pes12 import write_tex as write_dds
+        write_dds(hi_png, os.path.join(out, slot + HI_KIT_SUFFIX))
+        os.remove(hi_png)
         done.append(slot)
     print('team %d kits: %s' % (tid, ' '.join(done)))
 
 
 if __name__ == '__main__':
-    install(sys.argv[1], sys.argv[2], sys.argv[3], int(sys.argv[4]))
+    install(sys.argv[1], sys.argv[2], sys.argv[3], int(sys.argv[4]), sys.argv[5] if len(sys.argv) > 5 else None)

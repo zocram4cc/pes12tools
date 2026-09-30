@@ -7,7 +7,7 @@ in each folder's README)..
 | folder | what | install deps |
 |---|---|---|
 | `pes2012-4cc/` | ready-made 4chan Cup base for PES2012 v1.06 (kitserver 12 + `4cc-dlc` override root; no game file modified) | copy `kitserver/` into the game folder |
-| `pes2012-tools/` | the toolchain that built it: PES2015/PES21 team, body, kit, ball, stadium conversion; the custom-body runtime (`kitserver/4cc-players/`); the EDIT editor source is `editapp/` in the repo | Python 3 + `requirements.txt`; a PES2012 install, a PES2021 Data dir (kit layouts), your PES2015 exports |
+| `pes2012-tools/` | the toolchain that built it: PES2015/PES2017 team, body, kit, ball, stadium conversion; the custom-body runtime (`kitserver/4cc-players/`); the EDIT editor source is `editapp/` in the repo | Python 3 + `requirements.txt`, `7z`, ImageMagick; a PES2012 install, a PES2015 Data dir (kit layouts), a PES2021 Data dir (engine textures), your 4cc exports |
 | `pes2012-blender/` | Blender 4.x/5.x add-on for KTMDL BINs (balls, boots, stadiums) and PGB2 player bodies, with tests | Blender; same BIN sources as above |
 
 ## Build order (from a bare checkout)
@@ -19,18 +19,21 @@ in each folder's README)..
    and the 19 body bones from your game (face/bin ids are StrCode hashes;
    the bones are matched to the PES15/Fox skeleton by bind position, never
    by name).
-3. Teams: `python3 pes12_import_team.py <export.bin> <Faces dir> <kit.dds>
-   <db dir> <custom dir> <GDB dir> <first marker>` imports squad, lineup,
-   formation (coordinates clamped to the role's stock ranges - out-of-range
-   values crash the game on team select), bodies, and kits.
+3. Teams: `python3 pes12_import_team.py <aesthetics> <save/EDIT.bin>
+   <custom dir> <GDB dir> [--export=<tactical export>] [--pes15=<PES2015
+   Data dir>] ...` imports squad (into EDIT.bin; the DLC base keeps its
+   placeholders), lineup, formation (coordinates clamped to the role's stock
+   ranges - out-of-range values crash the game on team select), bodies, and
+   kits (see `pes2012-tools/README.md`).
 4. Balls/stadiums: `python3 pes12_ball.py` / `python3 pes12_stadium.py`
-   (stadium map and proof conversion: repo 10-stadiums.md).
+   (in `pes2012-tools/`; stadium map and proof conversion: repo
+   10-stadiums.md).
 
 ## Player settings (custom bodies)
 
 Each player's folder (`kitserver/4cc-players/custom/p<pid>/`) holds
 `body.bin` (PGB2: header magic/nv/ni/stride/nsub/**mode** + submesh table
-+ 80-byte verts + u32 indices), `body_<k>.tex` (PGT1), and optionally a
++ 80-byte verts + u32 indices), `body_<k>.tex` (a DXT DDS, or PGT1), and optionally a
 `mode` file with one word. The mode says which stock parts the model
 replaces (drawlogic reads the PGB2 header word unless `mode` exists):
 

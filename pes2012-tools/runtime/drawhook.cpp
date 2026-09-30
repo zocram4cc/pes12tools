@@ -1,5 +1,5 @@
 // drawhook (shim): waits for kitserver's device, hooks Present only, and
-// hot-loads dllprobe\drawlogic.dll (copied to a fresh name each time) whenever
+// hot-loads 4cc-players\drawlogic.dll (copied to a fresh name each time) whenever
 // flags\reload appears. The logic DLL owns every other device hook.
 #include <windows.h>
 #include <mmsystem.h>

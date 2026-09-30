@@ -1,7 +1,9 @@
 """Convert a ball mesh + texture into a PES2012 dt0b ball BIN.
 
-Source mesh: PES21 .fmdl (FmdlFile, Fox coords Y-up metres) or plain .obj
-(metres, same axes). Texture: any PIL-readable image, or a PES21 .ftex.
+Source mesh: PES21 .fmdl (FmdlFile, Fox coords Y-up metres), PES14-17
+.model (`MODEL\0` magic, pes-model-blender ModelFile, same axes) or plain
+.obj (metres, same axes). Texture: any PIL-readable image (PES14-17 DDS
+included), or a PES21 .ftex.
 
   tools/pes12_ball.py <src mesh> <out ball_N.bin> [--template=N]
                       [--texture=T] [--texture-slot=i]
@@ -27,9 +29,10 @@ import zlib
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
-sys.path.insert(0, os.environ.get('PES12_VENDOR', os.path.join(HERE, 'vendor')))
 import ktmdl_write  # noqa: E402
 
+VENDOR = os.environ.get('PES12_VENDOR', os.path.join(HERE, 'vendor'))
+sys.path.insert(0, VENDOR)
 GAME = os.environ.get('PES12_GAME', os.path.join(HERE, 'game'))
 DT0B = os.environ.get('PES12_DT0B', os.path.join(GAME, 'img', 'dt0b.img'))
 WESYS_TAG = b"\x00\x01\x01WESYS"  # tools/pes12db.py WESYS_TAG
@@ -200,11 +203,46 @@ def join_bin(ktmdl, tex_blocks):
     return bytes(out)
 
 
+# PES14-17 MODEL (pes-model-blender ModelFile, same parser as
+# tools/pes15_to_pes12.py): 0 bones, world-space, Y-up metres.
+def is_model_file(path):
+    with open(path, 'rb') as f:
+        return f.read(6) == b'MODEL\x00'
+
+
+def read_model(path):
+    """PES14-17 .model -> (pos, nrm, uv, idx), world-space metres."""
+    import importlib.util
+    spec = importlib.util.spec_from_file_location(
+        'pes_model_file', os.environ.get('PES12_MODEL_FILE', os.path.join(VENDOR, 'ModelFile.py')))
+    MF = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(MF)
+    r = MF.readModelFile(path, MF.ParserSettings())
+    m = r[0] if isinstance(r, tuple) else r
+    pos, nrm, uv, idx = [], [], [], []
+    for x in m.meshes:
+        if not len(x.faces) > 1:
+            continue
+        base = len(pos)
+        ids = {id(v): k for k, v in enumerate(x.vertices)}
+        for v in x.vertices:
+            pos.append((v.position.x, v.position.y, v.position.z))
+            n = (v.normal.x, v.normal.y, v.normal.z) if v.normal else (0.0, 1.0, 0.0)
+            nrm.append(n)
+            u = v.uv[0] if v.uv else None
+            uv.append((u.u, 1.0 - u.v) if u is not None else (0.0, 0.0))
+        for fa in x.faces:
+            idx.extend(base + ids[id(v)] for v in fa.vertices)
+    return pos, nrm, uv, idx
+
+
 def convert(src_mesh, out_path, template_n=11, texture=None, slot=COLOR_SLOT):
     wtag, body = stock_template(template_n)
     kt, tex_blocks = split_bin(body)
     if src_mesh.lower().endswith(".fmdl"):
         pos, nrm, uv, idx = read_fmdl(src_mesh)
+    elif is_model_file(src_mesh):
+        pos, nrm, uv, idx = read_model(src_mesh)
     else:
         pos, nrm, uv, idx = read_obj(src_mesh)
     src_r = max(math.sqrt(x * x + y * y + z * z) for x, y, z in pos)
