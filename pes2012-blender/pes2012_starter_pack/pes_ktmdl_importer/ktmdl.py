@@ -313,6 +313,7 @@ def _parse_packet(reader, offset, index):
         "streamInfoCount": reader.u32(offset + 0x10),
         "streamInfoOffset": reader.i32(offset + 0x14),
         "skeletonCount": reader.u32(offset + 0x18),
+        # palette/index tables: offsets relative to THIS packet record
         "skeletonOffset": reader.i32(offset + 0x1C),
         "indexCount": reader.u32(offset + 0x20),
         "indexInfoOffset": reader.i32(offset + 0x24),
@@ -338,6 +339,10 @@ def _parse_packet(reader, offset, index):
 
 
 def _parse_stream_info(reader, offset, index=None):
+    # elementOffset (vertex records) and the packet's palette/index-table
+    # offsets are RELATIVE TO THIS RECORD, not to the packet: dt09 #176 and
+    # dt0b #35 read garbage (sky floats, out-of-file shader strings) when the
+    # packet base is added (30-09).
     out = {
         "offset": offset,
         "streamOffset": reader.i32(offset),
@@ -518,6 +523,28 @@ def _parse_texture_id(reader, offset, index):
     }
 
 
+def _name_table(reader, base, offset, count):
+    """(rel offsets, strings) for one debug name table, or None when the
+    fields do not describe one. The layout is not uniform: dt0b #35 (KTMDL
+    2.1) puts the texture-name count where 2.2 files hold a shader count, so
+    following the fields blindly reads past the file (30-09)."""
+    if count <= 0 or count > 0x10000 or offset <= 0:
+        return None
+    table = base + offset
+    if not 0 <= table <= reader.size - count * 4:
+        return None
+    rels = list(reader.unpack("%dI" % count, table))
+    names = []
+    for rel in rels:
+        if not 0 <= table + rel < reader.size:
+            return None
+        try:
+            names.append(reader.cstring(table + rel))
+        except KTMDLError:
+            return None
+    return rels, names
+
+
 def _parse_debug_info(reader, header):
     base = header["debugInfoOffset"]
     empty = {
@@ -545,26 +572,15 @@ def _parse_debug_info(reader, header):
             "shaderIdOffset": reader.i32(base + 0x10),
         }
     )
-    tex_count = header["textureNameIdCount"]
-    if tex_count and out["textureNameOffset"] > 0:
-        table = base + out["textureNameOffset"]
-        reader.check(table, tex_count * 4)
-        for i in range(tex_count):
-            rel = reader.u32(table + i * 4)
-            out["textureNameOffsets"].append(rel)
-            out["textureNames"].append(reader.cstring(table + rel))
+    got = _name_table(reader, base, out["textureNameOffset"], header["textureNameIdCount"])
+    if got:
+        out["textureNameOffsets"], out["textureNames"] = got
     scount = out["shaderNameCount"]
-    if scount and out["shaderIdOffset"] > 0:
-        table = base + out["shaderIdOffset"]
-        reader.check(table, scount * 4)
-        out["shaderIds"] = list(reader.unpack("%dI" % scount, table))
-    if scount and out["shaderNameOffset"] > 0:
-        table = base + out["shaderNameOffset"]
-        reader.check(table, scount * 4)
-        for i in range(scount):
-            rel = reader.u32(table + i * 4)
-            out["shaderNameOffsets"].append(rel)
-            out["shaderNames"].append(reader.cstring(table + rel))
+    if scount and 0 <= base + out["shaderIdOffset"] <= reader.size - scount * 4:
+        out["shaderIds"] = list(reader.unpack("%dI" % scount, base + out["shaderIdOffset"]))
+    got = _name_table(reader, base, out["shaderNameOffset"], scount)
+    if got:
+        out["shaderNameOffsets"], out["shaderNames"] = got
     return out
 
 
@@ -914,7 +930,7 @@ def parse_bytes(data, source_name="<memory>"):
         pbase = packet["offset"]
         palette = []
         if packet["skeletonCount"]:
-            pp = pbase + packet["skeletonOffset"]
+            pp = pbase + packet["skeletonOffset"]   # packet-relative (header)')
             r.check(pp, packet["skeletonCount"] * 2)
             palette = list(r.unpack("%dH" % packet["skeletonCount"], pp))
         packet["skeletonIndices"] = palette
@@ -922,12 +938,12 @@ def parse_bytes(data, source_name="<memory>"):
 
         streams = []
         if packet["streamInfoCount"]:
-            info_base = pbase + packet["streamInfoOffset"]
+            info_base = pbase + packet["streamInfoOffset"]   # records; their own offsets are record-relative
             for si in range(packet["streamInfoCount"]):
                 info = _parse_stream_info(r, info_base + si * 0x20, si)
                 entry = {"info": info, "declaration": [], "vertices": [], "indices": []}
                 if info["elementCount"] > 0:
-                    dp = info["offset"] + info["elementOffset"]
+                    dp = info["offset"] + info["elementOffset"]   # record-relative
                     entry["declaration"] = [
                         _parse_vertex_element(r, dp + ei * 4, ei)
                         for ei in range(info["elementCount"])

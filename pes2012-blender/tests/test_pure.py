@@ -71,8 +71,80 @@ def test_container_edited_rewrite():
     print('container: edited rewrite keeps the other blocks and row fields')
 
 
+
+def _vendor_reader():
+    """The vendored KTMDL reader without the bpy-importing package __init__."""
+    import importlib.util
+    here = os.path.join(HERE, '..', 'pes2012_starter_pack', 'pes_ktmdl_importer', 'ktmdl.py')
+    spec = importlib.util.spec_from_file_location('pes_ktmdl_vendor', here)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+def _class_blocks():
+    out = []
+    for name, (img, idx) in corpus.CLASSES.items():
+        c = container.read(corpus.read_entry(img, idx))
+        for k, b in enumerate(c.blocks):
+            if b.kind == 'ktmdl':
+                out.append((name, k, b.data))
+    return out
+
+
+def test_model_corpus_parses():
+    """Every KTMDL block of the user's game parses, including the 5 the old
+    magic-search located wrongly (dt09 #176 x4, dt0b #35)."""
+    V = _vendor_reader()
+    fails = []
+    for img, i, raw in all_entries():
+        for k, b in enumerate(container.read(raw).ktmdl_blocks()):
+            try:
+                V.parse_bytes(b.data, 'x')
+            except Exception as e:
+                fails.append((img, i, k, str(e)[:80]))
+    assert not fails, fails[:10]
+    print('model: every KTMDL block of %d entries parses' % len(all_entries()))
+
+
+def test_model_stream_tables_are_record_relative():
+    """A stream record's element table and packet's palette are offsets from
+    the RECORD, not from the packet: bad176 pkt0 rec0 elementOffset 1088 lands
+    1088 past its own record (a plausible vertex-element row), and read
+    packet-relative it reads the region right after the header (sky floats).
+    The vendored reader added the packet base to both."""
+    V = _vendor_reader()
+    import struct
+    for name, k, data in _class_blocks():
+        S = struct.unpack_from('<I', data, 0x34)[0]
+        n = struct.unpack_from('<I', data, 0x30)[0]
+        P = struct.unpack_from('<i', data, 0x2C)[0]
+        for i in range(n):
+            o = S + i * 0x20
+            elc = data[o + 0x0A]
+            sto = struct.unpack_from('<i', data, o + 0x0C)[0]
+            if not elc:
+                continue
+            rel = data[o + sto:o + sto + elc * 4]
+            # every row is u16 stream id 0, then (offset, format, semantics)
+            rows = [(r[1], r[2], r[3]) for r in (rel[j * 4:j * 4 + 4] for j in range(elc))]
+            assert rows[0] == (0, 2, 0x10), (name, k, i, rows[0])
+            assert all(a <= b for a, b in zip([x[0] for x in rows], [x[0] for x in rows][1:])), (name, i, rows)
+        p0 = P
+        skN = struct.unpack_from('<I', data, p0 + 0x18)[0]
+        skO = struct.unpack_from('<i', data, p0 + 0x1C)[0]
+        if skN:
+            pal = struct.unpack_from('<%dH' % skN, data, p0 + skO)
+            assert len(set(pal)) == skN or skN == 1, (name, k, pal)
+            assert max(pal) <= len(V.parse_bytes(data, 'x')['bones']), (name, k, pal)
+    print('model: stream element tables and palettes read record-relative')
+
+
+
+
 TESTS = [test_corpus_found, test_container_unedited_exact, test_container_block_offsets,
-         test_container_every_ktmdl_located, test_container_edited_rewrite]
+         test_container_every_ktmdl_located, test_container_edited_rewrite,
+         test_model_corpus_parses, test_model_stream_tables_are_record_relative]
 
 if __name__ == '__main__':
     if not corpus.available():
