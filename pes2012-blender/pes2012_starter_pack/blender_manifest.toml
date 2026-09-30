@@ -1,0 +1,19 @@
+schema_version = "1.0.0"
+
+id = "pes2012_toolkit"
+version = "2.0.0"
+name = "PES2012 Toolkit"
+tagline = "Byte-exact import/export of PES2012 KTMDL BINs and PGB2 bodies"
+maintainer = "PES2012 4CC toolchain"
+type = "add-on"
+
+blender_version_min = "4.2.0"
+
+license = ["SPDX:GPL-3.0-or-later"]
+tags = ["Import-Export"]
+
+[permissions]
+files = "Read and write PES2012 BIN files"
+
+[build]
+paths_exclude_pattern = ["__pycache__/", "/.git/", "*.zip"]

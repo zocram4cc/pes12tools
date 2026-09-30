@@ -73,13 +73,8 @@ def test_container_edited_rewrite():
 
 
 def _vendor_reader():
-    """The vendored KTMDL reader without the bpy-importing package __init__."""
-    import importlib.util
-    here = os.path.join(HERE, '..', 'pes2012_starter_pack', 'pes_ktmdl_importer', 'ktmdl.py')
-    spec = importlib.util.spec_from_file_location('pes_ktmdl_vendor', here)
-    mod = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(mod)
-    return mod
+    from pes_ktmdl_importer import ktmdl
+    return ktmdl
 
 
 def _class_blocks():
@@ -142,9 +137,128 @@ def test_model_stream_tables_are_record_relative():
 
 
 
+
+def test_skeleton_per_block():
+    """One skeleton per KTMDL block: node counts, parents resolvable,
+    binds equal the raw matrices. Blocks are NOT merged: dt07 #2960's
+    block-1 thigh is not block-0's shinguard, and dt09 #349's node-0
+    blocks disagree in bind (30-09)."""
+    import model
+    import skeleton
+    want = {'body_349': 6, 'face_dt0c': 2, 'ball': 1, 'kit': 3, 'boots_skinned': 2,
+            'hair_3bone': 2, 'face_dt0d': 2, 'body_21': 1, 'body_40': 1, 'body_multi': 3,
+            'boots_static': 4}
+    for name, nblocks in want.items():
+        img, idx = corpus.CLASSES[name]
+        c = container.read(corpus.read_entry(img, idx))
+        ms = [('blk%d' % k, model.read(b.data).parsed) for k, b in enumerate(c.ktmdl_blocks())]
+        sks = skeleton.build(ms)
+        assert len(sks) == nblocks and len(ms) == nblocks, (name, len(sks), len(ms))
+        for (blk, parsed), sk in zip(ms, sks):
+            assert len(sk) == len(parsed['bones']), (name, blk)
+            for b in sk.bones:
+                assert b.parent_id in (-1,) or b.parent_id in sk.by_id, (name, blk, b.id)
+                raw = parsed['bones'][b.id]
+                flat = [float(x) for row in raw['matrix'] for x in row]
+                assert all(abs(a - x) < 1e-6 for a, x in zip(b.bind, flat)), (name, blk, b.id)
+    print('skeleton: one skeleton per block, binds exact')
+
+
+
+def _blender_corners(parsed_packet):
+    """What blender_io import leaves on a mesh, without Blender: one corner
+    per face corner tagged with its source vid, UVs flipped in float32,
+    weights summed per bone in float32 like vertex groups store them."""
+    import model
+    f32 = model._f32
+    corners, tris = [], []
+    for t in parsed_packet['triangles']:
+        tri = []
+        for vid in t:
+            view = model.import_view(parsed_packet['vertices'][vid], parsed_packet['bonePalette'])
+            corners.append(dict(vid=vid, pos=view['pos'], uv=dict(view['uv']), nrm=view['nrm'],
+                                w={k: f32(x) for k, x in view['w'].items()}))
+            tri.append(len(corners) - 1)
+        tris.append(tuple(tri))
+    return corners, tris
+
+
+def test_export_unedited_byte_exact():
+    """Blender-shaped corners of every packet, exported unedited through
+    export_packet + build, reproduce every class block byte for byte."""
+    import model
+    import ktmdl_write as W
+    for name, k, data in _class_blocks():
+        m = model.read(data)
+        rows = []
+        for i, p in enumerate(m.parsed['packets']):
+            corners, tris = _blender_corners(p)
+            rows.append(model.export_packet(data, i, corners, tris))
+        out = W.build(data, rows)
+        assert out == data, (name, k, len(out), len(data))
+    print('export: unedited Blender round trip byte-exact on every class block')
+
+
+def test_export_edited():
+    """Moving one corner and deleting a triangle: the rest stays stock, the
+    moved vertex is fresh, counts follow the edit."""
+    import model
+    import ktmdl_write as W
+    for name in ('ball', 'body_349', 'boots_skinned', 'face_dt0c'):
+        img, idx = corpus.CLASSES[name]
+        data = next(b.data for b in container.read(corpus.read_entry(img, idx)).ktmdl_blocks())
+        m = model.read(data)
+        p = m.parsed['packets'][0]
+        corners, tris = _blender_corners(p)
+        tris = tris[1:]                                   # delete the first triangle
+        moved = tris[0][0]
+        c = corners[moved]
+        c['pos'] = (c['pos'][0] + 0.01, c['pos'][1], c['pos'][2])
+        rows = [model.export_packet(data, 0, corners, tris)]
+        out = W.build(data, rows)
+        m2 = model.read(out)
+        q = m2.parsed['packets'][0]
+        assert len(q['triangles']) == len(p['triangles']) - 1, (name, len(q['triangles']))
+        got = sorted(tuple(round(x, 5) for x in q['vertices'][v]['POSITION']) for t in q['triangles'] for v in t)
+        assert tuple(round(x, 5) for x in c['pos']) in got, name
+        for j in range(1, len(m.parsed['packets'])):
+            assert W.packet_mesh(out, j)[0] == W.packet_mesh(data, j)[0], (name, j)
+    print('export: edited packet re-reads with the edit, other packets stock')
+
+
+
+def test_export_corpus_byte_exact():
+    """EVERY entry of the game: each KTMDL block exported unedited from
+    Blender-shaped corners, written back through the container, equals the
+    source entry. Long (minutes): runs when PES12_FULL=1."""
+    if not os.environ.get('PES12_FULL'):
+        print('export corpus: skipped (PES12_FULL=1 to run)')
+        return
+    import model
+    import ktmdl_write as W
+    bad = []
+    for img, i, raw in all_entries():
+        c = container.read(raw)
+        try:
+            for b in c.ktmdl_blocks():
+                m = model.read(b.data)
+                rows = [model.export_packet(b.data, j, *_blender_corners(p))
+                        for j, p in enumerate(m.parsed['packets'])]
+                b.data = W.build(b.data, rows) if rows else b.data
+            if container.write(c) != raw:
+                bad.append((img, i, 'differs'))
+        except Exception as e:
+            bad.append((img, i, repr(e)[:80]))
+    assert not bad, (len(bad), bad[:10])
+    print('export corpus: %d entries byte-exact' % len(all_entries()))
+
+
 TESTS = [test_corpus_found, test_container_unedited_exact, test_container_block_offsets,
          test_container_every_ktmdl_located, test_container_edited_rewrite,
-         test_model_corpus_parses, test_model_stream_tables_are_record_relative]
+         test_model_corpus_parses, test_model_stream_tables_are_record_relative,
+         test_skeleton_per_block,
+         test_export_unedited_byte_exact, test_export_edited,
+         test_export_corpus_byte_exact]
 
 if __name__ == '__main__':
     if not corpus.available():

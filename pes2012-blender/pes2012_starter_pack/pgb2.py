@@ -29,6 +29,8 @@ MODES = ('body', 'head', 'kit', 'boots')
 
 SUB_ALPHATEST, SUB_BLEND, SUB_TWOSIDED, SUB_NOZWRITE = 1, 2, 4, 8
 SUB_KIT, SUB_OUTLINE, SUB_FACE = 16, 32, 64
+# drawlogic's own pixel shaders and hair pass (dllprobe/drawlogic.cpp SUB_*)
+SUB_SHADELESS, SUB_TOON, SUB_HAIR = 1 << 16, 1 << 17, 1 << 18
 SUB_REF_SHIFT = 8  # bits 8-15: alpha-test ref (pass alpha > ref)
 
 MAX_INFLUENCES = 4

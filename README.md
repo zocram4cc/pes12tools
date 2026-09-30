@@ -8,7 +8,7 @@ in each folder's README)..
 |---|---|---|
 | `pes2012-4cc/` | ready-made 4chan Cup base for PES2012 v1.06 (kitserver 12 + `4cc-dlc` override root; no game file modified) | copy `kitserver/` into the game folder |
 | `pes2012-tools/` | the toolchain that built it: PES2015/PES2017 team, body, kit, ball, stadium conversion; the custom-body runtime (`kitserver/4cc-players/`); the EDIT editor source is `editapp/` in the repo | Python 3 + `requirements.txt`, `7z`, ImageMagick; a PES2012 install, a PES2015 Data dir (kit layouts), a PES2021 Data dir (engine textures), your 4cc exports |
-| `pes2012-blender/` | Blender 4.x/5.x add-on for KTMDL BINs (balls, boots, stadiums) and PGB2 player bodies, with tests | Blender; same BIN sources as above |
+| `pes2012-blender/` | Blender 4.2+ extension: byte-exact import/export of every PES2012 model BIN (balls, stadiums, boots, faces, hair, bodies, kits) and PGB2 player bodies, with tests | Blender; same BIN sources as above |
 
 ## Build order (from a bare checkout)
 

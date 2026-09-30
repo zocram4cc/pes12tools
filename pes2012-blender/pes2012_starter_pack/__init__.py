@@ -1,291 +1,139 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
-"""PES 2008-2013 Starter Pack: KTMDL import/export + PGB2 custom bodies.
+"""PES2012 Blender toolkit: KTMDL models (balls, stadiums, boots, faces,
+hair, bodies, kits) and PGB2 custom bodies.
 
-KTMDL import re-exports the vendored pes_ktmdl_importer package from
-moth1995/pes2008-2013-tools (KTMDL importer by marqisspes6; GPL-3.0;
-see pes_ktmdl_importer/README.md and LICENSE).
-KTMDL export for new topology and PGB2 body import/export are
-implemented here on the pure-python ktpack/binwrap/pgb2 modules
-(importable without Blender, which is how tests/ exercises them).
+Pure-python layers (importable without Blender; tests/ exercise them):
+container (BIN wrappers), model (KTMDL read/export), skeleton (per-block
+bones), textures (WE00/DDS), ktpack/ktmdl_write (packing/rebuild), pgb2.
+blender_io is the only bpy-facing layer besides this file. The vendored
+KTMDL reader is moth1995/pes2008-2013-tools (marqisspes6, GPL-3.0; see
+pes_ktmdl_importer/README.md).
 
-World scale: PES units are metres, same as Blender, so no scale factor.
+World scale: PES units are metres, same as Blender.
 """
 bl_info = {
-    "name": "PES 2008-2013 Starter Pack",
+    "name": "PES2012 Toolkit",
     "author": "PES2012 modding toolchain",
-    "version": (1, 0, 0),
-    "blender": (4, 0, 0),
-    "location": "File > Import/Export > PES (.bin)",
-    "description": "Import stock KTMDL BINs, export edited geometry back "
-                   "into template BINs, and author PGB2 custom bodies",
-    "warning": "",
-    "doc_url": "",
+    "version": (2, 0, 0),
+    "blender": (4, 2, 0),
+    "location": "File > Import/Export > PES2012",
+    "description": "Byte-exact import/export of PES2012 KTMDL BINs and PGB2 custom bodies",
     "category": "Import-Export",
     "license": "GPL-3.0-or-later",
 }
 
 import os
-import struct
 import sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-import bpy
-from bpy.props import BoolProperty, EnumProperty, IntProperty, StringProperty
-from bpy_extras.io_utils import ExportHelper, ImportHelper
+import bpy  # noqa: E402
+from bpy.props import BoolProperty, EnumProperty, IntProperty, StringProperty  # noqa: E402
+from bpy_extras.io_utils import ExportHelper, ImportHelper  # noqa: E402
 
-from . import binwrap, ktpack, pgb2
-from .pes_ktmdl_importer import IMPORT_OT_pes_ktmdl
-from .pes_ktmdl_importer import ktmdl as _ktmdl
-from .pes_ktmdl_importer import (
-    _basis_matrix,
-    _create_armature,
-    _create_mesh_object,
-    _source_stem,
-    _store_collection_metadata,
-)
+from . import blender_io, container, ktmdl_write, model, pgb2, skeleton  # noqa: E402
+
+SOURCE_PROP = 'pes12_source'    # collection: absolute path of the imported BIN
+BLOCK_PROP = 'pes12_block'      # object: index into the container's blocks
+PACKET_PROP = 'pes12_packet'    # mesh object: packet index in its block
 
 
-def _to_blender(p):
-    x, y, z = p  # PES (X, Y, Z) -> Blender (X, -Z, Y)
-    return (x, -z, y)
+def import_bin(context, filepath):
+    """BIN -> collection: per KTMDL block one armature (its own skeleton)
+    and one mesh per packet. Returns (collection, packet count)."""
+    raw = open(filepath, 'rb').read()
+    c = container.read(raw)
+    blocks = [(k, b) for k, b in enumerate(c.blocks) if b.kind == 'ktmdl']
+    if not blocks:
+        raise ValueError('no KTMDL block in %s' % filepath)
+    stem = os.path.splitext(os.path.basename(filepath))[0]
+    col = bpy.data.collections.new(stem)
+    context.scene.collection.children.link(col)
+    col[SOURCE_PROP] = os.path.abspath(filepath)
+    layer = context.view_layer.layer_collection.children[col.name]
+    context.view_layer.active_layer_collection = layer
+    n = 0
+    for k, b in blocks:
+        m = model.read(b.data)
+        sk = skeleton.build_one('b%d' % k, m.parsed)
+        arm = blender_io.make_armature('%s_b%d' % (stem, k), sk)
+        arm[BLOCK_PROP] = k
+        for i, p in enumerate(m.parsed['packets']):
+            o = blender_io.make_mesh('%s_b%d_p%03d' % (stem, k, i), p, p['bonePalette'], sk)
+            o[BLOCK_PROP] = k
+            o[PACKET_PROP] = i
+            blender_io.parent_to_armature(o, arm)
+            o.parent = arm
+            n += 1
+    return col, n
 
 
-def _to_pes(p):
-    x, y, z = p  # inverse of the import basis (vendored _basis_matrix)
-    return (x, z, -y)
+def export_bin(col, filepath):
+    """Collection from import_bin -> BIN at filepath, byte-exact where the
+    user changed nothing. A packet whose mesh object was deleted keeps its
+    stock data; extra objects are ignored (one object per packet)."""
+    src = col.get(SOURCE_PROP)
+    if not src or not os.path.exists(src):
+        raise ValueError('collection %s was not imported from a PES2012 BIN' % col.name)
+    c = container.read(open(src, 'rb').read())
+    objs = {}
+    for o in col.all_objects:
+        if o.type == 'MESH' and BLOCK_PROP in o and PACKET_PROP in o:
+            objs.setdefault(int(o[BLOCK_PROP]), {})[int(o[PACKET_PROP])] = o
+    for k, packets in objs.items():
+        b = c.blocks[k]
+        m = model.read(b.data)
+        sk = skeleton.build_one('b%d' % k, m.parsed)
+        rows = [model.export_packet(b.data, i, *blender_io.read_corners(o, sk))
+                for i, o in sorted(packets.items())]
+        b.data = ktmdl_write.build(b.data, rows)
+    open(filepath, 'wb').write(container.write(c))
+    return filepath
 
 
-def _template_body(path):
-    """Template BIN path -> (tag8, body); BIN may be WESYS or raw."""
-    raw = open(path, 'rb').read()
-    return bytes(raw[:8]), binwrap.unwesys(raw)
-
-
-def import_bin(context, filepath, flip_v=False):
-    """BIN bytes -> (model-ish report, collection, objects): one temp .ktmdl
-    per KTMDL block, each imported through the vendored importer."""
-    import tempfile
-    tag, body = _template_body(filepath)
-    kind, blocks = _split_template(body)
-    hits = binwrap.find_ktmdl(blocks)
-    if not hits:
-        raise _ktmdl.KTMDLError('no KTMDL block in %s' % filepath)
-    stem = _source_stem(filepath)
-    collection = bpy.data.collections.new(stem)
-    context.scene.collection.children.link(collection)
-    basis = _basis_matrix('PES_TO_BLENDER')
-    objects, total = [], 0
-    for h in hits:
-        with tempfile.NamedTemporaryFile(suffix='.ktmdl', delete=False) as t:
-            t.write(blocks[h])
-            tmp = t.name
-        try:
-            model = _ktmdl.parse_file(tmp)
-            arm_obj, bone_names = None, {}
-            if model['bones']:
-                arm_obj, bone_names = _create_armature(
-                    context, collection, model, basis, 1.0)
-            for packet in model['packets']:
-                o = _create_mesh_object(
-                    context, collection, model, packet, basis, 1.0, flip_v,
-                    True, arm_obj, bone_names, 'PRIMARY0', {})
-                o['pes12_template'] = os.path.abspath(filepath)
-                o['pes12_block'] = h
-                objects.append(o)
-            total += len(model['packets'])
-        finally:
-            os.unlink(tmp)
-    _store_collection_metadata(collection, model, None, None, filepath,
-                               'PES_TO_BLENDER', 1.0, flip_v, 'PRIMARY0')
-    return {'blocks': len(hits), 'parts': total, 'kind': kind}, collection, objects
-
-
-def _palette_of(template, packet):
-    """Template packet palette -> {vertex-group name: palette slot}.
-
-    KTMDL BLENDINDICES index the packet's own palette (bone node ids),
-    so groups map through the vendored importer bone names
-    (bone_%03d_%016X), not the PGB2 21-slot table. Falls back to SLOT_OF
-    when the template carries no palette (unskinned packets).
-    """
-    from .pes_ktmdl_importer import _bone_name
-    from .pes_ktmdl_importer import ktmdl as _k
-    model = _k.parse_bytes(bytes(template), 'template.ktmdl')
-    pal = model['packets'][packet].get('skeletonIndices', [])
-    node_of = {b['index']: b for b in model['bones']}
-    out = {}
-    for slot, node in enumerate(pal):
-        b = node_of.get(node)
-        if b is not None:
-            out[_bone_name(b)] = slot
-    return out or dict(pgb2.SLOT_OF)
-
-
-def _mesh_data(obj, flip_v, template=None, packet=0):
-    """Blender mesh -> (attrs, tris): split verts by loop seams.
-
-    One attr per (vertex, uv chans, loop normal) key over loop_triangle
-    loops, so UV/normal seams survive; tris index the split verts. w is
-    [(palette slot, weight)] via the template packet palette.
-    """
-    mesh = obj.data
-    mesh.calc_loop_triangles()
-    mat3 = obj.matrix_world.to_3x3()
-    pal = _palette_of(template, packet) if template is not None else dict(pgb2.SLOT_OF)
-    layers = [mesh.uv_layers.get('UV%d' % ch) for ch in range(4)]
-    attrs, index_of, tris = [], {}, []
-    for t in mesh.loop_triangles:
-        tri = []
-        for li in t.loops:
-            loop = mesh.loops[li]
-            vi = loop.vertex_index
-            v = mesh.vertices[vi]
-            uv = []
-            for layer in layers:
-                if layer is None:
-                    continue
-                u, vv = layer.data[li].uv
-                uv.append((u, 1.0 - vv if flip_v else vv))
-            n = (mat3 @ v.normal).normalized()
-            key = (vi, tuple(uv))
-            if key not in index_of:
-                index_of[key] = len(attrs)
-                infl = []
-                for g in v.groups:
-                    name = obj.vertex_groups[g.group].name
-                    if name in pal:
-                        infl.append((pal[name], g.weight))
-                p = obj.matrix_world @ v.co
-                attrs.append(dict(pos=_to_pes(p), nrm=_to_pes(n),
-                                  uv=(uv or [(0.0, 0.0)]), w=infl))
-            tri.append(index_of[key])
-        tris.append(tuple(tri))
-    return attrs, tris
-
-
-def _split_template(body):
-    """Template body -> (kind, blocks): ball, dt08 stadium side, generic.
-
-    The dialect is chosen by join(split(x)) == x (ball, then stadium,
-    then generic): row layouts overlap, so header-shape guessing
-    mis-routes (dt08 sides share n=4/hs=64 with balls; texture
-    companions parse as stadium rows). 0-packet reserved slots pass
-    through untouched.
-    """
-    from . import ktmdl_write as _W  # noqa: F401 (kept for export scope)
-    try:
-        kt, tex = binwrap.split_ball(body)
-        if binwrap.join_ball(kt, tex) == bytes(body):
-            return 'ball', [kt, *tex]
-    except ValueError:
-        pass
-    try:
-        blocks = binwrap.split_stadium(body)
-        if binwrap.join_stadium(blocks) == bytes(body):
-            return 'stadium', blocks
-    except ValueError:
-        pass
-    return 'generic', binwrap.split_generic(body)
-
-
-def export_bin(filepath, template_path, objects, flip_v=False, afs_entry=None):
-    """Mesh objects + template BIN -> WESYS BIN at filepath.
-
-    Objects carry pes12_block / ktmdl_packet_index from import_bin; the
-    template supplies header/materials/bones/declaration. Returns the
-    written path (defaults to <name>_<entry>.bin for afs2fs when the
-    chosen name has no underscore suffix).
-    """
-    from . import ktmdl_write as W
-    tag, body = _template_body(template_path)
-    kind, blocks = _split_template(body)
-    rows_by_block = {}
-    for o in objects:
-        block = int(o.get('pes12_block', 0))
-        template = blocks[block]
-        packet = int(o.get('ktmdl_packet_index', o.get('ktmdl_part_index', 0)))
-        attrs, tris = _mesh_data(o, flip_v, template, packet)
-        decl = ktpack.declaration(template, packet)
-        if not any(s in (0x20, 0x21) for _, _, s in decl):
-            for a in attrs:
-                a.pop('w', None)
-        rows_by_block.setdefault(block, []).append(
-            ktpack.mesh_row(template, packet, attrs, list(tris)))
-    new_blocks = list(blocks)
-    for block, rows in rows_by_block.items():
-        # untouched packets ride along as template rows: ktmdl_write
-        # rebuilds group/bounding AABBs from the replaced packets only,
-        # so a partial export would otherwise shrink the block bounds.
-        have = {r['packet'] for r in rows}
-        npacket = W._u32(blocks[block], W.H_PACKET_COUNT)
-        for pi in range(npacket):
-            if pi not in have:
-                vb, idx, _st = W.packet_mesh(blocks[block], pi)
-                rows.append({'packet': pi, 'vertices': bytes(vb),
-                             'indices': list(idx)})
-        new_blocks[block] = W.build(blocks[block], rows)
-    if kind == 'ball':
-        out_body = binwrap.join_ball(new_blocks[0], new_blocks[1:])
-    elif kind == 'stadium':
-        out_body = binwrap.join_stadium(new_blocks)
-    else:
-        n, _, hs = struct.unpack_from('<III', body)
-        out_body = binwrap.join_generic(new_blocks, compact=(hs == 12 + 12 * n))
-    out = filepath
-    if afs_entry is not None and '_' not in os.path.splitext(os.path.basename(out))[0]:
-        out = os.path.join(os.path.dirname(out), '%s_%d.bin' % (
-            os.path.splitext(os.path.basename(out))[0], afs_entry))
-    wrapped = binwrap.wesys_wrap(out_body)
-    open(out, 'wb').write(bytes(tag) + bytes(wrapped[8:]) if tag[3:8] == b'WESYS'
-                          else bytes(out_body))
-    return out
+def _collection_of(context):
+    """Imported collection of the active object, else the active one."""
+    o = context.active_object
+    cols = list(o.users_collection) if o else []
+    cols.append(context.view_layer.active_layer_collection.collection)
+    for col in cols:
+        if SOURCE_PROP in col:
+            return col
+    return None
 
 
 class IMPORT_OT_pes12_bin(bpy.types.Operator, ImportHelper):
     bl_idname = 'import_scene.pes12_bin'
-    bl_label = 'Import PES2012 BIN (KTMDL)'
+    bl_label = 'Import PES2012 BIN'
     bl_options = {'UNDO', 'PRESET'}
     filename_ext = '.bin'
     filter_glob: StringProperty(default='*.bin', options={'HIDDEN'})
-    flip_v: BoolProperty(name='Flip UV V', default=False)
 
     def execute(self, context):
         try:
-            rep, _c, objs = import_bin(context, self.filepath, self.flip_v)
-        except _ktmdl.KTMDLError as e:
+            col, n = import_bin(context, self.filepath)
+        except Exception as e:  # reader errors carry the offending field
             self.report({'ERROR'}, str(e))
             return {'CANCELLED'}
-        self.report({'INFO'}, 'Imported %d part(s) (%s BIN)' % (rep['parts'], rep['kind']))
+        self.report({'INFO'}, 'Imported %d packet(s) into %s' % (n, col.name))
         return {'FINISHED'}
 
 
 class EXPORT_OT_pes12_bin(bpy.types.Operator, ExportHelper):
     bl_idname = 'export_scene.pes12_bin'
-    bl_label = 'Export PES2012 BIN (KTMDL from template)'
+    bl_label = 'Export PES2012 BIN'
     bl_options = {'PRESET'}
     filename_ext = '.bin'
     filter_glob: StringProperty(default='*.bin', options={'HIDDEN'})
-    flip_v: BoolProperty(name='Flip UV V', default=False)
-    afs_entry: IntProperty(
-        name='AFS entry number', default=11,
-        description='dtXX entry this BIN replaces; the file name defaults '
-                    'to <name>_<entry>.bin for afs2fs')
 
     def execute(self, context):
-        objs = [o for o in context.selected_objects if o.type == 'MESH']
-        if not objs:
-            self.report({'ERROR'}, 'Select mesh objects to export')
-            return {'CANCELLED'}
-        templates = {o.get('pes12_template', '') for o in objs}
-        if len(templates) != 1 or not next(iter(templates)):
-            self.report({'ERROR'},
-                        'All selected objects must come from one Import PES2012 BIN')
+        col = _collection_of(context)
+        if col is None:
+            self.report({'ERROR'}, 'Select an object of an imported PES2012 BIN')
             return {'CANCELLED'}
         try:
-            out = export_bin(self.filepath, next(iter(templates)), objs,
-                             self.flip_v, self.afs_entry)
-        except (_ktmdl.KTMDLError, ValueError) as e:
+            out = export_bin(col, self.filepath)
+        except ValueError as e:
             self.report({'ERROR'}, str(e))
             return {'CANCELLED'}
         self.report({'INFO'}, 'Wrote %s' % out)
@@ -295,6 +143,20 @@ class EXPORT_OT_pes12_bin(bpy.types.Operator, ExportHelper):
 # --- PGB2 bodies ---
 
 PGB2_MODES = tuple((m, m, m) for m in pgb2.MODES)
+# material property -> submesh flag bit (every bit PGB2 defines; the ref
+# byte, bits 8-15, is pgb2_alpha_ref)
+FLAG_PROPS = (
+    ('pgb2_alpha_test', pgb2.SUB_ALPHATEST, 'Alpha test (bit 0)'),
+    ('pgb2_blend', pgb2.SUB_BLEND, 'Alpha blend, drawn last (bit 1)'),
+    ('pgb2_twosided', pgb2.SUB_TWOSIDED, 'Two-sided (bit 2)'),
+    ('pgb2_nozwrite', pgb2.SUB_NOZWRITE, 'No depth write (bit 3)'),
+    ('pgb2_kit_slot', pgb2.SUB_KIT, 'Kit slot: UVs on the worn kit sheet (bit 4)'),
+    ('pgb2_outline', pgb2.SUB_OUTLINE, 'Toon outline shell (bit 5)'),
+    ('pgb2_face', pgb2.SUB_FACE, 'Face part: head-local verts (bit 6)'),
+    ('pgb2_shadeless', pgb2.SUB_SHADELESS, 'Shadeless pixel shader (bit 16)'),
+    ('pgb2_toon', pgb2.SUB_TOON, 'Toon (Pony) pixel shader (bit 17)'),
+    ('pgb2_hair', pgb2.SUB_HAIR, 'Hair: opaque core plus alpha fringe pass (bit 18)'),
+)
 
 
 def _ensure_props():
@@ -306,37 +168,20 @@ def _ensure_props():
         bpy.types.Material.pgb2_alpha_ref = IntProperty(
             name='Alpha ref', default=0, min=0, max=255,
             description='Alpha-test threshold, bits 8-15 (pass alpha > ref)')
-    for name, default, desc in (
-            ('pgb2_alpha_test', False, 'Alpha test (bit0)'),
-            ('pgb2_blend', False, 'Alpha blend, drawn last (bit1)'),
-            ('pgb2_twosided', False, 'Two-sided (bit2)'),
-            ('pgb2_nozwrite', False, 'No depth write (bit3)'),
-            ('pgb2_kit_slot', False, 'Kit slot: UVs on the worn kit sheet (bit4)'),
-            ('pgb2_outline', False, 'Toon outline shell (bit5)'),
-            ('pgb2_face', False, 'Face part: head-local verts (bit6)')):
+    for name, bit, desc in FLAG_PROPS:
         if not hasattr(bpy.types.Material, name):
-            setattr(bpy.types.Material, name,
-                    BoolProperty(name=name, default=default, description=desc))
+            setattr(bpy.types.Material, name, BoolProperty(name=name, default=False, description=desc))
 
 
 def _mat_flags(mat):
     # RNA storage (Blender 5.0 moved bpy.props out of IDProperty dicts,
     # so mat.get('pgb2_blend') reads None even when set: use getattr).
     f = 0
-    if getattr(mat, 'pgb2_alpha_test', False):
-        f |= pgb2.SUB_ALPHATEST | (int(getattr(mat, 'pgb2_alpha_ref', 0)) << pgb2.SUB_REF_SHIFT)
-    if getattr(mat, 'pgb2_blend', False):
-        f |= pgb2.SUB_BLEND
-    if getattr(mat, 'pgb2_twosided', False):
-        f |= pgb2.SUB_TWOSIDED
-    if getattr(mat, 'pgb2_nozwrite', False):
-        f |= pgb2.SUB_NOZWRITE
-    if getattr(mat, 'pgb2_kit_slot', False):
-        f |= pgb2.SUB_KIT
-    if getattr(mat, 'pgb2_outline', False):
-        f |= pgb2.SUB_OUTLINE
-    if getattr(mat, 'pgb2_face', False):
-        f |= pgb2.SUB_FACE
+    for name, bit, _desc in FLAG_PROPS:
+        if getattr(mat, name, False):
+            f |= bit
+    if f & pgb2.SUB_ALPHATEST:
+        f |= int(getattr(mat, 'pgb2_alpha_ref', 0)) << pgb2.SUB_REF_SHIFT
     return f
 
 
@@ -357,7 +202,7 @@ def import_body(context, filepath):
         if vi in face_verts:  # head-local storage: add the head joint back
             p = (p[0] + pgb2.HEAD_POS[0], p[1] + pgb2.HEAD_POS[1],
                  p[2] + pgb2.HEAD_POS[2])
-        positions.append(_to_blender(p))
+        positions.append(blender_io.to_blender(p))
     mesh.from_pydata(
         positions, [],
         [tuple(parsed['idx'][k:k + 3])
@@ -388,12 +233,9 @@ def import_body(context, filepath):
     for mi, s in enumerate(parsed['subs']):
         mat = bpy.data.materials.new('%s_sub%d' % (stem, mi))
         obj.data.materials.append(mat)
-        for bit, key in ((1, 'pgb2_alpha_test'), (2, 'pgb2_blend'),
-                         (4, 'pgb2_twosided'), (8, 'pgb2_nozwrite'),
-                         (16, 'pgb2_kit_slot'), (32, 'pgb2_outline'),
-                         (64, 'pgb2_face')):
+        for key, bit, _desc in FLAG_PROPS:
             setattr(mat, key, bool(s['flags'] & bit))
-        mat.pgb2_alpha_ref = (s['flags'] >> 8) & 0xFF
+        mat.pgb2_alpha_ref = (s['flags'] >> pgb2.SUB_REF_SHIFT) & 0xFF
         mat['pgb2_tex'] = s['tex']
     # polygon k belongs to the submesh whose index range holds it
     tri_no = 0
@@ -416,8 +258,8 @@ def export_body(filepath, obj):
     mesh = obj.data
     mesh.calc_loop_triangles()
     mat3 = obj.matrix_world.to_3x3()
-    pos_of = {v.index: _to_pes(obj.matrix_world @ v.co) for v in mesh.vertices}
-    nrm_of = {v.index: _to_pes((mat3 @ v.normal).normalized()) for v in mesh.vertices}
+    pos_of = {v.index: blender_io.to_pes(obj.matrix_world @ v.co) for v in mesh.vertices}
+    nrm_of = {v.index: blender_io.to_pes((mat3 @ v.normal).normalized()) for v in mesh.vertices}
     try:
         mesh.calc_tangents()
         has_tan = True
@@ -452,9 +294,9 @@ def export_body(filepath, obj):
                         except ValueError:
                             pass
                 if has_tan:
-                    tan = _to_pes(loop.tangent)
+                    tan = blender_io.to_pes(loop.tangent)
                     try:
-                        bin_ = _to_pes(loop.bitangent)
+                        bin_ = blender_io.to_pes(loop.bitangent)
                     except Exception:
                         bin_ = (0.0, 0.0, 1.0)
                 else:
@@ -534,11 +376,8 @@ classes = (IMPORT_OT_pes12_bin, EXPORT_OT_pes12_bin, IMPORT_OT_pgb2, EXPORT_OT_p
 
 def register():
     _ensure_props()
-    for c in list(classes) + [IMPORT_OT_pes_ktmdl]:
-        try:
-            bpy.utils.register_class(c)
-        except ValueError:
-            pass  # vendored importer self-registers on Blender reload
+    for c in classes:
+        bpy.utils.register_class(c)
     bpy.types.TOPBAR_MT_file_import.append(menu_import)
     bpy.types.TOPBAR_MT_file_export.append(menu_export)
 
@@ -550,7 +389,7 @@ def unregister():
             menu.remove(fn)
         except Exception:
             pass
-    for c in reversed([*classes, IMPORT_OT_pes_ktmdl]):
+    for c in reversed(classes):
         try:
             bpy.utils.unregister_class(c)
         except Exception:

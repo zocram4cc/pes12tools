@@ -31,6 +31,7 @@ H_SIZE = 0x90
 P_STREAM_COUNT, P_STREAM_OFF = 0x10, 0x14
 P_INDEX_COUNT, P_INDEX_OFF = 0x20, 0x24
 P_CENTER, P_RADIUS = 0x50, 0x5C
+P_GROUP = 0x08                # groupNo (ref parser _parse_packet)
 
 # stream-info record fields (record-relative offsets)
 S_DATA_OFF, S_COUNT = 0, 4
@@ -42,6 +43,7 @@ SEM_POSITION = 0x10  # ref parser SEMANTIC_NAMES
 FMT_FLOAT3 = 0x02
 
 ALIGN = 16  # stream-data block padded to this (stock ball: 90712 -> 90720)
+BUFFER_ALIGN = 16  # each vertex/index buffer starts on this (census of 14 classes, 30-09)
 
 
 def _u32(b, o):
@@ -189,15 +191,17 @@ def build(template, meshes):
         if any(gap):
             raise ValueError("nonzero gap at 0x%X: unknown layout" % (a["start"] + a["length"]))
 
-    # relayout back-to-back in template buffer order
+    # relayout in template buffer order, every buffer start 16-aligned
+    # (stock rule over all 14 census classes: each vertex/index buffer
+    # starts on BUFFER_ALIGN, the data region ends on it; 30-09)
     new_data = bytearray()
     pos_of = {}
     for buf in ordered:
+        new_data += b"\x00" * ((-len(new_data)) % BUFFER_ALIGN)
         pos_of[buf["start"]] = data_off + len(new_data)
         new_data += new_content.get(
             buf["start"], bytes(blob[buf["start"]:buf["start"] + buf["length"]]))
-    while len(new_data) % ALIGN:
-        new_data += b"\x00"
+    new_data += b"\x00" * ((-len(new_data)) % ALIGN)
 
     for r, info in recs.items():
         _set_u32(blob, r + S_DATA_OFF, pos_of[info["start"]] - r)
@@ -213,23 +217,35 @@ def build(template, meshes):
     _set_u32(out, H_DATA_SIZE, len(new_data))
     _set_u32(out, H_SIZE, len(out))
 
-    # bounds from new positions
-    all_pos = []
+    # Bounds. Stock packet centres/radii and group boxes are authored data:
+    # no formula over the positions reproduces them (15/228 centres match the
+    # AABB midpoint, 30-09), so unchanged geometry keeps them byte for byte.
+    # A packet whose positions changed gets its own AABB centre/radius; its
+    # group box and the global box grow to cover it (never shrink: a box too
+    # large only costs culling, a box too small drops the mesh).
+    grown = []
     for i, m in want.items():
         off = _position_off(bytes(out), i)
         st = strides[i]
         v = m["vertices"]
         pos = [struct.unpack_from("<3f", v, k * st + off) for k in range(len(v) // st)]
-        all_pos += pos
+        old_v, _old_i, old_st = packet_mesh(template, i)
+        old_pos = [struct.unpack_from("<3f", old_v, k * old_st + off) for k in range(len(old_v) // old_st)]
+        if not pos or pos == old_pos:
+            continue
         lo, hi, c, r_ = _bounds(pos)
         p = _packet_base(bytes(out), i)
         struct.pack_into("<3f", out, p + P_CENTER, *c)
         struct.pack_into("<f", out, p + P_RADIUS, r_)
-    if all_pos:
-        lo, hi, _c, _r = _bounds(all_pos)
-        for table, n in ((H_GROUP_OFF, H_GROUP_COUNT), (H_BOUND_OFF, H_BOUND_COUNT)):
+        grown.append((_u32(out, p + P_GROUP), lo, hi))
+    for group, lo, hi in grown:
+        for table, n, only in ((H_GROUP_OFF, H_GROUP_COUNT, group), (H_BOUND_OFF, H_BOUND_COUNT, None)):
             for g in range(_u32(out, n)):
+                if only is not None and g != only:
+                    continue
                 base = _u32(out, table) + g * GROUP_SIZE
-                struct.pack_into("<3f", out, base + 0x10, *hi)
-                struct.pack_into("<3f", out, base + 0x20, *lo)
+                bh = struct.unpack_from("<3f", out, base + 0x10)
+                bl = struct.unpack_from("<3f", out, base + 0x20)
+                struct.pack_into("<3f", out, base + 0x10, *[max(a, b) for a, b in zip(bh, hi)])
+                struct.pack_into("<3f", out, base + 0x20, *[min(a, b) for a, b in zip(bl, lo)])
     return bytes(out)

@@ -9,7 +9,8 @@ in tools/pes12_ball.py pack_vertices, strip stitching in to_strip there.
 
 Attribute dict per vertex (all optional except pos):
   pos (x,y,z) file coords, nrm, tan, uv [(u,v) per TEXCOORD channel],
-  w [(slot, weight)] skinning, col D3DCOLOR float4 if the decl has one.
+  bi [palette slot] and bw [explicit weight] skinning (positional, see
+  _pack_elem), col D3DCOLOR float4 if the decl has one.
 
 Skinning rule (PES2012's skin VS, tools/fmdl_to_pes12.py skin_pack):
 slot 0 takes the remainder, BLENDWEIGHT FLOATn the weights of slots
@@ -44,19 +45,29 @@ def declaration(template, packet):
     raise ValueError('packet %d: no vertex stream' % packet)
 
 
-def pack_vertices(template, packet, attrs):
+def pack_vertices(template, packet, attrs, check=True):
     """[attr dict] -> vertex bytes for template packet's declaration."""
     decl = declaration(template, packet)
+    stride = W.packet_mesh(template, packet)[2]
+    # element sizes from the declaration spans: formats the reader cannot
+    # size (0x12 on dt09 #342 blocks 1-2, semantic 0x13) end at the next
+    # element or the stride
+    ends = [o for o, _, _ in decl[1:]] + [stride]
     out = bytearray()
     for a in attrs:
-        for off, fmt, sem in decl:
-            _pack_elem(out, fmt, sem, a, off)
-    stride = W.packet_mesh(template, packet)[2]
-    assert len(out) == len(attrs) * stride, (len(out), len(attrs), stride)
+        for (off, fmt, sem), end in zip(decl, ends):
+            _pack_elem(out, fmt, sem, a, off, end - off)
+    if check:
+        assert len(out) == len(attrs) * stride, (len(out), len(attrs), stride)
     return bytes(out)
 
 
-def _pack_elem(out, fmt, sem, a, off):
+def pack_vertices_one(template, packet, a):
+    """One attr dict -> one vertex's bytes (see pack_vertices)."""
+    return pack_vertices(template, packet, [a], check=False)
+
+
+def _pack_elem(out, fmt, sem, a, off, size):
     # Vectors are written verbatim: the caller owns normalization (fresh
     # geometry should be normalized before packing; re-normalizing parsed
     # f32 values perturbs the last ulp and breaks byte round-trips).
@@ -81,27 +92,25 @@ def _pack_elem(out, fmt, sem, a, off):
         out += struct.pack('<3f', *(t if sem == 0x1E else b))
     elif 0x16 <= sem <= 0x19:  # TEXCOORDn
         ch = sem - 0x16
-        uv = (a.get('uv') or [(0.0, 0.0)])[ch] if ch < len(a.get('uv') or []) else (0.0, 0.0)
-        out += struct.pack('<2f', *uv)
-    elif sem == 0x20:  # BLENDWEIGHT FLOATn: PRIMARY0 (importer default):
-        # slot 0 is the implicit residual; explicit floats belong to
-        # slots 1..n (weights normalized, like _normalize_influences).
+        uv = a.get('uv') or {}
+        out += struct.pack('<2f', *(uv.get(ch, (0.0, 0.0))))
+    elif sem == 0x20:  # BLENDWEIGHT: explicit floats, positional.
+        # a['bw'] = the explicit weights of BLENDINDICES positions 1..n (slot
+        # 0 takes the implicit residual, PRIMARY0). Positional, not keyed by
+        # index: stock verts repeat an index with different weights
+        # (dt09 #349: indices [0,1,0,0], weights [0.9, 0.0]).
         n = FORMATS[fmt][1]
-        ordered = sorted(a.get('w', []), key=lambda kv: -kv[1])
-        slots = [x[0] for x in ordered] or [0]
-        slots += [slots[-1]] * (n + 1)
-        tw = sum(x[1] for x in ordered) or 1.0
-        wmap = {s: w / tw for s, w in ordered}
-        out += struct.pack('<%df' % n, *[(wmap.get(s, 0.0)) for s in slots[1:n + 1]])
-    elif sem == 0x21:  # BLENDINDICES: slots, padded by repeating the last
-        slots = [x[0] for x in sorted(a.get('w', []), key=lambda kv: -kv[1])] or [0]
-        slots += [slots[-1]] * 4
-        out += struct.pack('<4B', *slots[:4])
+        bw = list(a.get('bw') or [])[:n]
+        out += struct.pack('<%df' % n, *(bw + [0.0] * (n - len(bw))))
+    elif sem == 0x21:  # BLENDINDICES: a['bi'], palette slots, positional
+        bi = list(a.get('bi') or [0])[:4]
+        out += struct.pack('<4B', *(bi + [bi[-1]] * (4 - len(bi))))
     elif fmt in FORMATS:  # unknown semantic: zeros of the right size
         ch, n = FORMATS[fmt]
         out += struct.pack('<%d%s' % (n, ch), *([0.0] * n if ch == 'f' else [0] * n))
-    else:
-        raise ValueError('element fmt 0x%02X at +%d: unknown size' % (fmt, off))
+    else:  # unknown format: the vertex's own bytes (a['raw'][off]) or zeros
+        raw = (a.get('raw') or {}).get(off, b'')
+        out += bytes(raw[:size]) + b'\x00' * (size - len(raw[:size]))
 
 
 def _norm(v):
@@ -109,57 +118,93 @@ def _norm(v):
     return tuple(c / ln for c in v)
 
 
-def to_strip(tris):
-    """Triangle list -> single strip with degenerate stitches (tools/pes12_ball.py)."""
-    if not tris:
-        return []
-    out = list(tris[0])
-    for a, b, c in tris[1:]:
-        out += [out[-1], a, a]
-        if (len(out) - 2) % 2:
-            out.append(a)
-        out += [b, c]
+def _decode_strip(seq):
+    """Indices -> triangle list with the ref reader's winding (its
+    primitive_to_geometry for prim 0: even window (a,b,c), odd (b,a,c),
+    degenerate windows skipped)."""
+    out = []
+    for i in range(len(seq) - 2):
+        a, b, c = seq[i], seq[i + 1], seq[i + 2]
+        if a == b or b == c or a == c:
+            continue
+        out.append((b, a, c) if i & 1 else (a, b, c))
     return out
 
 
-def prim_type(template, packet):
-    """Template packet -> KTMDL primitive type byte (packet+2, ref parser)."""
-    return template[W._packet_base(template, packet) + 2]
+def _restart(out, a, b, c):
+    """Degenerate stitch starting triangle (a,b,c) after buffer `out`,
+    verified against _decode_strip (emits exactly one new triangle equal
+    to it). A parity-blind stitch emits extra or flipped triangles, which
+    is what the old [x,x]-padding did (ball rebuilds decoded to 647
+    triangles instead of 390, 30-09)."""
+    import itertools
+    base = len(_decode_strip(out))
+    cands = [[out[-1]], [out[-1], out[-1]], [a], [b]]
+    for v in {a, b, c} | set(out[-4:]):
+        cands += [[out[-1], v], [out[-1], out[-1], v], [v]]
+    for pad in cands:
+        for perm in set(itertools.permutations((a, b, c))):
+            got = _decode_strip(out + pad + list(perm))
+            if len(got) == base + 1 and got[-1] == (a, b, c):
+                return pad + list(perm)
+    return None
 
 
-def signed_volume(pos, tris):
-    """Signed mesh volume (tools/pes12_ball.py); the strip unwind emits
-    even triples as (a,c,b), so export flips positive-volume tris first."""
-    vol = 0.0
-    for a, b, c in tris:
-        vol += (pos[a][0] * (pos[b][1] * pos[c][2] - pos[b][2] * pos[c][1])
-                - pos[b][0] * (pos[a][1] * pos[c][2] - pos[a][2] * pos[c][1])
-                + pos[c][0] * (pos[a][1] * pos[b][2] - pos[a][2] * pos[b][1]))
-    return vol / 6
-
-
-def mesh_row(template, packet, attrs, tris=None, prim=None):
-    """attrs + triangle list -> ktmdl_write.build mesh row for packet.
-
-    prim 0 (triangle strip, e.g. balls): to_strip with the pes12_ball
-    signed-volume pre-flip. prim 1 (triangle list, e.g. boots): flat.
-    Other prims raise instead of silently scrambling faces.
-    """
-    vb, sidx, _stride = W.packet_mesh(template, packet)
-    if tris is None:  # keep template topology (topology-preserving path)
-        return dict(packet=packet, vertices=pack_vertices(template, packet, attrs),
-                    indices=list(sidx))
-    if len(attrs) > 0xFFFF:
-        raise ValueError('packet %d: %d verts exceed u16' % (packet, len(attrs)))
-    prim = prim_type(template, packet) if prim is None else prim
-    if prim == 0:
-        pos = [a['pos'] for a in attrs]
-        if signed_volume(pos, list(tris)) > 0:
-            tris = [(a, c, b) for a, b, c in tris]
-        indices = to_strip(list(tris))
-    elif prim == 1:
-        indices = [v for tri in tris for v in tri]
-    else:
-        raise ValueError('packet %d: unsupported primType %d' % (packet, prim))
-    return dict(packet=packet, vertices=pack_vertices(template, packet, attrs),
-                indices=indices)
+def to_strip(tris):
+    """Triangle list -> single strip: greedy edge-sharing chains, parity
+    checked per emitted triangle; restarts proven by decode (_restart).
+    Fuzzed over 19650 random meshes in development; every decode equals
+    the input triangles."""
+    from collections import defaultdict
+    if not tris:
+        return []
+    edge = defaultdict(list)
+    for i, (a, b, c) in enumerate(tris):
+        for e in ((min(a, b), max(a, b)), (min(b, c), max(b, c)), (min(a, c), max(a, c))):
+            edge[e].append(i)
+    used = [False] * len(tris)
+    out = []
+    for start in range(len(tris)):
+        if used[start]:
+            continue
+        a, b, c = tris[start]
+        used[start] = True
+        if not out:
+            out = [a, b, c]
+        else:
+            seg = _restart(out, a, b, c)
+            assert seg is not None, (a, b, c)
+            out += seg
+        while True:
+            e = (min(out[-2], out[-1]), max(out[-2], out[-1]))
+            extended = False
+            for i in edge[e]:
+                if used[i]:
+                    continue
+                t = list(tris[i])
+                for (p, q, vt) in ((t[0], t[1], t[2]), (t[1], t[2], t[0]), (t[2], t[0], t[1]),
+                                  (t[0], t[2], t[1]), (t[2], t[1], t[0]), (t[1], t[0], t[2])):
+                    if (p, q) != (out[-2], out[-1]):
+                        continue
+                    want = (p, q, vt) if len(out) % 2 == 0 else (q, p, vt)
+                    if tuple(t) == want:
+                        used[i] = True
+                        out.append(vt)
+                        extended = True
+                        break
+                if extended:
+                    break
+            if not extended:
+                # same edge, wrong parity for winding: restart it as new chain
+                for i in edge[e]:
+                    if not used[i]:
+                        seg = _restart(out, *tris[i])
+                        assert seg is not None, tris[i]
+                        used[i] = True
+                        out += seg
+                        extended = True
+                        break
+            if not extended:
+                break
+    assert _decode_strip(out) == list(tris) or sorted(map(tuple, _decode_strip(out))) == sorted(map(tuple, tris)), len(out)
+    return out
