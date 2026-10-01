@@ -838,6 +838,63 @@ draw:
 // rig has no finger bones, so the two finger slots follow the hands. The kit
 // pieces wear the model's own team's sheet (hiKit, full resolution).
 static const UINT CU_SLOT_FINGER_L = 19, CU_SLOT_FINGER_R = 20;   // kitmap.h: children of hand_l / hand_r
+// Officials pool: custom\p<pid> for pid = (OFFICIALS_TID + 2000) * 100 + n,
+// written by tools/pes12_import_referees.py (OFFICIALS_TID there too); kits
+// custom\kits\<OFFICIALS_TID>\r<n>_hi.dds. Per match each official (keyed by
+// his head vertex buffer) gets a random referee and all of them one random
+// kit; a match ends when no official has drawn for OFFICIAL_FORGET_FRAMES
+// (the menus between matches draw none).
+static const int MAX_POOL = 99, MAX_OFFICIALS = 8, MAX_REF_KITS = 9, MAX_OFFICIALS_RUNS = 8;
+static const int OFFICIALS_TID = 999;
+// flags\officialpid: "<pid>" puts that model on every official (test override).
+static UINT g_officialPid = 0;
+// run k of this frame -> the pid it resolved to; the body draws (before the
+// head names the official) use last frame's to keep or hide the stock body.
+static LONG g_runPidPrev[MAX_OFFICIALS_RUNS], g_runPidCur[MAX_OFFICIALS_RUNS]; static int g_offRun = 0;
+static const LONG OFFICIAL_FORGET_FRAMES = 600;   // 10 s at 60 fps; ponytail: provisional, a real match-start hook if a half-time screen proves longer
+static const wchar_t* REF_KIT_SLOTS[MAX_REF_KITS] = { L"r1", L"r2", L"r3", L"r4", L"r5", L"r6", L"r7", L"r8", L"r9" };
+static LONG g_pool[MAX_POOL]; static int g_nPool = -1;      // -1: not probed yet
+static int g_nRefKits = 0;
+struct OfficialSlot { IDirect3DVertexBuffer9* head; LONG pid; };
+static OfficialSlot g_offTab[MAX_OFFICIALS]; static int g_nOff = 0;
+static const wchar_t* g_refKit = NULL; static LONG g_offLast = -1; static DWORD g_rng = 1;
+static DWORD nextRand() { g_rng = g_rng * 1103515245u + 12345u; return g_rng >> 16; }
+static void probePool() {
+    g_nPool = 0;
+    wchar_t p[MAX_PATH];
+    for (int n = 1; n <= MAX_POOL && g_nPool < MAX_POOL; n++) {
+        LONG pid = (OFFICIALS_TID + PLACEHOLDER_TEAM_BASE) * PLAYERS_PER_TEAM + n;
+        wsprintfW(p, L"%sp%d", CUSTOM_DIR, (int)pid);
+        if (GetFileAttributesW(p) != INVALID_FILE_ATTRIBUTES) g_pool[g_nPool++] = pid;
+    }
+    for (g_nRefKits = 0; g_nRefKits < MAX_REF_KITS; g_nRefKits++) {
+        wsprintfW(p, L"%s%d\\%s%s", KIT_DIR, OFFICIALS_TID, REF_KIT_SLOTS[g_nRefKits], HI_KIT_SUFFIX);
+        if (GetFileAttributesW(p) == INVALID_FILE_ATTRIBUTES) break;
+    }
+    char m[96]; wsprintfA(m, "officials: pool %d referees, %d kits", g_nPool, g_nRefKits); logline(m);
+}
+static LONG officialPid(IDirect3DVertexBuffer9* head) {
+    if (g_officialPid > 0) return g_officialPid;               // flags\officialpid test override
+    if (g_nPool < 0) probePool();
+    if (g_nPool == 0) return -1;
+    if (g_offLast < 0 || g_frame - g_offLast > OFFICIAL_FORGET_FRAMES) {   // a new match
+        g_nOff = 0; g_rng = GetTickCount() | 1;
+        g_refKit = g_nRefKits ? REF_KIT_SLOTS[nextRand() % g_nRefKits] : NULL;
+    }
+    g_offLast = g_frame;
+    for (int i = 0; i < g_nOff; i++) if (g_offTab[i].head == head) return g_offTab[i].pid;
+    if (g_nOff == MAX_OFFICIALS) return -1;
+    LONG pid;
+    for (int tries = 0;; tries++) {      // distinct while the pool allows
+        pid = g_pool[nextRand() % g_nPool];
+        bool used = false;
+        for (int i = 0; i < g_nOff; i++) if (g_offTab[i].pid == pid) used = true;
+        if (!used || tries >= g_nPool * 4) break;
+    }
+    g_offTab[g_nOff].head = head; g_offTab[g_nOff++].pid = pid;
+    char m[96]; wsprintfA(m, "official %d (head vb %08x) -> p%d, kit %S", g_nOff, (DWORD)head, (int)pid, g_refKit ? g_refKit : L"-"); logline(m);
+    return pid;
+}
 // A custom model's face parts are head-local on the face palette and drawn
 // at the game's face draw (players). Officials have none: every face slot
 // takes the head joint's frame (head skin matrix through the head's bind
@@ -862,16 +919,17 @@ static HRESULT drawFaceRigid(IDirect3DDevice9* d, const float (*c)[4]) {
     if (keepDecl) keepDecl->Release(); if (keepVS) keepVS->Release();
     return hr;
 }
-static const wchar_t* OFFICIAL_KIT_SLOT = L"pa";   // ponytail: test kit, owner picks the officials' kit
-static bool drawOfficial(IDirect3DDevice9* d) {
-    float c[CU_SLOTS * BONE_REGS][4];
+// The official's bone block from his body draw's constants (OFFICIAL_SLOT).
+static void officialBones(float (*c)[4]) {
     for (UINT k = 0; k < CU_SLOTS; k++) {
         UINT src = k < sizeof(OFFICIAL_SLOT) / sizeof(OFFICIAL_SLOT[0]) ? OFFICIAL_SLOT[k]
                  : OFFICIAL_SLOT[k == CU_SLOT_FINGER_L ? SLOT_HAND_L : SLOT_HAND_R];
         for (UINT r = 0; r < BONE_REGS; r++) memcpy(c[k * BONE_REGS + r], g_vsc[BONE_REG0 + src * BONE_REGS + r], 16);
     }
+}
+static bool drawOfficial(IDirect3DDevice9* d, const float (*c)[4]) {
     bool ok = g_runKitOk; int tid = g_runTid; const wchar_t* slot = g_runSlot; IDirect3DBaseTexture9* kt = g_runKitTex;
-    g_runKitOk = true; g_runTid = modelTeam(*g_cuM); g_runSlot = OFFICIAL_KIT_SLOT; g_runKitTex = g_tex0;
+    g_runKitOk = g_refKit != NULL; g_runTid = OFFICIALS_TID; g_runSlot = g_refKit; g_runKitTex = g_tex0;
     IDirect3DVertexShader9* ownVS = NULL; d->GetVertexShader(&ownVS);
     int pass = isColourVS(ownVS) ? 1 : 0;
     if (ownVS) ownVS->Release();
@@ -1210,9 +1268,6 @@ static UINT g_texDumpNV = 0;
 // flags\hidenv: "<nV>" skips every draw with that vertex count; draw indices
 // shift between frames, a signature does not (debug, finding characters).
 static UINT g_hideNV = 0;
-// flags\officialpid: "<pid>" draws that custom model on every official (test;
-// per-match assignment pending). 0 / absent = stock officials.
-static UINT g_officialPid = 0;
 static const int OFFICIAL_HEAD_DRAWS = 2;   // head + hair after each official (01-10 kickoff log)
 static bool g_texDumpArmed = false;     // dumps run for exactly one full frame
 static IDirect3DBaseTexture9* g_texDumped[MAX_TEXDUMPS]; static int g_nTexDumped = 0;
@@ -1280,19 +1335,31 @@ static HRESULT STDMETHODCALLTYPE myDIP(IDirect3DDevice9* d, D3DPRIMITIVETYPE t,
     {   // Officials: the dt09 #349 block 1 model, recognised by its vertex buffer.
         // One official = consecutive draws from that buffer, then his head and
         // hair (2 skinned draws from his own head buffer; 01-10 kickoff log).
-        static bool open = false, drawn = false; static int headLeft = 0;
+        // Who he is shows only at the head: the body run captures his bones,
+        // the first head draw picks the model and draws it.
+        static bool open = false, hideBody = false; static int headLeft = 0;
+        static float bones[CU_SLOTS * BONE_REGS][4];
         D3DVERTEXBUFFER_DESC vd;
         bool off = g_vb && SUCCEEDED(g_vb->GetDesc(&vd)) && vd.Size == OFFICIAL_VB_BYTES;
         if (off) {
             if (!open) {
-                open = true;
-                drawn = g_officialPid > 0 && g_kitDecl && g_kitVS && useModel(d, g_officialPid) && drawOfficial(d);
+                open = true; officialBones(bones);
+                if (g_nPool < 0) probePool();
+                // outfield rule: a body model replaces the whole figure, any other
+                // mode (head, kit, boots) is worn over the stock body
+                LONG guess = g_offRun < MAX_OFFICIALS_RUNS ? g_runPidPrev[g_offRun] : -1;
+                if (g_officialPid > 0) guess = g_officialPid;
+                hideBody = (g_officialPid > 0 || g_nPool > 0) && g_passVS[1] &&
+                           (guess <= 0 || (useModel(d, guess) && g_cuM->flags == MODE_BODY));
             }
-            if (drawn) return D3D_OK;
+            if (hideBody) return D3D_OK;
         } else if (open) {
-            open = false;
-            headLeft = drawn ? OFFICIAL_HEAD_DRAWS : 0;
-            drawn = false;
+            open = false; headLeft = 0; g_offRun++;
+            if (g_declSkinned && (g_officialPid > 0 || g_nPool > 0)) {
+                LONG pid = officialPid(g_vb);
+                if (g_offRun < MAX_OFFICIALS_RUNS) g_runPidCur[g_offRun] = pid;
+                if (pid > 0 && useModel(d, pid) && drawOfficial(d, bones)) headLeft = OFFICIAL_HEAD_DRAWS;
+            }
         }
         if (headLeft > 0) { headLeft--; if (g_declSkinned) return D3D_OK; headLeft = 0; }
     }
@@ -1478,6 +1545,9 @@ extern "C" __declspec(dllexport) void logic_present(IDirect3DDevice9* d) {
     static LONG dumpStart = 0;
     if (g_grabAll == 2) { g_grabAll = 0; char m[64]; wsprintfA(m, "frame %d grabbed all: %d draws", (int)f, (int)g_grabSeq); logline(m); }
     if (g_grabAll == 1) g_grabAll = 2;  // arm for the next full frame
+    memcpy(g_runPidPrev, g_runPidCur, sizeof(g_runPidCur));
+    for (int k = 0; k < MAX_OFFICIALS_RUNS; k++) g_runPidCur[k] = -1;
+    g_offRun = 0;
     if (g_texDumpArmed) { g_texDumpArmed = false; g_texDumpNV = 0; }
     else if (g_texDumpNV) { g_texDumpArmed = true; g_nTexDumped = 0; }
     if (g_grabGroup >= 0) {  // grab covers exactly one frame
