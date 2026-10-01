@@ -140,7 +140,17 @@ def official_map(game=GAME):
     pal_off, pal_body = list(pals.pop()), body['packets'][0]['bonePalette']
     vb = sum(-(-p['vertexDescriptor']['count'] * p['vertexDescriptor']['stride'] // VB_ALIGN) * VB_ALIGN
              for p in off['packets'])
-    return {'slots': [pal_off.index(b) for b in pal_body], 'vb_bytes': vb}
+    # Officials have no face draw: their custom face parts are drawn rigidly on
+    # the head joint. The head = the highest leaf bone; its bind must be a pure
+    # translation for "skin matrix x bind translation" to be the joint frame.
+    parents = [b['parentIndex'] for b in body['bones']]
+    binds = [np.array(b['matrix'], float).reshape(4, 4) for b in body['bones']]
+    head = max((i for i in range(len(binds)) if i not in parents), key=lambda i: binds[i][3, 1])
+    if not np.allclose(binds[head][:3, :3], np.eye(3), atol=1e-4):
+        raise SystemExit('head bone %d bind has a rotation' % head)
+    return {'slots': [pal_off.index(b) for b in pal_body], 'vb_bytes': vb,
+            'head_slot': pal_body.index(head), 'head_bind': binds[head][3, :3].round(5).tolist(),
+            'face_slots': len(face_rig(game)['palette'])}
 
 
 def write_official_h(game=GAME):
@@ -152,6 +162,10 @@ def write_official_h(game=GAME):
         f.write('static const int OFFICIAL_SLOT[%d] = {%s};\n' % (len(m['slots']), ', '.join(map(str, m['slots']))))
         f.write('// the officials\' vertex buffer: every packet\'s vertices, %d-aligned\n' % VB_ALIGN)
         f.write('static const UINT OFFICIAL_VB_BYTES = %d;\n' % m['vb_bytes'])
+        f.write('// rigid face: the head bone (our slot), its bind position (m), the face palette size\n')
+        f.write('static const UINT HEAD_SLOT = %d;\n' % m['head_slot'])
+        f.write('static const float HEAD_BIND[3] = {%s};\n' % ', '.join('%.5ff' % v for v in m['head_bind']))
+        f.write('static const UINT FACE_SLOTS = %d;\n' % m['face_slots'])
     return OFFICIAL_H
 
 

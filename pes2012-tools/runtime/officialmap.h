@@ -3,3 +3,7 @@
 static const int OFFICIAL_SLOT[19] = {3, 2, 12, 1, 0, 17, 18, 4, 10, 9, 11, 5, 6, 7, 8, 13, 16, 15, 14};
 // the officials' vertex buffer: every packet's vertices, 16-aligned
 static const UINT OFFICIAL_VB_BYTES = 291392;
+// rigid face: the head bone (our slot), its bind position (m), the face palette size
+static const UINT HEAD_SLOT = 18;
+static const float HEAD_BIND[3] = {0.00000f, 1.64952f, -0.00451f};
+static const UINT FACE_SLOTS = 27;

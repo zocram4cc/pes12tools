@@ -838,6 +838,30 @@ draw:
 // rig has no finger bones, so the two finger slots follow the hands. The kit
 // pieces wear the model's own team's sheet (hiKit, full resolution).
 static const UINT CU_SLOT_FINGER_L = 19, CU_SLOT_FINGER_R = 20;   // kitmap.h: children of hand_l / hand_r
+// A custom model's face parts are head-local on the face palette and drawn
+// at the game's face draw (players). Officials have none: every face slot
+// takes the head joint's frame (head skin matrix through the head's bind
+// position, officialmap.h), so the face rides the head without animating.
+static HRESULT drawFaceRigid(IDirect3DDevice9* d, const float (*c)[4]) {
+    float f[FACE_SLOTS * BONE_REGS][4];
+    const float (*h)[4] = c + HEAD_SLOT * BONE_REGS;
+    for (UINT r = 0; r < BONE_REGS; r++) {
+        float row[4] = { h[r][0], h[r][1], h[r][2],
+                         h[r][0] * HEAD_BIND[0] + h[r][1] * HEAD_BIND[1] + h[r][2] * HEAD_BIND[2] + h[r][3] };
+        for (UINT k = 0; k < FACE_SLOTS; k++) memcpy(f[k * BONE_REGS + r], row, 16);
+    }
+    float keep[FACE_SLOTS * BONE_REGS][4];
+    memcpy(keep, g_vsc[BONE_REG0], sizeof(keep));
+    IDirect3DVertexDeclaration9* keepDecl = NULL; IDirect3DVertexShader9* keepVS = NULL;
+    d->GetVertexDeclaration(&keepDecl); d->GetVertexShader(&keepVS);
+    d->SetVertexDeclaration(g_kitDecl); d->SetVertexShader(g_kitVS);
+    g_orgSVSCF(d, BONE_REG0, &f[0][0], FACE_SLOTS * BONE_REGS);
+    HRESULT hr = drawCustom(d, true);
+    g_orgSVSCF(d, BONE_REG0, &keep[0][0], FACE_SLOTS * BONE_REGS);
+    d->SetVertexDeclaration(keepDecl); d->SetVertexShader(keepVS);
+    if (keepDecl) keepDecl->Release(); if (keepVS) keepVS->Release();
+    return hr;
+}
 static const wchar_t* OFFICIAL_KIT_SLOT = L"pa";   // ponytail: test kit, owner picks the officials' kit
 static bool drawOfficial(IDirect3DDevice9* d) {
     float c[CU_SLOTS * BONE_REGS][4];
@@ -864,6 +888,7 @@ static bool drawOfficial(IDirect3DDevice9* d) {
     float keepPSC[PSC_N][4]; memcpy(keepPSC, g_psc, sizeof(g_psc));
     g_orgSPSCF(d, 0, &g_passPSC[pass][0][0], PSC_N);
     HRESULT hr = drawWithBones(d, c, "official");
+    if (SUCCEEDED(hr)) drawFaceRigid(d, c);
     g_orgSPSCF(d, 0, &keepPSC[0][0], PSC_N); memcpy(g_psc, keepPSC, sizeof(g_psc));
     g_orgSVSCF(d, 0, &g_vsc[0][0], BONE_REG0);
     g_orgSVSCF(d, BONE_END, &g_vsc[BONE_END][0], VSC_N - BONE_END);
