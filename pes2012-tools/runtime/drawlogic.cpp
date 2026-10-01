@@ -12,7 +12,7 @@
 #include <d3d9.h>
 #include <math.h>
 #include "kitmap.h"
-#include "officialmap.h"   // tools/pes12_rig.py: OFFICIAL_SLOT, OFFICIAL_VB_BYTES
+#include "officialmap.h"   // tools/pes12_rig.py: OFFICIAL_*, CLOSE_*, HEAD_*
 #include "custom_ps.h"
 
 // Paths hang off drawhook's root (<kitserver>\4cc-players\, drawhook.cpp initRoot).
@@ -684,6 +684,7 @@ static bool loadModel(IDirect3DDevice9* d, CustomModel& M, const wchar_t* dir) {
         lstrcpyW(path, dir);
         if (v2) { wchar_t f[32]; wsprintfW(f, L"body_%u.tex", k); lstrcatW(path, f); } else lstrcatW(path, L"body.tex");
         M.tex[k] = loadTex(d, path);
+        if (!M.tex[k]) { char e[MAX_PATH + 48]; wsprintfA(e, "custom %s: texture %u failed to load (%S)", M.name, k, path); logline(e); }
     }
     char m[160]; wsprintfA(m, "custom %s: ok=%d nv=%u ni=%u subs=%u texs=%u mode=%u", M.name, (int)ok, M.nv, M.ni, M.nsub, M.ntex, M.flags); logline(m);
     if (!ok) releaseModel(M);
@@ -929,6 +930,14 @@ static HRESULT drawFaceRigid(IDirect3DDevice9* d, const float (*c)[4]) {
     if (keepDecl) keepDecl->Release(); if (keepVS) keepVS->Release();
     return hr;
 }
+// The close-up model's bones of palette group g, from a draw of that group.
+static void closeBones(float (*c)[4], int g) {
+    for (UINT k = 0; k < CU_SLOTS; k++) {
+        UINT s = k < sizeof(CLOSE_SRC_SLOT) / sizeof(CLOSE_SRC_SLOT[0]) ? k : (k == CU_SLOT_FINGER_L ? SLOT_HAND_L : SLOT_HAND_R);
+        if (CLOSE_SRC_GROUP[s] != g) continue;
+        for (UINT r = 0; r < BONE_REGS; r++) memcpy(c[k * BONE_REGS + r], g_vsc[BONE_REG0 + CLOSE_SRC_SLOT[s] * BONE_REGS + r], 16);
+    }
+}
 // The official's bone block from his body draw's constants (OFFICIAL_SLOT).
 static void officialBones(float (*c)[4]) {
     for (UINT k = 0; k < CU_SLOTS; k++) {
@@ -955,8 +964,14 @@ static bool drawOfficial(IDirect3DDevice9* d, const float (*c)[4]) {
     g_orgSVSCF(d, BONE_END, &g_passVSC[pass][BONE_END][0], VSC_N - BONE_END);
     float keepPSC[PSC_N][4]; memcpy(keepPSC, g_psc, sizeof(g_psc));
     g_orgSPSCF(d, 0, &g_passPSC[pass][0][0], PSC_N);
+    // drawCustom reads the UV selector (c176) from the tracked constants; give it
+    // the kit draw's, as players get. The official's own differs between his
+    // two models (01-10: Eustace wrong zoomed out, right zoomed in).
+    float keepUV[4]; memcpy(keepUV, g_vsc[UV_SELECT_REG], sizeof(keepUV));
+    memcpy(g_vsc[UV_SELECT_REG], g_passVSC[pass][UV_SELECT_REG], sizeof(keepUV));
     HRESULT hr = drawWithBones(d, c, "official");
     if (SUCCEEDED(hr)) drawFaceRigid(d, c);
+    memcpy(g_vsc[UV_SELECT_REG], keepUV, sizeof(keepUV));
     g_orgSPSCF(d, 0, &keepPSC[0][0], PSC_N); memcpy(g_psc, keepPSC, sizeof(g_psc));
     g_orgSVSCF(d, 0, &g_vsc[0][0], BONE_REG0);
     g_orgSVSCF(d, BONE_END, &g_vsc[BONE_END][0], VSC_N - BONE_END);
@@ -1060,7 +1075,9 @@ static HRESULT drawCustom(IDirect3DDevice9* d, bool faceOnly) {
         const CustomSub& S = M.sub[i];
         // face subs are head-local on the face palette: only at the face draw
         if (((S.flags & SUB_FACE) != 0) != faceOnly) continue;
-        if (!g_cuKeepGameTex && S.tex < M.ntex && M.tex[S.tex]) g_orgSTEX(d, 0, M.tex[S.tex]);
+        // a texture that failed to load binds nothing, never the previous sub's
+        // texture (01-10: Eustace's chair drew his newspaper)
+        if (!g_cuKeepGameTex) g_orgSTEX(d, 0, S.tex < M.ntex ? M.tex[S.tex] : NULL);
         // kit slot: the pack's own sheet for the kit this player is wearing, at
         // full resolution through TEXCOORD0; else the game's bound sheet
         // through TEXCOORD1 (the remapped UVs)
@@ -1279,6 +1296,8 @@ static UINT g_texDumpNV = 0;
 // shift between frames, a signature does not (debug, finding characters).
 static UINT g_hideNV = 0;
 static const int OFFICIAL_HEAD_DRAWS = 2;   // head + hair after each official (01-10 kickoff log)
+static const UINT OFFICIAL_HEAD_STRIDE = 64;  // the head's first piece at both LODs (82/171/64, 145/369/64; 01-10 grabs)
+static const int OFFICIAL_FACE_DRAWS_MAX = 5; // close LOD face set before the head (8/7/60 30/57/88 8/9/60 671/1599/88 28/39/80)
 static bool g_texDumpArmed = false;     // dumps run for exactly one full frame
 static IDirect3DBaseTexture9* g_texDumped[MAX_TEXDUMPS]; static int g_nTexDumped = 0;
 static void dumpStageTextures(UINT nV, UINT nP, LONG di) {
@@ -1347,13 +1366,19 @@ static HRESULT STDMETHODCALLTYPE myDIP(IDirect3DDevice9* d, D3DPRIMITIVETYPE t,
         // hair (2 skinned draws from his own head buffer; 01-10 kickoff log).
         // Who he is shows only at the head: the body run captures his bones,
         // the first head draw picks the model and draws it.
-        static bool open = false, hideBody = false; static int headLeft = 0;
+        // Two models: block 1 (one palette, all 19 bones) and, at close cameras,
+        // block 0 (two palette groups; each bone taken from its group's draw).
+        static bool open = false, hideBody = false, resolved = true; static int headLeft = 0, tail = 0;
         static float bones[CU_SLOTS * BONE_REGS][4];
         D3DVERTEXBUFFER_DESC vd;
-        bool off = g_vb && SUCCEEDED(g_vb->GetDesc(&vd)) && vd.Size == OFFICIAL_VB_BYTES;
+        bool haveDesc = g_vb && SUCCEEDED(g_vb->GetDesc(&vd));
+        bool farModel = haveDesc && vd.Size >= OFFICIAL_VB_LO && vd.Size < OFFICIAL_VB_HI;
+        bool closeModel = haveDesc && vd.Size >= CLOSE_VB_LO && vd.Size < CLOSE_VB_HI;
+        bool off = farModel || closeModel;
+        if (closeModel) closeBones(bones, g_vbOff >= CLOSE_GROUP_START[CLOSE_GROUPS - 1] ? CLOSE_GROUPS - 1 : 0);
         if (off) {
             if (!open) {
-                open = true; officialBones(bones);
+                open = true; if (farModel) officialBones(bones);
                 if (g_nPool < 0) probePool();
                 // outfield rule: a body model replaces the whole figure, any other
                 // mode (head, kit, boots) is worn over the stock body
@@ -1364,13 +1389,24 @@ static HRESULT STDMETHODCALLTYPE myDIP(IDirect3DDevice9* d, D3DPRIMITIVETYPE t,
             }
             if (hideBody) return D3D_OK;
         } else if (open) {
-            open = false; headLeft = 0;
-            if (g_declSkinned && (g_officialPid > 0 || g_nPool > 0)) {
-                LONG pid = officialPid(g_vb);
-                if (g_offRun < MAX_OFFICIALS_RUNS) g_runPidCur[g_offRun] = pid;
-                if (pid > 0 && useModel(d, pid) && drawOfficial(d, bones)) headLeft = OFFICIAL_HEAD_DRAWS;
-            }
-            g_offRun++;
+            open = false; headLeft = 0; tail = OFFICIAL_FACE_DRAWS_MAX + 1; resolved = false;
+        }
+        // after the body: at close cameras his face set, then (both LODs) his head,
+        // whose first piece is the first skinned stride-OFFICIAL_HEAD_STRIDE draw.
+        // The head VB names him for the match at either LOD.
+        if (tail > 0 && !off) {
+            bool head = g_declSkinned && g_stride == OFFICIAL_HEAD_STRIDE;
+            if (head) {
+                tail = 0; resolved = true;
+                if (g_officialPid > 0 || g_nPool > 0) {
+                    LONG pid = officialPid(g_vb);
+                    if (g_offRun < MAX_OFFICIALS_RUNS) g_runPidCur[g_offRun] = pid;
+                    if (pid > 0 && useModel(d, pid) && drawOfficial(d, bones)) headLeft = OFFICIAL_HEAD_DRAWS;
+                }
+                g_offRun++;
+            } else if (!g_declSkinned || --tail == 0) {
+                tail = 0; if (!resolved) { resolved = true; g_offRun++; }
+            } else if (hideBody) return D3D_OK;   // the face set of a replaced official
         }
         if (headLeft > 0) { headLeft--; if (g_declSkinned) return D3D_OK; headLeft = 0; }
     }
@@ -1430,19 +1466,24 @@ static HRESULT STDMETHODCALLTYPE myDIP(IDirect3DDevice9* d, D3DPRIMITIVETYPE t,
             }
         }
         g_curModel = g_pendingModel; g_pendingModel = -1;
+        {   // every kit hip (stock players too) refreshes its pass's kit context:
+            // officials need one even when no custom player is on screen (01-10:
+            // a close camera with only the linesman drew him stock)
+            IDirect3DVertexDeclaration9* kd = NULL; IDirect3DVertexShader9* kv = NULL; IDirect3DPixelShader9* kp = NULL;
+            d->GetVertexDeclaration(&kd); d->GetVertexShader(&kv); d->GetPixelShader(&kp);
+            int k = isColourVS(kv) ? 1 : 0;
+            if (g_passDecl[k]) g_passDecl[k]->Release(); if (g_passVS[k]) g_passVS[k]->Release(); if (g_passPS[k]) g_passPS[k]->Release();
+            g_passDecl[k] = kd; g_passVS[k] = kv; g_passPS[k] = kp;   // Get* AddRef'd: owned here
+            memcpy(g_passVSC[k], g_vsc, sizeof(g_vsc)); memcpy(g_passPSC[k], g_psc, sizeof(g_psc));
+            for (int st = 1; st < KIT_STAGES; st++) {
+                if (g_passStage[k][st]) g_passStage[k][st]->Release();
+                g_passStage[k][st] = g_texStage[st]; if (g_texStage[st]) g_texStage[st]->AddRef();
+            }
+        }
         if (g_curModel >= 0) {
             memcpy(g_hipM, g_vsc[BONE_REG0 + CU_SRC_SLOT[2] * BONE_REGS], sizeof(g_hipM));
             if (g_kitDecl) g_kitDecl->Release(); if (g_kitVS) g_kitVS->Release(); if (g_kitPS) g_kitPS->Release();
             d->GetVertexDeclaration(&g_kitDecl); d->GetVertexShader(&g_kitVS); d->GetPixelShader(&g_kitPS);
-            {   int k = isColourVS(g_kitVS) ? 1 : 0;
-                if (g_passDecl[k]) g_passDecl[k]->Release(); if (g_passVS[k]) g_passVS[k]->Release(); if (g_passPS[k]) g_passPS[k]->Release();
-                g_passDecl[k] = g_kitDecl; g_passVS[k] = g_kitVS; g_passPS[k] = g_kitPS;
-                if (g_kitDecl) g_kitDecl->AddRef(); if (g_kitVS) g_kitVS->AddRef(); if (g_kitPS) g_kitPS->AddRef();
-                memcpy(g_passVSC[k], g_vsc, sizeof(g_vsc)); memcpy(g_passPSC[k], g_psc, sizeof(g_psc));
-                for (int st = 1; st < KIT_STAGES; st++) {
-                    if (g_passStage[k][st]) g_passStage[k][st]->Release();
-                    g_passStage[k][st] = g_texStage[st]; if (g_texStage[st]) g_texStage[st]->AddRef();
-                } }
             if (useModel(d, g_curModel)) patchKit(modelTeam(*g_cuM), g_tex0);
         }
         g_runKitOk = kitOfSheet(g_tex0, g_runTid, g_runSlot);

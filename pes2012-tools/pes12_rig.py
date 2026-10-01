@@ -112,7 +112,7 @@ def load_body_bones(path=None):
 
 OFFICIAL_BLOCK = 1                  # dt09 #349 block 1: the referee/linesman LOD0 model (01-10)
 OFFICIAL_H = os.path.join(HERE, 'runtime', 'officialmap.h')   # rebuild runtime/ after regenerating
-VB_ALIGN = 16                       # the game packs each packet's vertices 16-aligned in one VB (01-10 probe)
+VB_ALIGN = 16                       # the game pads its model VB per draw to 16 bytes (01-10 probes)
 
 
 def _body_block(game, block):
@@ -138,8 +138,7 @@ def official_map(game=GAME):
     if len(pals) != 1:
         raise SystemExit('official packets disagree on the palette: %d palettes' % len(pals))
     pal_off, pal_body = list(pals.pop()), body['packets'][0]['bonePalette']
-    vb = sum(-(-p['vertexDescriptor']['count'] * p['vertexDescriptor']['stride'] // VB_ALIGN) * VB_ALIGN
-             for p in off['packets'])
+    vb = vb_band(off)
     # Officials have no face draw: their custom face parts are drawn rigidly on
     # the head joint. The head = the highest leaf bone; its bind must be a pure
     # translation for "skin matrix x bind translation" to be the joint frame.
@@ -153,6 +152,48 @@ def official_map(game=GAME):
             'face_slots': len(face_rig(game)['palette'])}
 
 
+CLOSE_BLOCK = 0    # dt09 #349 block 0: the officials' close-up model (57 bones, 01-10 grab)
+
+
+def vb_band(model):
+    """The size range of the vertex buffer the game builds for a model: its
+    packets' vertices, plus up to VB_ALIGN-1 bytes of padding per packet (it
+    merges and 16-aligns draws; measured 291392 for block 1, 593264 for
+    block 0, both inside). -> (lo, hi), lo <= size < hi."""
+    raw = sum(p['vertexDescriptor']['count'] * p['vertexDescriptor']['stride'] for p in model['packets'])
+    return raw, raw + VB_ALIGN * len(model['packets'])
+
+
+def close_map(game=GAME):
+    """The close-up model against the custom rig: its packets use two
+    palettes, neither holding all 19 body bones. For each of our slots: which
+    palette group carries the bone, and its slot there; plus each group's
+    first byte in the model's vertex buffer (16-aligned packets in order) and
+    the buffer's size. Bones are matched by id (nameIdHex)."""
+    close, body = _body_block(game, CLOSE_BLOCK), _body_block(game, BODY_BLOCK)
+    ids = [b['nameIdHex'] for b in close['bones']]
+    groups, starts, off = [], [], 0
+    for p in close['packets']:
+        pal = p['bonePalette']
+        if not groups or pal != groups[-1]:
+            if pal in groups:
+                raise SystemExit('close-up palettes interleave: packet %d' % p['index'])
+            groups.append(pal)
+            starts.append(off)   # unpadded: a draw at or past it is in this group
+        off += p['vertexDescriptor']['count'] * p['vertexDescriptor']['stride']
+    src = []
+    for b in body['packets'][0]['bonePalette']:
+        want = body['bones'][b]['nameIdHex']
+        for g, pal in enumerate(groups):
+            hit = [k for k, j in enumerate(pal) if ids[j] == want]
+            if hit:
+                src.append((g, hit[0]))
+                break
+        else:
+            raise SystemExit('body bone %s not in any close-up palette' % want)
+    return {'src': src, 'starts': starts, 'vb_bytes': vb_band(close)}
+
+
 def write_official_h(game=GAME):
     m = official_map(game)
     with open(OFFICIAL_H, 'w') as f:
@@ -160,12 +201,20 @@ def write_official_h(game=GAME):
                 % (OFFICIAL_BLOCK, BODY_BLOCK))
         f.write('// our slot s (block %d palette order) -> the official draw\'s palette slot\n' % BODY_BLOCK)
         f.write('static const int OFFICIAL_SLOT[%d] = {%s};\n' % (len(m['slots']), ', '.join(map(str, m['slots']))))
-        f.write('// the officials\' vertex buffer: every packet\'s vertices, %d-aligned\n' % VB_ALIGN)
-        f.write('static const UINT OFFICIAL_VB_BYTES = %d;\n' % m['vb_bytes'])
+        f.write('// the officials\' vertex buffer size band: lo <= size < hi\n')
+        f.write('static const UINT OFFICIAL_VB_LO = %d, OFFICIAL_VB_HI = %d;\n' % m['vb_bytes'])
         f.write('// rigid face: the head bone (our slot), its bind position (m), the face palette size\n')
         f.write('static const UINT HEAD_SLOT = %d;\n' % m['head_slot'])
         f.write('static const float HEAD_BIND[3] = {%s};\n' % ', '.join('%.5ff' % v for v in m['head_bind']))
         f.write('static const UINT FACE_SLOTS = %d;\n' % m['face_slots'])
+        c = close_map(game)
+        f.write('// close-up model (block %d): our slot -> (palette group, slot); groups start at\n'
+                '// these VB bytes (the game draws a group\'s packets in VB order)\n' % CLOSE_BLOCK)
+        f.write('static const UINT CLOSE_VB_LO = %d, CLOSE_VB_HI = %d;\n' % c['vb_bytes'])
+        f.write('static const UINT CLOSE_GROUPS = %d;\n' % len(c['starts']))
+        f.write('static const UINT CLOSE_GROUP_START[%d] = {%s};\n' % (len(c['starts']), ', '.join(map(str, c['starts']))))
+        f.write('static const int CLOSE_SRC_GROUP[%d] = {%s};\n' % (len(c['src']), ', '.join(str(g) for g, _ in c['src'])))
+        f.write('static const int CLOSE_SRC_SLOT[%d] = {%s};\n' % (len(c['src']), ', '.join(str(s) for _, s in c['src'])))
     return OFFICIAL_H
 
 
