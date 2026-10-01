@@ -87,6 +87,14 @@ static const UINT DETAIL_BOOT_NV = 228, DETAIL_BOOT_L_NP = 579, DETAIL_BOOT_R_NP
 // projected feet, every other player's 3 m or more
 static const float DETAIL_OWNER_MAX_M = 0.5f;
 static const UINT BONE_REG0 = 20;
+// Adboards (dt07 2920-2930 shared strip + installed banner blocks): every
+// face packet samples the whole atlas through TEXCOORD1, so one 8-ad sheet
+// covers the whole stadium. Signature measured from the 01-10 frame grab
+// (draw 446: banner block 11 packet 0, 10442 verts / 8434 tris / stride 40,
+// zero-clean TEXCOORD0 all-4B, board-shaped y 0.90..1.95 m).
+static const UINT ADBOARD_NV_A = 10442, ADBOARD_NP = 8434, ADBOARD_STRIDE = 40;
+static IDirect3DTexture9* g_adTex = NULL;   // the board sheet (custom\boards\board_0.tex)
+static bool g_adTried = false;              // tried loading this session
 static const UINT BONE_REGS = 3;
 static const UINT CU_SLOTS = 21;           // 19 main bones + 2 finger bones (kitmap.h)
 // draws in a player's kit run from packet 5 to the run's end (24-09 dump:
@@ -657,6 +665,20 @@ static bool loadCustom(IDirect3DDevice9* d) {
     return true;
 }
 
+// The adboard sheet: custom\boards\board_0.tex (DDS or .tex) if present,
+// built once per session. No file = stock boards, like every other
+// drawlogic path with nothing installed.
+static bool adboardTex(IDirect3DDevice9* d) {
+    if (!g_adTex && !g_adTried) {
+        g_adTried = true;
+        wchar_t path[MAX_PATH]; lstrcpyW(path, CUSTOM_DIR); lstrcatW(path, L"boards\\board_0.tex");
+        g_adTex = loadTex(d, path);
+        char m[80]; wsprintfA(m, "adboards: %s", g_adTex ? "custom sheet loaded" : "no custom sheet, stock");
+        logline(m);
+    }
+    return g_adTex != NULL;
+}
+
 static HRESULT drawCustom(IDirect3DDevice9* d, bool faceOnly = false);
 
 static const UINT FACE_PRINT_BYTES = 32;        // vertex bytes fingerprinting a face draw
@@ -1143,6 +1165,13 @@ static HRESULT STDMETHODCALLTYPE myDIP(IDirect3DDevice9* d, D3DPRIMITIVETYPE t,
     }
     if (g_runPos >= 0 && ((g_pMask >> part) & 1)) return D3D_OK;
     if (g_runPos >= 0 && g_runKitOk && g_tex0 == g_runKitTex) return kitDraw(d, t, bV, mV, nV, sI, nP);
+    if (nV == ADBOARD_NV_A && nP == ADBOARD_NP && g_stride == ADBOARD_STRIDE && adboardTex(d)) {
+        IDirect3DBaseTexture9* keepTex = g_tex0;
+        g_orgSTEX(d, 0, g_adTex);
+        HRESULT hr = g_orgDIP(d, t, bV, mV, nV, sI, nP);
+        g_orgSTEX(d, 0, keepTex);
+        return hr;
+    }
     if (nV == BODY_NV && nP == BODY_NP && g_stride == BODY_STRIDE) {
         LONG k = g_bodyDraw++;
         if (k < 32 && ((g_bodyHide >> k) & 1)) return D3D_OK;

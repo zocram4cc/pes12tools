@@ -804,6 +804,11 @@ def is_pitch(names):
     return any(n.startswith(PITCH_TEXTURE_PREFIX) for n in names)
 
 
+EMPTY_BLOCK_RADIUS_M = 1.0   # stock board packets carry radius 0 after
+# empty_block, and the stadium loader culls on it: a zero-radius packet
+# inside an INSTALLED 400-block geometry entry crashes the match load
+# (dt07 2664, 01-10). Kept non-zero so the entry still loads.
+
 def empty_block(K, block, keep_pitch=True):
     """Every packet with a vertex stream -> one degenerate triangle at the
     origin (keeps the block's tables and the engine's packet counts);
@@ -813,7 +818,21 @@ def empty_block(K, block, keep_pitch=True):
         stride, _ = _decl(block, i)
         if stride and not (keep_pitch and is_pitch(names)):
             want.append({"packet": i, "vertices": bytes(3 * stride), "indices": [0, 1, 2]})
-    return ktmdl_write.build(block, want) if want else block
+    out = ktmdl_write.build(block, want) if want else block
+    if out is not block:
+        out = _raise_radii(out, EMPTY_BLOCK_RADIUS_M)
+    return out
+
+
+def _raise_radii(blob, radius):
+    """Every packet record's radius field -> `radius` (the build writes the
+    collapsed packet's own AABB, i.e. 0)."""
+    out = bytearray(blob)
+    n = ktmdl_write._u32(out, ktmdl_write.H_PACKET_COUNT)
+    for i in range(n):
+        base = ktmdl_write._packet_base(out, i)
+        struct.pack_into("<f", out, base + ktmdl_write.P_RADIUS, radius)
+    return bytes(out)
 
 
 TEMPLATE_FLAGS = 0                 # packet flags of the plain lit stand material
