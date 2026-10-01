@@ -1,0 +1,5 @@
+__pycache__/
+.ruff_cache/
+*.pyc
+pes2012-blender/tests/_out/
+pes2012-editapp/.venv/
