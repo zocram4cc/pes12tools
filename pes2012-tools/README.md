@@ -81,7 +81,7 @@ sheets in memory across matches.
 
 ```sh
 python3 pes12_ball.py ...      # see its docstring
-python3 pes12_stadium.py ...   # see its docstring (and the repo's 10-stadiums.md)
+python3 pes12_stadium.py ...   # see its docstring
 ```
 
 ## Runtime

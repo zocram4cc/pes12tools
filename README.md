@@ -1,19 +1,26 @@
-# PES2012 4cc distribution (source)
+# pes12tools - the 4chan Cup toolchain for PES2012 (PC v1.06)
 
-Three folders, each standalone. No game, PES, or 4cc data ships here: every
-derived table rebuilds from the user's own installs by a script (the how is
-in each folder's README)..
+Four folders, each standalone:
 
-| folder | what | install deps |
+| folder | what | install |
 |---|---|---|
-| `pes2012-4cc/` | ready-made 4chan Cup base for PES2012 v1.06 (kitserver 12 + `4cc-dlc` override root; no game file modified) | copy `kitserver/` into the game folder |
-| `pes2012-tools/` | the toolchain that built it: PES2015/PES2017 team, body, kit, ball, stadium conversion; the custom-body runtime (`kitserver/4cc-players/`); the EDIT editor source is `editapp/` in the repo | Python 3 + `requirements.txt`, `7z`, ImageMagick; a PES2012 install, a PES2015 Data dir (kit layouts), a PES2021 Data dir (engine textures), your 4cc exports |
-| `pes2012-blender/` | Blender 4.2+ extension: byte-exact import/export of every PES2012 model BIN (balls, stadiums, boots, faces, hair, bodies, kits) and PGB2 player bodies, with tests | Blender; same BIN sources as above |
+| `pes2012-4cc/` | ready-made 4chan Cup base: kitserver 12 + the `4cc-dlc` override root (210 4cc teams, placeholder squads, crests, league names); no game file is modified | copy `kitserver/` into the game folder ([README](pes2012-4cc/README.md)) |
+| `pes2012-editapp/` | EDIT.bin editor (PySide6): teams, squads, every player field, squad CSV import/export | Python 3.10+, `pip install -r requirements.txt`; Windows and Linux steps in [its README](pes2012-editapp/README.md) |
+| `pes2012-tools/` | the toolchain: PES2015/PES2017 team, body, kit, ball and stadium conversion; the custom-body runtime (`kitserver/4cc-players/`) | Python 3 + `requirements.txt`, `7z`, ImageMagick; a PES2012 install, a PES2015 Data dir (kit layouts), a PES2021 Data dir (engine textures), your 4cc exports |
+| `pes2012-blender/` | Blender 4.2+ extension: byte-exact import/export of every PES2012 model BIN (balls, stadiums, boots, faces, hair, bodies, kits) and PGB2 player bodies, with tests | install the zip from Blender's Get Extensions ([README](pes2012-blender/README.md)) |
+
+`pes2012-editapp` imports `pes2012-tools` from its sibling folder: keep the
+layout when copying them out.
+
+`pes2012-4cc/` ships database tables derived from PES2012 itself (its
+`dt04`/`dt06` overrides start from the stock tables). Everything the tools
+produce from PES2015/PES2017/PES2021 data or from 4cc packs is never
+shipped: it rebuilds from your own installs by a script (each folder's
+README says how)..
 
 ## Build order (from a bare checkout)
 
-1. Base game content: `pes2012-4cc/` is hand-built by `tools/pes12_4cc_dlc.py`
-   (see `pes2012-tools/`); the player table there holds flat-40 CB
+1. Base game content: `pes2012-4cc/` is built by `pes2012-tools/pes12_4cc_dlc.py`; the player table there holds flat-40 CB
    placeholders, one row per 4cc team.
 2. Rig tables: `python3 pes12_rig.py "<game dir>"` extracts the face rig
    and the 19 body bones from your game (face/bin ids are StrCode hashes;
@@ -26,8 +33,7 @@ in each folder's README)..
    ranges - out-of-range values crash the game on team select), bodies, and
    kits (see `pes2012-tools/README.md`).
 4. Balls/stadiums: `python3 pes12_ball.py` / `python3 pes12_stadium.py`
-   (in `pes2012-tools/`; stadium map and proof conversion: repo
-   10-stadiums.md).
+   (in `pes2012-tools/`; usage in their docstrings).
 
 ## Player settings (custom bodies)
 
@@ -46,8 +52,8 @@ replaces (drawlogic reads the PGB2 header word unless `mode` exists):
 
 Default at import: PES15 hides its body for short socks + tucked shirt
 (every whole-body model has it, no face-only model does); a hidden body
-keeps boots when the model stops above the floor. The ingame EDIT editor
-(repo `editapp/`) shows each player's mode and writes the `mode` file;
+keeps boots when the model stops above the floor. The EDIT editor
+(`pes2012-editapp/`) shows each player's mode and writes the `mode` file;
 `flags/reload` applies it live.
 
 ## DLC compilation

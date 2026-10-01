@@ -36,9 +36,9 @@ folder and its `img.dir` line.
 
 ## Editing
 
-`editapp/` in the repository is the EDIT.bin editor (teams, squads, every
-player field, team CSV import/export): `pip install -r editapp/requirements.txt`,
-then `python3 editapp/src/main.py <EDIT.bin>`.
+`pes2012-editapp/` (next to this folder) is the EDIT.bin editor (teams,
+squads, every player field, team CSV import/export); install and use:
+`pes2012-editapp/README.md` (Windows and Linux).
 
 ## Contents
 
