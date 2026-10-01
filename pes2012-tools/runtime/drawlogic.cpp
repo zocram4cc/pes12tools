@@ -87,14 +87,40 @@ static const UINT DETAIL_BOOT_NV = 228, DETAIL_BOOT_L_NP = 579, DETAIL_BOOT_R_NP
 // projected feet, every other player's 3 m or more
 static const float DETAIL_OWNER_MAX_M = 0.5f;
 static const UINT BONE_REG0 = 20;
-// Adboards (dt07 2920-2930 shared strip + installed banner blocks): every
-// face packet samples the whole atlas through TEXCOORD1, so one 8-ad sheet
-// covers the whole stadium. Signature measured from the 01-10 frame grab
-// (draw 446: banner block 11 packet 0, 10442 verts / 8434 tris / stride 40,
-// zero-clean TEXCOORD0 all-4B, board-shaped y 0.90..1.95 m).
-static const UINT ADBOARD_NV_A = 10442, ADBOARD_NP = 8434, ADBOARD_STRIDE = 40;
+// Adboards: the board faces sample the DoubleFusion ad sheet (1024x512
+// A8R8G8B8, a 4x8 grid of 256x64 ads, built at runtime; no file in the game
+// holds it). A stadium draws one of 8 board layouts (dt07 2923-2930; Karasuno
+// loads 2924, slot 2693's stadium 2927 - bserv.log 01-10), each 10 face
+// blocks: far, both goal ends, two near-side pieces, and their floor
+// reflections, every one its own draw with its own vertex count. What they
+// share, and nothing else in stock dt07/dt08 or the installed overrides has
+// (all 82 face packets, scanned 01-10): stride 48 and the declaration
+// POSITION, NORMAL, TEXCOORD0..2 (d_bill_face00, d_bill_wrap00, e_cmap00).
+// (The 10442/8434/40 banner block draw is the boards' backs, not the ads.)
+static const UINT ADBOARD_STRIDE = 48;
 static IDirect3DTexture9* g_adTex = NULL;   // the board sheet (custom\boards\board_0.tex)
 static bool g_adTried = false;              // tried loading this session
+static bool g_declBoard = false;            // the bound declaration is the board face one
+static bool isBoardDecl(IDirect3DVertexDeclaration9* p) {
+    static const BYTE USAGE[] = { D3DDECLUSAGE_POSITION, D3DDECLUSAGE_NORMAL,
+                                  D3DDECLUSAGE_TEXCOORD, D3DDECLUSAGE_TEXCOORD, D3DDECLUSAGE_TEXCOORD };
+    static const BYTE INDEX[] = { 0, 0, 0, 1, 2 };
+    const UINT N = sizeof(USAGE);
+    D3DVERTEXELEMENT9 el[MAXD3DDECLLENGTH + 1]; UINT ne = 0;
+    if (!p || FAILED(p->GetDeclaration(NULL, &ne)) || ne != N + 1 || FAILED(p->GetDeclaration(el, &ne))) return false;
+    for (UINT i = 0; i < N; i++) if (el[i].Stream != 0 || el[i].Usage != USAGE[i] || el[i].UsageIndex != INDEX[i]) return false;
+    return true;
+}
+// The same face draws also run in passes that bind a 64x64 white DXT5 or no
+// texture (shadow/depth, texdump 01-10); only the material pass binds the
+// sheet itself, and only that one is swapped.
+static const UINT AD_SHEET_W = 1024, AD_SHEET_H = 512;
+static bool isAdSheet(IDirect3DBaseTexture9* bt) {
+    if (!bt || bt->GetType() != D3DRTYPE_TEXTURE) return false;
+    D3DSURFACE_DESC sd;
+    if (FAILED(((IDirect3DTexture9*)bt)->GetLevelDesc(0, &sd))) return false;
+    return sd.Width == AD_SHEET_W && sd.Height == AD_SHEET_H && sd.Format == D3DFMT_A8R8G8B8;
+}
 static const UINT BONE_REGS = 3;
 static const UINT CU_SLOTS = 21;           // 19 main bones + 2 finger bones (kitmap.h)
 // draws in a player's kit run from packet 5 to the run's end (24-09 dump:
@@ -360,17 +386,22 @@ static IDirect3DTexture9* loadTex(IDirect3DDevice9* d, const wchar_t* path) {
     if (!b) return NULL;
     DWORD* hd = (DWORD*)b;
     IDirect3DTexture9* t = NULL;
+    // PGT1 .tex: u32 magic, w, h, mips, then RGBA8 mips (pgb2.build_tex)
+    const DWORD TEX_HEADER_BYTES = 16, TEX_PX_BYTES = 4;
     if (n >= DDS_HEADER_BYTES && hd[0] == DDS_MAGIC) t = loadDDS(d, b, n);
-    else if (hd[0] == TEX_MAGIC && SUCCEEDED(d->CreateTexture(hd[1], hd[2], hd[3], 0, D3DFMT_A8R8G8B8, D3DPOOL_MANAGED, &t, NULL))) {
-        BYTE* src = b + 16;
+    else if (n >= TEX_HEADER_BYTES && hd[0] == TEX_MAGIC && SUCCEEDED(d->CreateTexture(hd[1], hd[2], hd[3], 0, D3DFMT_A8R8G8B8, D3DPOOL_MANAGED, &t, NULL))) {
+        BYTE* src = b + TEX_HEADER_BYTES;
         for (DWORD m = 0; m < hd[3]; m++) {
             UINT mw = hd[1] >> m, mh = hd[2] >> m; if (!mw) mw = 1; if (!mh) mh = 1;
+            // a short file (e.g. RGB written where RGBA is read) stops here,
+            // not past the heap buffer: that overrun crashed the game 01-10
+            if (src + mw * mh * TEX_PX_BYTES > b + n) break;
             D3DLOCKED_RECT lr;
             if (SUCCEEDED(t->LockRect(m, &lr, NULL, 0))) {
-                for (UINT y = 0; y < mh; y++) memcpy((BYTE*)lr.pBits + y * lr.Pitch, src + y * mw * 4, mw * 4);
+                for (UINT y = 0; y < mh; y++) memcpy((BYTE*)lr.pBits + y * lr.Pitch, src + y * mw * TEX_PX_BYTES, mw * TEX_PX_BYTES);
                 t->UnlockRect(m);
             }
-            src += mw * mh * 4;
+            src += mw * mh * TEX_PX_BYTES;
         }
     }
     HeapFree(GetProcessHeap(), 0, b);
@@ -972,7 +1003,7 @@ static HRESULT STDMETHODCALLTYPE mySSS(IDirect3DDevice9* d, UINT s,
     return g_orgSSS(d, s, vb, off, st);
 }
 static HRESULT STDMETHODCALLTYPE mySVD(IDirect3DDevice9* d, IDirect3DVertexDeclaration9* p) {
-    g_decl = p;
+    g_decl = p; g_declBoard = isBoardDecl(p);
     return g_orgSVD(d, p);
 }
 static HRESULT STDMETHODCALLTYPE mySFVF(IDirect3DDevice9* d, DWORD f) {
@@ -1057,6 +1088,62 @@ static void grabDraw(IDirect3DDevice9* d, D3DPRIMITIVETYPE t, INT bV, UINT mV,
     CloseHandle(f);
 }
 
+// flags\texdump: "<nV>" -> for one full frame, every draw with that vertex
+// count (TEXDUMP_ALL: every draw) writes each bound stage's top mip once to
+// 4cc-players\grab\tex_<ptr>.dds; drawhook.log maps draw -> stage -> ptr.
+// Read-only lock; DEFAULT-pool textures fail it and are only logged.
+static const UINT TEXDUMP_ALL = 1;      // no real draw has a single vertex
+static const int MAX_TEXDUMPS = 1024;   // distinct textures per dump frame
+static UINT g_texDumpNV = 0;
+static bool g_texDumpArmed = false;     // dumps run for exactly one full frame
+static IDirect3DBaseTexture9* g_texDumped[MAX_TEXDUMPS]; static int g_nTexDumped = 0;
+static void dumpStageTextures(UINT nV, UINT nP, LONG di) {
+    const DWORD DDS_HDR_SIZE = 124, DDS_PF_SIZE = 32, DDSD_CAPS_HEIGHT_WIDTH_PF = 0x1007,
+                DDSD_LINEARSIZE = 0x80000, DDPF_FOURCC = 0x4, DDPF_RGB_ALPHA = 0x41,
+                DDSCAPS_TEXTURE = 0x1000, RGBA_BITS = 32;
+    for (int s = 0; s < 8; s++) {
+        IDirect3DBaseTexture9* bt = g_texStage[s];
+        if (!bt || bt->GetType() != D3DRTYPE_TEXTURE) continue;
+        char m[128];
+        wsprintfA(m, "texdump draw %d nV=%u nP=%u s%d tex=%08x", (int)di, nV, nP, s, (DWORD)bt);
+        logline(m);
+        bool seen = false;
+        for (int k = 0; k < g_nTexDumped; k++) if (g_texDumped[k] == bt) seen = true;
+        if (seen || g_nTexDumped >= MAX_TEXDUMPS) continue;
+        g_texDumped[g_nTexDumped++] = bt;
+        IDirect3DTexture9* tx = (IDirect3DTexture9*)bt;
+        D3DSURFACE_DESC sd; tx->GetLevelDesc(0, &sd);
+        bool dxt = sd.Format == D3DFMT_DXT1 || sd.Format == D3DFMT_DXT3 || sd.Format == D3DFMT_DXT5;
+        bool argb = sd.Format == D3DFMT_A8R8G8B8 || sd.Format == D3DFMT_X8R8G8B8;
+        D3DLOCKED_RECT lr;
+        if ((!dxt && !argb) || FAILED(tx->LockRect(0, &lr, NULL, D3DLOCK_READONLY))) {
+            wsprintfA(m, "texdump tex=%08x %ux%u fmt=%08x: not dumped", (DWORD)bt, sd.Width, sd.Height, (DWORD)sd.Format);
+            logline(m); continue;
+        }
+        UINT rows = dxt ? (sd.Height + DXT_BLOCK_PX - 1) / DXT_BLOCK_PX : sd.Height;
+        UINT rowBytes = dxt ? (sd.Width + DXT_BLOCK_PX - 1) / DXT_BLOCK_PX * (sd.Format == D3DFMT_DXT1 ? DXT1_BLOCK_BYTES : DXT35_BLOCK_BYTES)
+                            : sd.Width * RGBA_BITS / 8;
+        DWORD h[32] = {0};
+        h[0] = DDS_MAGIC; h[1] = DDS_HDR_SIZE; h[2] = DDSD_CAPS_HEIGHT_WIDTH_PF | DDSD_LINEARSIZE;
+        h[3] = sd.Height; h[4] = sd.Width; h[5] = rows * rowBytes; h[7] = 1;
+        h[19] = DDS_PF_SIZE;
+        if (dxt) { h[20] = DDPF_FOURCC; h[21] = (DWORD)sd.Format; }
+        else { h[20] = DDPF_RGB_ALPHA; h[22] = RGBA_BITS; h[23] = 0x00FF0000; h[24] = 0x0000FF00; h[25] = 0x000000FF; h[26] = 0xFF000000; }
+        h[27] = DDSCAPS_TEXTURE;
+        wchar_t path[MAX_PATH]; wsprintfW(path, L"%sgrab\\tex_%08x.dds", g_root, (DWORD)bt);
+        HANDLE f = CreateFileW(path, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, 0, NULL);
+        DWORD w = 0;
+        if (f != INVALID_HANDLE_VALUE) {
+            WriteFile(f, h, sizeof(h), &w, NULL);
+            for (UINT r = 0; r < rows; r++) WriteFile(f, (BYTE*)lr.pBits + r * lr.Pitch, rowBytes, &w, NULL);
+            CloseHandle(f);
+        }
+        tx->UnlockRect(0);
+        wsprintfA(m, "texdump tex=%08x %ux%u fmt=%08x -> %s", (DWORD)bt, sd.Width, sd.Height, (DWORD)sd.Format, f != INVALID_HANDLE_VALUE ? "written" : "open failed");
+        logline(m);
+    }
+}
+
 static HRESULT STDMETHODCALLTYPE myDIP(IDirect3DDevice9* d, D3DPRIMITIVETYPE t,
         INT bV, UINT mV, UINT nV, UINT sI, UINT nP) {
     if (nV == GROUP_START_NV && nP == GROUP_START_NP && g_stride == GROUP_START_STRIDE) {
@@ -1068,6 +1155,7 @@ static HRESULT STDMETHODCALLTYPE myDIP(IDirect3DDevice9* d, D3DPRIMITIVETYPE t,
     }
     bool inGroup = g_group >= 0 && g_group < 32;
     LONG di = g_drawIdx++;
+    if (g_texDumpArmed && (nV == g_texDumpNV || g_texDumpNV == TEXDUMP_ALL)) dumpStageTextures(nV, nP, di);
     if (di >= g_hrLo && di < g_hrHi) return D3D_OK;
     // previous draw = the face when this one is a kit packet 5
     static IDirect3DVertexBuffer9* lastVB = NULL; static UINT lastOff = 0, lastSt = 0, lastFirst = 0, lastNV = 0;
@@ -1165,7 +1253,7 @@ static HRESULT STDMETHODCALLTYPE myDIP(IDirect3DDevice9* d, D3DPRIMITIVETYPE t,
     }
     if (g_runPos >= 0 && ((g_pMask >> part) & 1)) return D3D_OK;
     if (g_runPos >= 0 && g_runKitOk && g_tex0 == g_runKitTex) return kitDraw(d, t, bV, mV, nV, sI, nP);
-    if (nV == ADBOARD_NV_A && nP == ADBOARD_NP && g_stride == ADBOARD_STRIDE && adboardTex(d)) {
+    if (g_declBoard && g_stride == ADBOARD_STRIDE && isAdSheet(g_tex0) && adboardTex(d)) {
         IDirect3DBaseTexture9* keepTex = g_tex0;
         g_orgSTEX(d, 0, g_adTex);
         HRESULT hr = g_orgDIP(d, t, bV, mV, nV, sI, nP);
@@ -1242,6 +1330,8 @@ extern "C" __declspec(dllexport) void logic_present(IDirect3DDevice9* d) {
     static LONG dumpStart = 0;
     if (g_grabAll == 2) { g_grabAll = 0; char m[64]; wsprintfA(m, "frame %d grabbed all: %d draws", (int)f, (int)g_grabSeq); logline(m); }
     if (g_grabAll == 1) g_grabAll = 2;  // arm for the next full frame
+    if (g_texDumpArmed) { g_texDumpArmed = false; g_texDumpNV = 0; }
+    else if (g_texDumpNV) { g_texDumpArmed = true; g_nTexDumped = 0; }
     if (g_grabGroup >= 0) {  // grab covers exactly one frame
         char m[64]; wsprintfA(m, "frame %d grabbed group %d: %d draws", (int)f, (int)g_grabGroup, (int)g_grabSeq);
         logline(m);
@@ -1290,6 +1380,11 @@ extern "C" __declspec(dllexport) void logic_present(IDirect3DDevice9* d) {
         if (flagExists(L"facelog")) { wchar_t p[MAX_PATH]; lstrcpyW(p, FLAGDIR); lstrcatW(p, L"facelog"); DeleteFileW(p); g_facelog = 70; }
         { static LONG lg = 0; if (!lg && g_cuLo >= 0) { lg = 1; } }
         { static LONG last = -1; if (bodiesLastFrame != last) { char m[64]; wsprintfA(m, "body draws/frame=%d", (int)bodiesLastFrame); logline(m); last = bodiesLastFrame; } }
+        if (flagExists(L"texdump")) {
+            g_texDumpNV = readFlagInt(L"texdump", 0);
+            wchar_t p[MAX_PATH]; lstrcpyW(p, FLAGDIR); lstrcatW(p, L"texdump"); DeleteFileW(p);
+            wchar_t gd[MAX_PATH]; CreateDirectoryW(rootFile(gd, L"grab"), NULL);
+        }
         if (flagExists(L"grab")) {
             LONG gv = readFlagInt(L"grab", 0); g_grabSeq = 0;
             if (gv == GRAB_ALL) g_grabAll = 1; else g_grabGroup = gv & 31;
