@@ -23,6 +23,8 @@ bl_info = {
 }
 
 import os
+import re
+import struct
 import sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -31,16 +33,40 @@ import bpy  # noqa: E402
 from bpy.props import BoolProperty, EnumProperty, IntProperty, StringProperty  # noqa: E402
 from bpy_extras.io_utils import ExportHelper, ImportHelper  # noqa: E402
 
-from . import blender_io, container, ktmdl_write, model, pgb2, skeleton  # noqa: E402
+from . import blender_io, container, ktmdl_write, model, pgb2, skeleton, textures  # noqa: E402
 
 SOURCE_PROP = 'pes12_source'    # collection: absolute path of the imported BIN
 BLOCK_PROP = 'pes12_block'      # object: index into the container's blocks
 PACKET_PROP = 'pes12_packet'    # mesh object: packet index in its block
 
 
+TEX_ROW_ID_OFF = 8     # textureNameIds row: u32 texture id at +8 (pes12_stadium.repoint_textures)
+# authoring-name markers of the non-colour maps (stock names: ball000_s.tif,
+# ek9061_nml.psd, lm_e10_bs1_00.psd, head_occlusion.psd, ...)
+NOT_COLOUR = re.compile(r'(_s|_n|_nml|_spe|_nrm|normal|specular|occlusion|reflection)\b|^(lm|e_lmap|e_cmap)_', re.I)
+
+
+def _row_ids(block_data, parsed):
+    """The model's texture rows: row index -> texture id (u32 at row + 8)."""
+    return [struct.unpack_from('<I', block_data, r['offset'] + TEX_ROW_ID_OFF)[0]
+            for r in parsed.get('textureNameIds', [])]
+
+
+def _diffuse_row(packet, names):
+    """The packet's colour texture: the first ref on UV channel 0 whose name
+    is not a normal/specular/light map (the ball lists specular first)."""
+    refs = [r for r in packet['activeTextureRefs'] if r['uvNo'] == 0]
+    for r in refs:
+        stem = os.path.splitext(names[r['id']])[0] if r['id'] < len(names) else ''
+        if not NOT_COLOUR.search(stem):
+            return r['id']
+    return refs[0]['id'] if refs else None
+
+
 def import_bin(context, filepath):
     """BIN -> collection: per KTMDL block one armature (its own skeleton)
-    and one mesh per packet. Returns (collection, packet count)."""
+    and one mesh per packet; every texture the BIN carries as a packed image,
+    on the packets that sample it. Returns (collection, packet count)."""
     raw = open(filepath, 'rb').read()
     c = container.read(raw)
     blocks = [(k, b) for k, b in enumerate(c.blocks) if b.kind == 'ktmdl']
@@ -52,16 +78,30 @@ def import_bin(context, filepath):
     col[SOURCE_PROP] = os.path.abspath(filepath)
     layer = context.view_layer.layer_collection.children[col.name]
     context.view_layer.active_layer_collection = layer
+    datas = [b.data for b in c.blocks]
+    images = {}
+
+    def image(k):
+        if k not in images:
+            _, _, px = textures.decode(datas[k])
+            images[k] = blender_io.make_image('%s_tex%d' % (stem, k), k, px)
+        return images[k]
+
     n = 0
     for k, b in blocks:
         m = model.read(b.data)
         sk = skeleton.build_one('b%d' % k, m.parsed)
         arm = blender_io.make_armature('%s_b%d' % (stem, k), sk)
         arm[BLOCK_PROP] = k
+        row_ids = _row_ids(b.data, m.parsed)
+        bound = textures.bind(datas, row_ids)
         for i, p in enumerate(m.parsed['packets']):
             o = blender_io.make_mesh('%s_b%d_p%03d' % (stem, k, i), p, p['bonePalette'], sk)
             o[BLOCK_PROP] = k
             o[PACKET_PROP] = i
+            row = _diffuse_row(p, m.parsed['names'].get('textureNames', []))
+            if row is not None and row < len(row_ids) and row_ids[row] in bound and 'UV0' in o.data.uv_layers:
+                blender_io.assign_image(o, image(bound[row_ids[row]]), 'UV0')
             blender_io.parent_to_armature(o, arm)
             o.parent = arm
             n += 1
@@ -87,6 +127,20 @@ def export_bin(col, filepath):
         rows = [model.export_packet(b.data, i, *blender_io.read_corners(o, sk))
                 for i, o in sorted(packets.items())]
         b.data = ktmdl_write.build(b.data, rows)
+    # images painted or replaced since import go back into their blocks;
+    # untouched ones keep their bytes (DXT re-encoding is lossy)
+    seen = set()
+    for o in col.all_objects:
+        for slot in getattr(o, 'material_slots', ()):
+            nt = slot.material.node_tree if slot.material and slot.material.use_nodes else None
+            for node in (nt.nodes if nt else ()):
+                img = getattr(node, 'image', None)
+                if img is None or blender_io.TEX_BLOCK_PROP not in img or img.name in seen:
+                    continue
+                seen.add(img.name)
+                if blender_io.image_changed(img):
+                    k = int(img[blender_io.TEX_BLOCK_PROP])
+                    c.blocks[k].data = textures.encode(c.blocks[k].data, blender_io.image_rgba(img))
     open(filepath, 'wb').write(container.write(c))
     return filepath
 

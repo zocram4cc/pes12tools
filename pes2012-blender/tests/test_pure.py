@@ -9,6 +9,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.join(HERE, '..', 'pes2012_starter_pack'))
 sys.path.insert(0, HERE)
 
+import numpy as np  # noqa: E402
 import corpus  # noqa: E402
 import container  # noqa: E402
 
@@ -253,11 +254,79 @@ def test_export_corpus_byte_exact():
     print('export corpus: %d entries byte-exact' % len(all_entries()))
 
 
+def _texture_blocks():
+    """(img, entry, block bytes) for every WE00 texture block of the game."""
+    import textures
+    out = []
+    for img, i, raw in all_entries():
+        for b in container.read(raw).blocks:
+            if textures.is_texture(b.data):
+                out.append((img, i, b.data))
+    return out
+
+
+# DXT is lossy: mean |error| per channel (0..255) a fresh encode may add.
+# Re-encoding a stock DXT block's own decode measures 1-3 in practice.
+DXT_MEAN_ERR_MAX = 6.0
+
+
+def test_textures_decode_every_block():
+    import textures
+    blocks = _texture_blocks()
+    bad = []
+    for img, i, b in blocks:
+        try:
+            w, h, px = textures.decode(b)
+            assert px.shape == (h, w, 4)
+        except Exception as e:
+            bad.append((img, i, textures.texture_id(b), repr(e)[:80]))
+    assert not bad, (len(bad), bad[:10])
+    print('textures: %d WE00 blocks decode' % len(blocks))
+
+
+def test_textures_reencode_each_format():
+    """One block of every format: encode(decode(b)) keeps the block size and
+    header and decodes back within DXT tolerance (exact for raw/masked)."""
+    import textures
+    seen = {}
+    for img, i, b in _texture_blocks():
+        dds = textures._dds(b)
+        key = dds[3] if dds else ('raw', b[textures.KIND_OFF])
+        seen.setdefault(key, (img, i, b))
+    for key, (img, i, b) in seen.items():
+        w, h, px = textures.decode(b)
+        e = textures.encode(b, px)
+        assert len(e) == len(b), key
+        assert e[:textures.HEADER + textures.DDS_HEADER] == b[:textures.HEADER + textures.DDS_HEADER] or not textures._dds(b), key
+        _, _, back = textures.decode(e)
+        err = float(np.abs(back.astype(int) - px.astype(int)).mean())
+        lossless = key not in textures.DXT_BLOCK_BYTES
+        assert (err == 0) if lossless else (err <= DXT_MEAN_ERR_MAX), (key, img, i, err)
+        print('textures: %r (%s #%d %dx%d) re-encodes, mean error %.2f' % (key, img, i, w, h, err))
+
+
+def test_textures_edit_lands():
+    """A painted square appears after encode, the rest stays put."""
+    import textures
+    img, i, b = next(t for t in _texture_blocks()
+                     if textures._dds(t[2]) and textures._dds(t[2])[3] == b'DXT1' and textures._dds(t[2])[0] >= 64)
+    w, h, px = textures.decode(b)
+    edit = px.copy()
+    edit[8:24, 8:24] = (255, 0, 255, 255)
+    _, _, back = textures.decode(textures.encode(b, edit))
+    assert (np.abs(back[8:24, 8:24].astype(int) - (255, 0, 255, 255)) <= 8).all()
+    rest = np.ones((h, w), bool)
+    rest[4:28, 4:28] = False   # blocks touching the square may shift
+    assert float(np.abs(back[rest].astype(int) - px[rest].astype(int)).mean()) <= DXT_MEAN_ERR_MAX
+    print('textures: edit lands (%s #%d)' % (img, i))
+
+
 TESTS = [test_corpus_found, test_container_unedited_exact, test_container_block_offsets,
          test_container_every_ktmdl_located, test_container_edited_rewrite,
          test_model_corpus_parses, test_model_stream_tables_are_record_relative,
          test_skeleton_per_block,
          test_export_unedited_byte_exact, test_export_edited,
+         test_textures_decode_every_block, test_textures_reencode_each_format, test_textures_edit_lands,
          test_export_corpus_byte_exact]
 
 if __name__ == '__main__':

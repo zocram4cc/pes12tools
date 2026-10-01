@@ -67,6 +67,24 @@ equal bone ids across blocks carry different binds (face #164 node 24 sits
 thigh is not block 0's shinguard). Vertex groups are named after the bone
 of their block's armature.
 
+### Textures
+
+Every texture the BIN itself carries (WE00 blocks: DXT1/3/5, the one
+uncompressed DDS, the two raw ball textures) is imported as a packed image,
+each on the packets whose colour map it is, through `UV0`. Paint it in
+Texture Paint, or replace its pixels, and export: changed images are
+re-encoded into their own block (same size, format and mip count, mips
+rebuilt), unchanged ones keep their bytes (DXT is lossy, so they are never
+re-encoded). The image must keep its size.
+
+Which block a model row means is decided from the BIN itself, by three
+rules each checked on every stock entry: a block whose id equals the row
+id; a BIN with as many blocks as distinct row ids (balls, boots: rows in id
+order = blocks in file order); a face BIN's one texture is its skin row
+(200). Rows with no texture in their own BIN (stadiums, kits, the eyes and
+mouth of faces) sample shared textures elsewhere in the game and get no
+image.
+
 ### Object properties
 
 | where | property | meaning |
@@ -75,6 +93,7 @@ of their block's armature.
 | object | `pes12_block` | block index in that BIN |
 | mesh | `pes12_packet` | packet index in its block |
 | mesh attribute | `pes12_vid` | source vertex of each corner (keeps unedited bytes) |
+| image | `pes12_tex_block` / `pes12_tex_hash` | its block in the BIN / pixels at import (unchanged -> bytes kept) |
 
 ## PGB2 custom bodies
 
@@ -128,11 +147,13 @@ blender -b --factory-startup --python tests/test_blender.py   # through the add-
 
 Results on PES2012 v1.06 (30-09-26): 5152 KTMDL entries, 11388 blocks,
 all parse; all 5152 export byte-exact unedited; 14 class examples
-byte-exact through Blender 5.2's own import/export; edits (moved vertex,
-deleted face) survive a re-import on ball, stadium, boots, face and body;
-every PGB2 flag bit round-trips.
+byte-exact through Blender 5.2's own import/export, textures attached;
+edits (moved vertex, deleted face) survive a re-import on ball, stadium,
+boots, face and body; every PGB2 flag bit round-trips. Textures (01-10):
+all 5137 WE00 blocks decode (DXT1/DXT5 identical to ImageMagick); every
+format re-encodes in place (DXT mean error 0.6-1.2/255, others exact); a
+square painted into the ball's colour map in Blender exports with every
+other block byte-identical.
 
-Not in the add-on yet: texture editing (WE00/DDS blocks pass through
-untouched; edit them with pes2012-tools), whole stadium slots and the
-`balls.txt` install step (pes2012-tools `pes12_stadium.py` /
-`pes12_ball.py`).
+Not in the add-on yet: whole stadium slots and the `balls.txt` install
+step (pes2012-tools `pes12_stadium.py` / `pes12_ball.py`).

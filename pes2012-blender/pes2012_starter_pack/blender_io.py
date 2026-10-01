@@ -182,3 +182,58 @@ def read_corners(obj, skel):
             tri.append(len(corners) - 1)
         tris.append(tuple(tri))
     return corners, tris
+
+
+# --- textures ---------------------------------------------------------------
+
+TEX_BLOCK_PROP = 'pes12_tex_block'   # image: index of its WE00 block in the BIN
+TEX_HASH_PROP = 'pes12_tex_hash'     # image: digest of the pixels at import (unchanged -> block kept)
+
+
+def _pixels_digest(px):
+    import hashlib
+    return hashlib.sha1(px.tobytes()).hexdigest()
+
+
+def make_image(name, block_index, rgba):
+    """Decoded WE00 pixels (HxWx4 uint8, rows top-down) -> packed Blender
+    image (Blender rows run bottom-up)."""
+    import bpy
+    import numpy as np
+    h, w = rgba.shape[:2]
+    img = bpy.data.images.new(name, w, h, alpha=True)
+    img.pixels.foreach_set((np.flipud(rgba).astype(np.float32) / 255.0).ravel())
+    img.pack()
+    img[TEX_BLOCK_PROP] = block_index
+    img[TEX_HASH_PROP] = _pixels_digest(image_rgba(img))
+    return img
+
+
+def image_rgba(img):
+    """Blender image -> HxWx4 uint8, rows top-down."""
+    import numpy as np
+    w, h = img.size
+    f = np.empty(w * h * 4, np.float32)
+    img.pixels.foreach_get(f)
+    return np.flipud(np.clip(np.rint(f.reshape(h, w, 4) * 255.0), 0, 255).astype(np.uint8))
+
+
+def image_changed(img):
+    return _pixels_digest(image_rgba(img)) != img.get(TEX_HASH_PROP)
+
+
+def assign_image(obj, img, uv_name):
+    """One material showing img through uv_name (preview + the export link)."""
+    import bpy
+    mat = bpy.data.materials.new(obj.name)
+    mat.use_nodes = True
+    nt = mat.node_tree
+    bsdf = next(n for n in nt.nodes if n.type == 'BSDF_PRINCIPLED')
+    tex = nt.nodes.new('ShaderNodeTexImage')
+    tex.image = img
+    uv = nt.nodes.new('ShaderNodeUVMap')
+    uv.uv_map = uv_name
+    nt.links.new(uv.outputs['UV'], tex.inputs['Vector'])
+    nt.links.new(tex.outputs['Color'], bsdf.inputs['Base Color'])
+    obj.data.materials.append(mat)
+    return mat

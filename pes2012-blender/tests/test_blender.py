@@ -123,11 +123,71 @@ def test_pgb2_flags():
     print('blender: pgb2 flags, every bit round-trips (%d submeshes)' % nsub, flush=True)
 
 
+def _images(col):
+    out = {}
+    for o in col.all_objects:
+        for s in getattr(o, 'material_slots', ()):
+            for n in (s.material.node_tree.nodes if s.material and s.material.use_nodes else ()):
+                if getattr(n, 'image', None) is not None:
+                    out[n.image.name] = n.image
+    return out
+
+
+def test_textures_on_import():
+    """The BIN's own textures arrive as images on their packets: the ball's
+    colour map (not its specular, which the packet lists first), the boots'
+    colour sheet."""
+    import blender_io
+    for name, img_name_part in (('ball', '_tex1'), ('face_dt0c', '_tex')):
+        _fresh()
+        raw = corpus.read_entry(*corpus.CLASSES[name])
+        os.makedirs(OUT, exist_ok=True)
+        src = os.path.join(OUT, 'src.bin')
+        open(src, 'wb').write(raw)
+        col, _n = P.import_bin(bpy.context, src)
+        imgs = _images(col)
+        assert imgs and any(img_name_part in k for k in imgs), (name, list(imgs))
+        for img in imgs.values():
+            assert not blender_io.image_changed(img), img.name
+        print('blender: %-20s textures on import %s' % (name, sorted(imgs)), flush=True)
+
+
+def test_texture_edit_exports():
+    """Paint a square into the ball's colour map: the exported BIN carries it
+    (decoded back within DXT tolerance), its other texture blocks and the
+    model are byte-identical."""
+    import numpy as np
+    import blender_io
+    import textures
+    _fresh()
+    raw = corpus.read_entry(*corpus.CLASSES['ball'])
+    PAINT = (255, 0, 255, 255)
+
+    def paint(col):
+        img = next(iter(_images(col).values()))
+        px = blender_io.image_rgba(img)
+        px[16:48, 16:48] = PAINT
+        img.pixels.foreach_set((np.flipud(px).astype(np.float32) / 255.0).ravel())
+        paint.block = int(img[blender_io.TEX_BLOCK_PROP])
+
+    out = _roundtrip(raw, paint)
+    a, b = container.read(raw), container.read(out)
+    for k, (x, y) in enumerate(zip(a.blocks, b.blocks)):
+        if k == paint.block:
+            _, _, px = textures.decode(y.data)
+            assert (np.abs(px[16:48, 16:48].astype(int) - PAINT) <= 8).all(), 'paint lost'
+        else:
+            assert x.data == y.data, ('block changed', k)
+    print('blender: ball texture edit exports, other blocks byte-identical', flush=True)
+
+
 if __name__ == '__main__':
     if not corpus.available():
         print('SKIP: no game at %s (set PES12_GAME)' % corpus.GAME)
     else:
         test_unedited_byte_exact()
         test_edit_survives()
+        test_textures_on_import()
+        test_texture_edit_exports()
     test_pgb2_flags()
     print('BLENDER TESTS PASS', flush=True)
