@@ -63,6 +63,8 @@ def read_fmdl(path):
             pos.append((v.position.x, v.position.y, v.position.z))
             nrm.append((v.normal.x, v.normal.y, v.normal.z))
             u = v.uv[0] if v.uv else None
+            # PES21 fmdl UVs are a different format; this flip is unverified in
+            # game (only the .model path was, 01-10) - do not "fix" it blindly.
             uv.append((u.u, 1.0 - u.v) if u is not None else (0.0, 0.0))
         for fa in m.faces:
             idx.extend(base + ids[id(v)] for v in fa.vertices)
@@ -265,7 +267,11 @@ def read_model(path):
             n = (v.normal.x, v.normal.y, v.normal.z) if v.normal else (0.0, 1.0, 0.0)
             nrm.append(n)
             u = v.uv[0] if v.uv else None
-            uv.append((u.u, 1.0 - u.v) if u is not None else (0.0, 0.0))
+            # source UVs pass through unchanged: the PES14-17 .model layout is
+            # the one PES2012 samples. In game (01-10): with a 1-v flip the ball
+            # texture is scrambled, without it the 4cc balls read correctly -
+            # the same convention pes12_stadium.py uses for these models.
+            uv.append((u.u, u.v) if u is not None else (0.0, 0.0))
         for fa in x.faces:
             idx.extend(base + ids[id(v)] for v in fa.vertices)
     return pos, nrm, uv, idx
