@@ -95,6 +95,25 @@ image.
 | mesh attribute | `pes12_vid` | source vertex of each corner (keeps unedited bytes) |
 | image | `pes12_tex_block` / `pes12_tex_hash` | its block in the BIN / pixels at import (unchanged -> bytes kept) |
 
+## Stadium slots
+
+**File > Import > PES2012 stadium slot** asks for the game folder, an
+optional afs2fs root (`kitserver/4cc-dlc`: overrides there are read instead
+of stock, so you edit what the game actually loads) and the slot number
+(`pes12_stadium.py list`). You get one collection `slotNN` with a
+sub-collection per model entry: the geometry entry, then each per-variant
+props entry. Every packet is textured from the slot's texture entries
+(stand textures, lightmaps, sky, pitch art, then the shared pitch-side and
+adboard entries), resolved by texture id as the game does.
+
+Edit geometry and paint textures as for a single BIN, then **File > Export >
+PES2012 stadium slot (afs2fs)** with the afs2fs root: every model entry and
+every texture entry you changed is written as
+`<root>/img/dt07.img/dt07_<entry>.bin`; an entry equal to stock leaves no
+file (an existing override for it is removed). Stock `.img` files are never
+written. The slot table is read from your own `pes2012.exe`, with the same
+rules as pes2012-tools `pes12_stadium.py`.
+
 ## PGB2 custom bodies
 
 `dllprobe/custom/p<pid>/body.bin` (+ `body_<k>.dds` textures) as built by
@@ -155,5 +174,11 @@ format re-encodes in place (DXT mean error 0.6-1.2/255, others exact); a
 square painted into the ball's colour map in Blender exports with every
 other block byte-identical.
 
-Not in the add-on yet: whole stadium slots and the `balls.txt` install
-step (pes2012-tools `pes12_stadium.py` / `pes12_ball.py`).
+Stadium slots (01-10): the slot table equals pes12_stadium.read_slots on
+all 31 slots; slot 30 imports as 6 entries, 71 packets, 11 textures and an
+untouched export writes no file; a moved vertex plus a painted stand texture
+write exactly the geometry and that stand entry, each re-reading with the
+edit. Not yet seen in game: an edited slot served to a match.
+
+Not in the add-on yet: the `balls.txt` install step (pes2012-tools
+`pes12_ball.py`).

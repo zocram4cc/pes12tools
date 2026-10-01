@@ -33,11 +33,17 @@ import bpy  # noqa: E402
 from bpy.props import BoolProperty, EnumProperty, IntProperty, StringProperty  # noqa: E402
 from bpy_extras.io_utils import ExportHelper, ImportHelper  # noqa: E402
 
-from . import blender_io, container, ktmdl_write, model, pgb2, skeleton, textures  # noqa: E402
+from . import blender_io, container, ktmdl_write, model, pgb2, skeleton, stadium, textures  # noqa: E402
 
 SOURCE_PROP = 'pes12_source'    # collection: absolute path of the imported BIN
 BLOCK_PROP = 'pes12_block'      # object: index into the container's blocks
 PACKET_PROP = 'pes12_packet'    # mesh object: packet index in its block
+SLOT_PROP = 'pes12_slot'          # collection: slot number
+GAME_PROP = 'pes12_game'          # collection: the game folder it was read from
+ROOT_PROP = 'pes12_root'          # collection: the afs2fs root it reads overrides from
+ENTRY_PROP = 'pes12_entry'        # sub-collection: its dt07 entry
+TEX_ENTRY_PROP = 'pes12_tex_entry'  # image: the dt07 entry holding its block
+BIN_SELF = -1                     # image of a single-BIN import: its own BIN
 
 
 TEX_ROW_ID_OFF = 8     # textureNameIds row: u32 texture id at +8 (pes12_stadium.repoint_textures)
@@ -63,14 +69,46 @@ def _diffuse_row(packet, names):
     return refs[0]['id'] if refs else None
 
 
+def _activate(context, col, parent_layer):
+    """Make col the collection new objects link into (the blender_io helpers
+    link into context.collection)."""
+    layer = parent_layer.children[col.name]
+    context.view_layer.active_layer_collection = layer
+    return layer
+
+
+def _import_container(context, col, stem, c, texture_of):
+    """Meshes of every KTMDL block of container c into the active collection
+    (col). texture_of(row id, block datas) -> Blender image or None."""
+    datas = [b.data for b in c.blocks]
+    n = 0
+    for k, b in ((k, b) for k, b in enumerate(c.blocks) if b.kind == 'ktmdl'):
+        m = model.read(b.data)
+        sk = skeleton.build_one('b%d' % k, m.parsed)
+        arm = blender_io.make_armature('%s_b%d' % (stem, k), sk)
+        arm[BLOCK_PROP] = k
+        row_ids = _row_ids(b.data, m.parsed)
+        names = m.parsed['names'].get('textureNames', [])
+        for i, p in enumerate(m.parsed['packets']):
+            o = blender_io.make_mesh('%s_b%d_p%03d' % (stem, k, i), p, p['bonePalette'], sk)
+            o[BLOCK_PROP] = k
+            o[PACKET_PROP] = i
+            row = _diffuse_row(p, names)
+            img = texture_of(row_ids[row], datas) if row is not None and row < len(row_ids) else None
+            if img is not None and 'UV0' in o.data.uv_layers:
+                blender_io.assign_image(o, img, 'UV0')
+            blender_io.parent_to_armature(o, arm)
+            o.parent = arm
+            n += 1
+    return n
+
+
 def import_bin(context, filepath):
     """BIN -> collection: per KTMDL block one armature (its own skeleton)
     and one mesh per packet; every texture the BIN carries as a packed image,
     on the packets that sample it. Returns (collection, packet count)."""
-    raw = open(filepath, 'rb').read()
-    c = container.read(raw)
-    blocks = [(k, b) for k, b in enumerate(c.blocks) if b.kind == 'ktmdl']
-    if not blocks:
+    c = container.read(open(filepath, 'rb').read())
+    if not c.ktmdl_blocks():
         raise ValueError('no KTMDL block in %s' % filepath)
     stem = os.path.splitext(os.path.basename(filepath))[0]
     col = bpy.data.collections.new(stem)
@@ -79,47 +117,28 @@ def import_bin(context, filepath):
     layer = context.view_layer.layer_collection.children[col.name]
     context.view_layer.active_layer_collection = layer
     datas = [b.data for b in c.blocks]
+    rows = [r for b in c.ktmdl_blocks() for r in _row_ids(b.data, model.read(b.data).parsed)]
+    bound = textures.bind(datas, rows)   # over the whole BIN, as the rules were measured
     images = {}
 
-    def image(k):
+    def texture_of(row_id, _datas):
+        k = bound.get(row_id)
+        if k is None:
+            return None
         if k not in images:
             _, _, px = textures.decode(datas[k])
             images[k] = blender_io.make_image('%s_tex%d' % (stem, k), k, px)
+            images[k][TEX_ENTRY_PROP] = BIN_SELF
         return images[k]
 
-    n = 0
-    for k, b in blocks:
-        m = model.read(b.data)
-        sk = skeleton.build_one('b%d' % k, m.parsed)
-        arm = blender_io.make_armature('%s_b%d' % (stem, k), sk)
-        arm[BLOCK_PROP] = k
-        row_ids = _row_ids(b.data, m.parsed)
-        bound = textures.bind(datas, row_ids)
-        for i, p in enumerate(m.parsed['packets']):
-            o = blender_io.make_mesh('%s_b%d_p%03d' % (stem, k, i), p, p['bonePalette'], sk)
-            o[BLOCK_PROP] = k
-            o[PACKET_PROP] = i
-            row = _diffuse_row(p, m.parsed['names'].get('textureNames', []))
-            if row is not None and row < len(row_ids) and row_ids[row] in bound and 'UV0' in o.data.uv_layers:
-                blender_io.assign_image(o, image(bound[row_ids[row]]), 'UV0')
-            blender_io.parent_to_armature(o, arm)
-            o.parent = arm
-            n += 1
+    n = _import_container(context, col, stem, c, texture_of)
     return col, n
 
 
-def export_bin(col, filepath):
-    """Collection from import_bin -> BIN at filepath, byte-exact where the
-    user changed nothing. A packet whose mesh object was deleted keeps its
-    stock data; extra objects are ignored (one object per packet)."""
-    src = col.get(SOURCE_PROP)
-    if not src or not os.path.exists(src):
-        raise ValueError('collection %s was not imported from a PES2012 BIN' % col.name)
-    c = container.read(open(src, 'rb').read())
-    objs = {}
-    for o in col.all_objects:
-        if o.type == 'MESH' and BLOCK_PROP in o and PACKET_PROP in o:
-            objs.setdefault(int(o[BLOCK_PROP]), {})[int(o[PACKET_PROP])] = o
+def _export_container(c, objs, imgs, entry):
+    """Apply Blender edits to container c: the packets of objs ({block:
+    {packet: obj}}) and the changed images among imgs that live in this
+    entry (TEX_ENTRY_PROP)."""
     for k, packets in objs.items():
         b = c.blocks[k]
         m = model.read(b.data)
@@ -127,22 +146,118 @@ def export_bin(col, filepath):
         rows = [model.export_packet(b.data, i, *blender_io.read_corners(o, sk))
                 for i, o in sorted(packets.items())]
         b.data = ktmdl_write.build(b.data, rows)
-    # images painted or replaced since import go back into their blocks;
-    # untouched ones keep their bytes (DXT re-encoding is lossy)
-    seen = set()
+    for img in imgs:
+        if int(img.get(TEX_ENTRY_PROP, -1)) == entry and blender_io.image_changed(img):
+            k = int(img[blender_io.TEX_BLOCK_PROP])
+            c.blocks[k].data = textures.encode(c.blocks[k].data, blender_io.image_rgba(img))
+
+
+def _packet_objects(col):
+    objs = {}
+    for o in col.all_objects:
+        if o.type == 'MESH' and BLOCK_PROP in o and PACKET_PROP in o:
+            objs.setdefault(int(o[BLOCK_PROP]), {})[int(o[PACKET_PROP])] = o
+    return objs
+
+
+def _collection_images(col):
+    """Every imported image the collection's materials use, once."""
+    seen = {}
     for o in col.all_objects:
         for slot in getattr(o, 'material_slots', ()):
             nt = slot.material.node_tree if slot.material and slot.material.use_nodes else None
             for node in (nt.nodes if nt else ()):
                 img = getattr(node, 'image', None)
-                if img is None or blender_io.TEX_BLOCK_PROP not in img or img.name in seen:
-                    continue
-                seen.add(img.name)
-                if blender_io.image_changed(img):
-                    k = int(img[blender_io.TEX_BLOCK_PROP])
-                    c.blocks[k].data = textures.encode(c.blocks[k].data, blender_io.image_rgba(img))
+                if img is not None and blender_io.TEX_BLOCK_PROP in img:
+                    seen[img.name] = img
+    return list(seen.values())
+
+
+def export_bin(col, filepath):
+    """Collection from import_bin -> BIN at filepath, byte-exact where the
+    user changed nothing. A packet whose mesh object was deleted keeps its
+    stock data; extra objects are ignored (one object per packet). Images
+    painted since import go back into their blocks; untouched ones keep
+    their bytes (DXT re-encoding is lossy)."""
+    src = col.get(SOURCE_PROP)
+    if not src or not os.path.exists(src):
+        raise ValueError('collection %s was not imported from a PES2012 BIN' % col.name)
+    c = container.read(open(src, 'rb').read())
+    _export_container(c, _packet_objects(col), _collection_images(col), BIN_SELF)
     open(filepath, 'wb').write(container.write(c))
     return filepath
+
+
+# --- whole stadium slots ---
+
+
+
+def import_slot(context, game, number, root=None):
+    """A licensed stadium slot -> one collection, a sub-collection per model
+    entry (geometry, then the per-variant props), every packet textured from
+    the slot's texture entries (stand, lightmaps, sky, pitch, shared)."""
+    sl = {s.number: s for s in stadium.slots(game)}
+    if number not in sl:
+        raise ValueError('no licensed stadium slot %d (have %s)' % (number, sorted(sl)))
+    s = sl[number]
+    col = bpy.data.collections.new('slot%02d' % number)
+    context.scene.collection.children.link(col)
+    col[SLOT_PROP], col[GAME_PROP], col[ROOT_PROP] = number, os.path.abspath(game), os.path.abspath(root) if root else ''
+    top = _activate(context, col, context.view_layer.layer_collection)
+    index = stadium.texture_index(game, s, root)
+    cache, images = {}, {}
+
+    def texture_of(row_id, _datas):
+        where = index.get(row_id)
+        if where is None:
+            return None
+        if where not in images:
+            e, k = where
+            if e not in cache:
+                cache[e] = container.read(stadium.read_raw(game, e, root))
+            _, _, px = textures.decode(cache[e].blocks[k].data)
+            img = blender_io.make_image('dt07_%d_tex%d' % (e, k), k, px)
+            img[TEX_ENTRY_PROP] = e
+            images[where] = img
+        return images[where]
+
+    roles = stadium.slot_entries(s)
+    n = 0
+    for role in ('geometry', 'props'):
+        for e in roles[role]:
+            sub = bpy.data.collections.new('%s_dt07_%d' % (role, e))
+            col.children.link(sub)
+            sub[ENTRY_PROP] = e
+            _activate(context, sub, top)
+            n += _import_container(context, sub, 'dt07_%d' % e, container.read(stadium.read_raw(game, e, root)), texture_of)
+    return col, n
+
+
+def export_slot(col, root):
+    """Slot collection -> afs2fs overrides in root (kitserver/4cc-dlc) for
+    every model entry and every texture entry an edit touched; entries equal
+    to stock leave no file. -> written paths."""
+    if SLOT_PROP not in col:
+        raise ValueError('collection %s is not a stadium slot import' % col.name)
+    game, src_root = col[GAME_PROP], col.get(ROOT_PROP) or None
+    imgs = _collection_images(col)
+    out = []
+    for sub in col.children:
+        if ENTRY_PROP not in sub:
+            continue
+        e = int(sub[ENTRY_PROP])
+        c = container.read(stadium.read_raw(game, e, src_root))
+        _export_container(c, _packet_objects(sub), imgs, e)
+        p = stadium.write_raw(game, root, e, container.write(c))
+        if p:
+            out.append(p)
+    for e in sorted({int(i[TEX_ENTRY_PROP]) for i in imgs if blender_io.image_changed(i)} - {int(s[ENTRY_PROP]) for s in col.children if ENTRY_PROP in s}):
+        c = container.read(stadium.read_raw(game, e, src_root))
+        _export_container(c, {}, imgs, e)
+        p = stadium.write_raw(game, root, e, container.write(c))
+        if p:
+            out.append(p)
+    return out
 
 
 def _collection_of(context):
@@ -415,17 +530,78 @@ class EXPORT_OT_pgb2(bpy.types.Operator, ExportHelper):
         return {'FINISHED'}
 
 
+class IMPORT_OT_pes12_slot(bpy.types.Operator):
+    """Import every model of a licensed stadium slot, textured from the slot's own texture entries"""
+    bl_idname = 'import_scene.pes12_slot'
+    bl_label = 'Import PES2012 stadium slot'
+    bl_options = {'UNDO'}
+    game: StringProperty(name='Game folder', subtype='DIR_PATH',
+                         description='The PES2012 folder (pes2012.exe, img/)')
+    root: StringProperty(name='afs2fs root', subtype='DIR_PATH',
+                         description='kitserver/4cc-dlc: overrides there are read instead of stock (optional)')
+    slot: IntProperty(name='Slot', default=0, min=0, description='Licensed stadium slot number (pes12_stadium.py list)')
+
+    def invoke(self, context, event):
+        return context.window_manager.invoke_props_dialog(self)
+
+    def execute(self, context):
+        try:
+            col, n = import_slot(context, bpy.path.abspath(self.game), self.slot, bpy.path.abspath(self.root) or None)
+        except Exception as e:
+            self.report({'ERROR'}, str(e))
+            return {'CANCELLED'}
+        self.report({'INFO'}, 'Imported slot %d: %d packet(s) into %s' % (self.slot, n, col.name))
+        return {'FINISHED'}
+
+
+class EXPORT_OT_pes12_slot(bpy.types.Operator):
+    """Write the edited entries of an imported stadium slot as afs2fs overrides"""
+    bl_idname = 'export_scene.pes12_slot'
+    bl_label = 'Export PES2012 stadium slot'
+    root: StringProperty(name='afs2fs root', subtype='DIR_PATH',
+                         description='kitserver/4cc-dlc: overrides are written to <root>/img/dt07.img/')
+
+    def invoke(self, context, event):
+        return context.window_manager.invoke_props_dialog(self)
+
+    def execute(self, context):
+        col = _slot_collection(context)
+        if col is None:
+            self.report({'ERROR'}, 'Select an object of an imported stadium slot')
+            return {'CANCELLED'}
+        try:
+            out = export_slot(col, bpy.path.abspath(self.root))
+        except Exception as e:
+            self.report({'ERROR'}, str(e))
+            return {'CANCELLED'}
+        self.report({'INFO'}, 'Wrote %d override(s)' % len(out))
+        return {'FINISHED'}
+
+
+def _slot_collection(context):
+    """The slot collection holding the active object (its entry
+    sub-collection's parent), else the active collection if it is one."""
+    o = context.active_object
+    for c in bpy.data.collections:
+        if SLOT_PROP in c and (o is None or o.name in c.all_objects):
+            return c
+    return None
+
+
 def menu_import(self, context):
     self.layout.operator(IMPORT_OT_pes12_bin.bl_idname, text='PES2012 BIN (.bin)')
     self.layout.operator(IMPORT_OT_pgb2.bl_idname, text='PGB2 body (.bin)')
+    self.layout.operator(IMPORT_OT_pes12_slot.bl_idname, text='PES2012 stadium slot')
 
 
 def menu_export(self, context):
     self.layout.operator(EXPORT_OT_pes12_bin.bl_idname, text='PES2012 BIN (.bin)')
     self.layout.operator(EXPORT_OT_pgb2.bl_idname, text='PGB2 body (.bin)')
+    self.layout.operator(EXPORT_OT_pes12_slot.bl_idname, text='PES2012 stadium slot (afs2fs)')
 
 
-classes = (IMPORT_OT_pes12_bin, EXPORT_OT_pes12_bin, IMPORT_OT_pgb2, EXPORT_OT_pgb2)
+classes = (IMPORT_OT_pes12_bin, EXPORT_OT_pes12_bin, IMPORT_OT_pgb2, EXPORT_OT_pgb2,
+           IMPORT_OT_pes12_slot, EXPORT_OT_pes12_slot)
 
 
 def register():

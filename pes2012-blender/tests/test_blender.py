@@ -181,6 +181,56 @@ def test_texture_edit_exports():
     print('blender: ball texture edit exports, other blocks byte-identical', flush=True)
 
 
+SLOT = int(os.environ.get('PES12_TEST_SLOT', '30'))   # any stock slot; 30 = the last licensed one
+
+
+def test_slot_unedited_no_overrides():
+    """Whole slot imported and exported untouched: every entry equals stock,
+    so no override is written."""
+    import shutil
+    _fresh()
+    col, n = P.import_slot(bpy.context, corpus.GAME, SLOT)
+    subs = [c for c in col.children if P.ENTRY_PROP in c]
+    imgs = P._collection_images(col)
+    assert subs and n > 0 and imgs, (len(subs), n, len(imgs))
+    root = os.path.join(OUT, 'root')
+    shutil.rmtree(root, ignore_errors=True)
+    assert P.export_slot(col, root) == []
+    print('blender: slot %d: %d entries, %d packets, %d textures; unedited export writes nothing'
+          % (SLOT, len(subs), n, len(imgs)), flush=True)
+
+
+def test_slot_edits_write_their_entries():
+    """Move a vertex of the geometry and paint a stand texture: exactly those
+    two entries are written, each re-reads with the edit."""
+    import shutil
+    import numpy as np
+    import blender_io
+    import stadium
+    import textures
+    _fresh()
+    col, _n = P.import_slot(bpy.context, corpus.GAME, SLOT)
+    geo = next(c for c in col.children if c.name.startswith('geometry'))
+    mesh = next(o for o in geo.all_objects if o.type == 'MESH' and len(o.data.vertices) > 3)
+    mesh.data.vertices[0].co.x += EDIT_SHIFT_M
+    s = {x.number: x for x in stadium.slots(corpus.GAME)}[SLOT]
+    stand = set(stadium.slot_entries(s)['stand'])
+    img = next(i for i in P._collection_images(col) if int(i[P.TEX_ENTRY_PROP]) in stand)
+    px = blender_io.image_rgba(img)
+    px[0:8, 0:8] = (255, 0, 255, 255)
+    img.pixels.foreach_set((np.flipud(px).astype(np.float32) / 255.0).ravel())
+    root = os.path.join(OUT, 'root')
+    shutil.rmtree(root, ignore_errors=True)
+    out = P.export_slot(col, root)
+    want = {stadium.override_path(root, int(geo[P.ENTRY_PROP])), stadium.override_path(root, int(img[P.TEX_ENTRY_PROP]))}
+    assert set(out) == want, (out, want)
+    tc = container.read(open(stadium.override_path(root, int(img[P.TEX_ENTRY_PROP])), 'rb').read())
+    _, _, back = textures.decode(tc.blocks[int(img[blender_io.TEX_BLOCK_PROP])].data)
+    assert (np.abs(back[0:8, 0:8].astype(int) - (255, 0, 255, 255)) <= 8).all()
+    print('blender: slot %d edits write exactly geometry dt07_%d + stand dt07_%d'
+          % (SLOT, geo[P.ENTRY_PROP], img[P.TEX_ENTRY_PROP]), flush=True)
+
+
 if __name__ == '__main__':
     if not corpus.available():
         print('SKIP: no game at %s (set PES12_GAME)' % corpus.GAME)
@@ -189,5 +239,7 @@ if __name__ == '__main__':
         test_edit_survives()
         test_textures_on_import()
         test_texture_edit_exports()
+        test_slot_unedited_no_overrides()
+        test_slot_edits_write_their_entries()
     test_pgb2_flags()
     print('BLENDER TESTS PASS', flush=True)
