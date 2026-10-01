@@ -60,10 +60,15 @@ import pes15export as X  # noqa: E402
 import pes17export as X17  # noqa: E402
 import pes15_kits as K  # noqa: E402
 import pes12edit as E  # noqa: E402
+import afs  # noqa: E402
 
 PID_BASE = 2000                 # the DLC's placeholder pid base
 STARTERS = 11
-FACE_TEMPLATE = 'faces/anyukov/face_orig_backup.bin'   # any stock GDB face: only its mips carry the marker
+# the face.bin template: any stock face BIN (only its smallest mips carry the
+# marker, and the face is hidden under the custom body); this is the one
+# pes12_rig.py reads the face rig from. GDB is <game>/kitserver/GDB.
+FACE_TEMPLATE_IMG, FACE_TEMPLATE_ENTRY = 'dt0c.img', 132
+FACE_TEMPLATE_NAME = 'face_template.bin'          # written into GDB/faces/4cc/
 ROLE_OFF, DEPTH_OFF, LATERAL_OFF = 0x50, 0x5A, 0x64    # entry 29, per outfield slot (10 each)
 LEFT_MAX, RIGHT_MIN = 40, 60    # lateral thresholds for left / centre / right roles
 # PES15 position -> PES2012 formation role codes (left, centre, right), from the
@@ -197,8 +202,9 @@ def register(custom, gdb, tid, pids):
             if os.path.exists(face):
                 os.remove(face)
     map_path = os.path.join(gdb, 'faces', 'map.txt')
+    os.makedirs(os.path.dirname(map_path), exist_ok=True)
     keep = []
-    for line in open(map_path).read().splitlines():
+    for line in (open(map_path).read().splitlines() if os.path.exists(map_path) else []):
         head = line.split(',', 1)[0].strip()
         if not (head.isdigit() and team(int(head))):
             keep.append(line)
@@ -305,6 +311,10 @@ def main(aes, edit, custom, gdb, export=None, tid=None, starters_only=True, pes2
         found.append((s, folder))
     register(custom, gdb, tid, [new_pid[s['pid']] for s, _ in found])
     os.makedirs(os.path.join(gdb, 'faces', '4cc'), exist_ok=True)
+    template = os.path.join(gdb, 'faces', '4cc', FACE_TEMPLATE_NAME)
+    if not os.path.exists(template):
+        img = os.path.join(gdb, '..', '..', 'img', FACE_TEMPLATE_IMG)
+        open(template, 'wb').write(afs.read(img, FACE_TEMPLATE_ENTRY))
     for s, folder in found:
         pid = new_pid[s['pid']]
         app = x['players'][s['pid']]['appearance']
@@ -312,7 +322,7 @@ def main(aes, edit, custom, gdb, export=None, tid=None, starters_only=True, pes2
         hint = [] if app is None else ['hide' if X.hides_body(app) else 'keep']
         subprocess.run([sys.executable, os.path.join(HERE, 'pes15_to_pes12.py'), folder, kit,
                         os.path.join(custom, 'p%d' % pid)] + hint, check=True)
-        subprocess.run([sys.executable, os.path.join(HERE, 'mark_face.py'), os.path.join(gdb, FACE_TEMPLATE),
+        subprocess.run([sys.executable, os.path.join(HERE, 'mark_face.py'), template,
                         str(pid), os.path.join(gdb, 'faces', '4cc', '%d.bin' % pid)],
                        check=True, stdout=subprocess.DEVNULL)
         print('p%d %s' % (pid, os.path.basename(folder)))

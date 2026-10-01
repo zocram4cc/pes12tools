@@ -44,7 +44,8 @@ squads, every player field, team CSV import/export); install and use:
 
 | file | what |
 |---|---|
-| `kitserver/kload.dll`, `afsio.dll`, `afs2fs.dll`, `zlib1.dll`, `manager.exe`, `config.exe`, `lang_eng.txt`, `docs/` | kitserver 12 (Juce, Robbie; see `docs/license.txt`) |
+| `kitserver/kload.dll`, `afsio.dll`, `afs2fs.dll`, `zlib1.dll`, `manager.exe`, `config.exe`, `lang_eng.txt`, `docs/` | kitserver 12 (Juce, Robbie; see `docs/license.txt`); loaded by `config.txt` |
+| `kitserver/fserv.dll`, `lodmixer.dll` | the same kitserver 12 release, not loaded by the base; `pes12_runtime.py` copies them in when you install the player runtime (custom players, referees, adboards) |
 | `kitserver/config.txt` | loads afsio + afs2fs, registers the 4cc-dlc root |
 | `kitserver/4cc-dlc/img/dt04.img/dt04_26.bin` | players |
 | `.../dt04_29.bin`, `dt04_30.bin`, `dt04_31.bin`, `dt04_32.bin` | formations, teams, rosters, team names |

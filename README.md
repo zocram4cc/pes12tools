@@ -12,6 +12,10 @@ Four folders, each standalone:
 `pes2012-editapp` imports `pes2012-tools` from its sibling folder: keep the
 layout when copying them out.
 
+Building a whole DLC from your own 4cc packs (32-64 teams with full
+aesthetics, every stadium, adboards, referees and balls) is the step-by-step
+tutorial [DLC build](12-dlc-build.md).
+
 `pes2012-4cc/` ships database tables derived from PES2012 itself (its
 `dt04`/`dt06` overrides start from the stock tables). Everything the tools
 produce from PES2015/PES2017/PES2021 data or from 4cc packs is never

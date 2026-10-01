@@ -107,9 +107,39 @@ Shadeless pixel shaders are `runtime/custom_ps.hlsl`, compiled into
 `custom_ps.h` by `runtime/build_shaders.sh` (vkd3d-compiler); rerun it after
 editing the HLSL, before `build.sh`.
 
-The runtime needs kitserver's `lodmixer` (`dll = lodmixer` in `[kload]`)
-pinning players and officials to their full-detail model; lower LODs are
-other meshes the runtime does not replace. In `kitserver/config.txt`:
+## Build a whole 4cc DLC
+
+The step-by-step build (32-64 teams with full aesthetics, all stadiums,
+adboards, referees, balls, and how to ship it) is the wiki page
+[**DLC build**](12-dlc-build.md).
+
+## Install the player runtime (one command)
+
+The 4cc DLC base loads only `afsio` + `afs2fs`. Custom players,
+officials and adboards add three more modules and the LOD pins (see the
+`[lodmixer]` block below, written by the tool):
+
+```sh
+python3 pes12_runtime.py install "<PES2012 game dir>"
+```
+
+It copies `fserv.dll` and `lodmixer.dll` from `pes2012-4cc/kitserver/`
+into the game's `kitserver/`, installs `drawhook.dll` +
+`4cc-players/drawlogic.dll` from `runtime/`, creates
+`4cc-players/{custom,custom/kits,flags,kitmap}/`, adds
+`dll = fserv, lodmixer, drawhook` to `[kload]`, the LOD pins to
+`[lodmixer]`, and sets the large-address-aware flag on `pes2012.exe`
+(backup `pes2012.exe.pre-laa.bak`; the entrance LOD pin needs it). Idempotent;
+the game must be closed. On Linux/Wine point the game folder at the
+directory holding `pes2012.exe` (the one with `img/` next to it).
+
+PES12_ENVIRONMENT for the tools below (bash):
+
+    export PES12_GAME="<PES2012 game dir>"                       # default <pkg>/game
+    export PES12_KITMAP="$PES12_GAME/kitserver/4cc-players/kitmap"   # drawlogic reads fwd.bin here
+    export PES12_RIG="$PWD/rig"                                  # pes12_rig.py output (optional)
+    export PES12_BODY_BONES="$PES12_RIG/body349b2_bones.json"    # optional
+
 
 ```ini
 [lodmixer]

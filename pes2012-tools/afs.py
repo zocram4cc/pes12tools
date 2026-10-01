@@ -4,6 +4,7 @@ u32 size). Entries are usually WESYS-zlib BINs.
   python3 afs.py list <file.img>                 # index, offset, size, magic
   python3 afs.py scan <file.img> [...]           # KTMDL bbox per entry
   python3 afs.py extract <file.img> <index> <out>  # decompressed
+  python3 afs.py raw <file.img> <index> <out>      # as stored (WESYS kept): what afs2fs serves
 """
 import struct
 import sys
@@ -81,6 +82,8 @@ def model_extent(blob):
 
 
 def main():
+    if len(sys.argv) < 3 or sys.argv[1] not in ("list", "scan", "extract", "raw"):
+        sys.exit(__doc__)
     cmd, path = sys.argv[1], sys.argv[2]
     if cmd == "list":
         with open(path, "rb") as f:
@@ -106,6 +109,8 @@ def main():
     elif cmd == "extract":
         raw = read(path, int(sys.argv[3]))
         open(sys.argv[4], "wb").write(ktmdl.unwesys(raw))
+    elif cmd == "raw":
+        open(sys.argv[4], "wb").write(read(path, int(sys.argv[3])))
 
 
 if __name__ == "__main__":

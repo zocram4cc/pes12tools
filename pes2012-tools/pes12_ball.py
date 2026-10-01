@@ -70,7 +70,14 @@ def read_fmdl(path):
 
 
 def read_obj(path):
-    pos, uv, nrm, idx = [], [], [], []
+    """Wavefront OBJ (Blender: File > Export > Wavefront, Y up): one vertex per
+    distinct v/vt/vn corner, polygons fan-triangulated."""
+    pos, uv, nrm = [], [], []
+    corners, out_pos, out_uv, out_nrm, idx = {}, [], [], [], []
+
+    def ref(i, n):          # OBJ index (1-based, negative = from the end) -> 0-based
+        return int(i) - 1 if int(i) > 0 else n + int(i)
+
     for line in open(path):
         p = line.split()
         if not p:
@@ -82,12 +89,18 @@ def read_obj(path):
         elif p[0] == "vn":
             nrm.append(tuple(map(float, p[1:4])))
         elif p[0] == "f":
-            idx.extend(int(c.split("/")[0]) - 1 for c in p[1:])
-    if not nrm:
-        nrm = [(0.0, 1.0, 0.0)] * len(pos)
-    if not uv:
-        uv = [(0.0, 0.0)] * len(pos)
-    return pos, nrm, uv, idx
+            poly = []
+            for c in p[1:]:
+                if c not in corners:
+                    f = (c.split("/") + ["", ""])[:3]
+                    corners[c] = len(out_pos)
+                    out_pos.append(pos[ref(f[0], len(pos))])
+                    out_uv.append(uv[ref(f[1], len(uv))] if f[1] else (0.0, 0.0))
+                    out_nrm.append(nrm[ref(f[2], len(nrm))] if f[2] else (0.0, 1.0, 0.0))
+                poly.append(corners[c])
+            for k in range(1, len(poly) - 1):
+                idx += [poly[0], poly[k], poly[k + 1]]
+    return out_pos, out_nrm, out_uv, idx
 
 
 def signed_volume(pos, tris):
@@ -114,6 +127,11 @@ def to_strip(tris):
     return out
 
 
+# pack_vertices layout: position, normal, tangent, binormal (3 floats each),
+# UV0 and UV1 (2 floats each); stock balls 29-31 use a 56-byte layout instead
+VERTEX_BYTES = 64
+
+
 def pack_vertices(pos, nrm, uv, scale):
     out = bytearray()
     for (x, y, z), (nx, ny, nz), (u, v) in zip(pos, nrm, uv):
@@ -134,32 +152,43 @@ def pack_vertices(pos, nrm, uv, scale):
     return bytes(out)
 
 
-def convert_texture(src, we, slot_len):
-    """Image/.ftex -> WE00+DDS content bytes for one texture slot. magick
-    emits the full 10-mip chain for 512x512 DXT1/DXT5, matching stock sizes;
-    the DWReserved1 tag magick writes is normalized to stock (zeros)."""
-    from PIL import Image
+WE00_HEAD = 16                          # WE00 header before each DDS
+DDS_HEIGHT, DDS_WIDTH, DDS_MIPS, DDS_FOURCC = 12, 16, 28, 84   # DDS header field offsets (from the 128-byte header)
+DDS_TAG_START, DDS_TAG_END = 32, 76     # DWReserved1: magick writes a tag, stock is zeros
+
+
+def convert_texture(src, block):
+    """Image/.ftex -> WE00+DDS content bytes for one texture slot, encoded at
+    the slot's own size, format and mip count (read from the template's DDS
+    header: every stock colour slot is 512x512 DXT1, 10 mips). Alpha in the
+    source is dropped when the slot is DXT1, as the game samples it."""
     if src.lower().endswith(".ftex"):
         import ftex
-        dds = ftex.to_dds(open(src, "rb").read())
-        with tempfile.NamedTemporaryFile(suffix=".dds", delete=False) as t:
-            t.write(dds)
-            src = t.name
+        dds, ext = ftex.to_dds(open(src, "rb").read()), ".dds"
+    else:
+        import ktmdl
+        dds, ext = ktmdl.unwesys(open(src, "rb").read()), os.path.splitext(src)[1]   # some pack DDS are wrapped
+    with tempfile.NamedTemporaryFile(suffix=ext, delete=False) as t:
+        t.write(dds)
+        src = t.name
     with tempfile.NamedTemporaryFile(suffix=".dds", delete=False) as t:
         dst = t.name
-    im = Image.open(src).convert("RGBA")
-    has_alpha = im.getchannel("A").getextrema()[0] < 255
-    fmt = "dxt5" if (has_alpha or slot_len > 200000) else "dxt1"
-    subprocess.run(["magick", src + "[0]", "-resize", "512x512!",
-                    "-define", "dds:compression=" + fmt, dst],
+    slot = block[WE00_HEAD:]
+    h, w, mips = (struct.unpack_from("<I", slot, o)[0] for o in (DDS_HEIGHT, DDS_WIDTH, DDS_MIPS))
+    fmt = slot[DDS_FOURCC:DDS_FOURCC + 4].decode().lower()
+    subprocess.run(["magick", src + "[0]", "-resize", "%dx%d!" % (w, h),
+                    "-define", "dds:compression=" + fmt, "-define", "dds:mipmaps=%d" % (mips - 1), dst],
                    check=True, capture_output=True)
+    os.unlink(src)
     dds = open(dst, "rb").read()
     os.unlink(dst)
-    if len(dds) != slot_len:
-        raise ValueError("texture payload %d != slot %d" % (len(dds), slot_len))
-    we = bytearray(we)
+    if len(dds) != len(slot):
+        raise ValueError("texture payload %d != slot %d" % (len(dds), len(slot)))
+    if dds[:4] != b"DDS ":
+        raise ValueError("magick did not write a DDS")
+    we = bytearray(block[:WE00_HEAD])
     struct.pack_into("<I", we, 8, len(dds))  # WE00 size field = DDS length
-    return bytes(we) + dds[:32] + b"\x00" * 44 + dds[76:]
+    return bytes(we) + dds[:DDS_TAG_START] + b"\x00" * (DDS_TAG_END - DDS_TAG_START) + dds[DDS_TAG_END:]
 
 
 def split_bin(body):
@@ -206,8 +235,8 @@ def join_bin(ktmdl, tex_blocks):
 # PES14-17 MODEL (pes-model-blender ModelFile, same parser as
 # tools/pes15_to_pes12.py): 0 bones, world-space, Y-up metres.
 def is_model_file(path):
-    with open(path, 'rb') as f:
-        return f.read(6) == b'MODEL\x00'
+    import ktmdl
+    return ktmdl.unwesys(open(path, 'rb').read())[:6] == b'MODEL\x00'
 
 
 def read_model(path):
@@ -217,7 +246,13 @@ def read_model(path):
         'pes_model_file', os.environ.get('PES12_MODEL_FILE', os.path.join(VENDOR, 'ModelFile.py')))
     MF = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(MF)
-    r = MF.readModelFile(path, MF.ParserSettings())
+    import ktmdl
+    with tempfile.NamedTemporaryFile(suffix='.model', delete=False) as t:
+        t.write(ktmdl.unwesys(open(path, 'rb').read()))   # PES14-17 packs ship most .model wrapped
+    try:
+        r = MF.readModelFile(t.name, MF.ParserSettings())
+    finally:
+        os.unlink(t.name)
     m = r[0] if isinstance(r, tuple) else r
     pos, nrm, uv, idx = [], [], [], []
     for x in m.meshes:
@@ -247,6 +282,11 @@ def convert(src_mesh, out_path, template_n=11, texture=None, slot=COLOR_SLOT):
         pos, nrm, uv, idx = read_obj(src_mesh)
     src_r = max(math.sqrt(x * x + y * y + z * z) for x, y, z in pos)
     vb, _sidx, stride = ktmdl_write.packet_mesh(kt, 0)
+    if not os.path.getsize(src_mesh) and not src_mesh.endswith(".obj"):
+        sys.exit("%s: empty source mesh" % src_mesh)
+    if stride != VERTEX_BYTES:
+        sys.exit("template ball %d has %d-byte vertices; pick a %d-byte one (any but 29-31; default 11)"
+                 % (template_n, stride, VERTEX_BYTES))
     stock_max = max(
         math.sqrt(sum(c * c for c in struct.unpack_from("<3f", vb, k * stride)))
         for k in range(len(vb) // stride))
@@ -262,8 +302,7 @@ def convert(src_mesh, out_path, template_n=11, texture=None, slot=COLOR_SLOT):
               "vertices": pack_vertices(pos, nrm, uv, scale),
               "indices": to_strip(tris)}])
     if texture:
-        tex_blocks[slot] = convert_texture(texture, tex_blocks[slot][:16],
-                                           len(tex_blocks[slot]) - 16)
+        tex_blocks[slot] = convert_texture(texture, tex_blocks[slot])
     out = join_bin(new_kt, tex_blocks)
     comp = zlib.compress(out, 9)
     # WESYS csize counts the zlib stream; the stock file then pads the BIN

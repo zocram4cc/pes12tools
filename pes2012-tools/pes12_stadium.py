@@ -5,8 +5,8 @@ install <source>: a PES15/17 stadium folder (common/bg/model/bg/stadium/stNNN:
            its st_*.xml pick the models, the .mtl files resolve each
            material's DiffuseMap; sibling bg/pitch and bg/sky folders are
            imported too), or a PES21 scene .fmdl (textures looked up as .ftex
-           under --textures, an extracted cpk root). The Blender pack builds
-           the same Scene from Blender objects and calls install() directly.
+           under --textures, an extracted cpk root). Editing a slot's stock
+           geometry and textures in Blender: pes2012-blender, stadium slots.
 hide/show: crowd, pitch (the stock pitch base), props = per slot;
            boards, staff = shared entries, i.e. every stadium at once.
 pitch:     an RGBA image over +/-60 x +/-40 m (GF pitch_overlay convention)

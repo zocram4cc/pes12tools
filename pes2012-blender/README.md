@@ -151,6 +151,12 @@ sk_hand_l sk_forearm_l sk_upperarm_l sk_shoulder_l sk_belly sk_chest
 sk_neck sk_head fingers_l fingers_r`. Weights follow PES2012's skin
 shader: slot 0 takes 1 - (w1 + w2 + w3).
 
+## Tutorial
+
+The step-by-step tutorial (install, extract any asset, edit and paint,
+whole stadium slots, custom bodies, a new ball or stadium, testing before
+serving) is the wiki page [**Blender tutorial**](13-blender-tutorial.md).
+
 ## Tests
 
 The tests use **your own** PES2012 install as data (nothing from the game
