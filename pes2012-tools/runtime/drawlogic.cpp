@@ -102,6 +102,13 @@ static const UINT ADBOARD_STRIDE = 48;
 static IDirect3DTexture9* g_adTex = NULL;   // the board sheet (custom\boards\board_0.tex)
 static bool g_adTried = false;              // tried loading this session
 static bool g_declBoard = false;            // the bound declaration is the board face one
+static bool g_declSkinned = false;          // the bound declaration has BLENDINDICES
+static bool declHasUsage(IDirect3DVertexDeclaration9* p, BYTE usage) {
+    D3DVERTEXELEMENT9 el[MAXD3DDECLLENGTH + 1]; UINT ne = 0;
+    if (!p || FAILED(p->GetDeclaration(NULL, &ne)) || ne > MAXD3DDECLLENGTH + 1 || FAILED(p->GetDeclaration(el, &ne))) return false;
+    for (UINT i = 0; i + 1 < ne; i++) if (el[i].Usage == usage) return true;
+    return false;
+}
 static bool isBoardDecl(IDirect3DVertexDeclaration9* p) {
     static const BYTE USAGE[] = { D3DDECLUSAGE_POSITION, D3DDECLUSAGE_NORMAL,
                                   D3DDECLUSAGE_TEXCOORD, D3DDECLUSAGE_TEXCOORD, D3DDECLUSAGE_TEXCOORD };
@@ -229,6 +236,9 @@ static CD_FN g_orgCD = NULL;
 static D3DC9_FN g_realD3DC9 = NULL;
 typedef HRESULT (STDMETHODCALLTYPE *SVSCF_FN)(IDirect3DDevice9*, UINT, const float*, UINT);
 static SVSCF_FN g_orgSVSCF = NULL;
+static SVSCF_FN g_orgSPSCF = NULL;   // SetPixelShaderConstantF, same signature
+static const UINT PSC_N = 224;        // ps_3_0 float constant registers
+static float g_psc[PSC_N][4];
 
 // ---- custom body (tools/fmdl_to_pes12.py PGB1 / tools/pes15_to_pes12.py PGB2) ----
 static const DWORD TEX_MAGIC = 0x31544750;      // 'PGT1'
@@ -342,6 +352,21 @@ static unsigned g_pMask = 0;           // flags\pmask: debug, hide these Part cl
 static float g_hipM[3][4];
 static IDirect3DVertexDeclaration9* g_kitDecl = NULL;
 static IDirect3DVertexShader9* g_kitVS = NULL;
+static IDirect3DPixelShader9* g_kitPS = NULL;   // the kit draw's pixel shader (officials bind it: theirs expects other inputs)
+// The last kit draw's shaders per pass kind ([1] colour, [0] depth/shadow;
+// isColourVS). An official can come before any player in its pass, so he
+// takes the set of his own pass, not simply the last one seen.
+static IDirect3DVertexDeclaration9* g_passDecl[2]; static IDirect3DVertexShader9* g_passVS[2]; static IDirect3DPixelShader9* g_passPS[2];
+// ... and its stages 1-7: the kit pixel shader reads lighting lookups there,
+// which an official's own draw may bind to his textures (01-10: one
+// official lit, the other black with stages 1/2 = his own textures).
+static const int KIT_STAGES = 8;
+static IDirect3DBaseTexture9* g_passStage[2][KIT_STAGES];
+// ... and its VS constants: the kit VS reads lighting outside the bone block,
+// where an official's draw holds his own shader's values (01-10: lit custom
+// materials black on the referee, fine on the linesman; shadeless ones fine).
+static float g_passVSC[2][256][4];
+static float g_passPSC[2][PSC_N][4];   // ... and its PS constants (light colours)
 
 static BYTE* readAll(const wchar_t* path, DWORD* size) {
     HANDLE f = CreateFileW(path, GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, 0, NULL);
@@ -768,17 +793,33 @@ static float nearestExtremity(bool feet, int* model) {
     return best;
 }
 
+static HRESULT drawWithBones(IDirect3DDevice9* d, const float (*c)[4], const char* who);
 static HRESULT drawCustomLod0(IDirect3DDevice9* d) {
     float c[CU_SLOTS * BONE_REGS][4];
     for (UINT k = 0; k < CU_SLOTS; k++)
         for (UINT r = 0; r < BONE_REGS; r++)
             memcpy(c[k * BONE_REGS + r], CU_SRC_PKT[k] == 0 ? g_hipM[r] : g_vsc[BONE_REG0 + CU_SRC_SLOT[k] * BONE_REGS + r], 16);
     noteExtremities(c, MODE_PART_HIDE[g_cuM->flags], MODE_HIDES_SKIN[g_cuM->flags], g_curModel);
+    return drawWithBones(d, c, "player");
+}
+
+// The custom model with the given 21-slot bone block, through the kit run's
+// declaration and vertex shader (captured at the last custom player's hip).
+static HRESULT drawWithBones(IDirect3DDevice9* d, const float (*c)[4], const char* who) {
+    // flags\dumpc = "player" | "official": the next such custom draw writes its
+    // bone block and the game's VS constants to 4cc-players\uploaded_<who>.bin
     if (flagExists(L"dumpc")) {
-        wchar_t p[MAX_PATH]; lstrcpyW(p, FLAGDIR); lstrcatW(p, L"dumpc"); DeleteFileW(p);
-        wchar_t up[MAX_PATH]; HANDLE f = CreateFileW(rootFile(up, L"uploaded.bin"), GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, 0, NULL);
-        DWORD w; WriteFile(f, c, sizeof(c), &w, NULL); WriteFile(f, g_vsc, sizeof(g_vsc), &w, NULL); WriteFile(f, g_hipM, sizeof(g_hipM), &w, NULL); CloseHandle(f);
+        wchar_t p[MAX_PATH]; lstrcpyW(p, FLAGDIR); lstrcatW(p, L"dumpc");
+        char nm[32] = {0}; DWORD r = 0; HANDLE h = CreateFileW(p, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE, NULL, OPEN_EXISTING, 0, NULL);
+        if (h != INVALID_HANDLE_VALUE) { ReadFile(h, nm, 31, &r, NULL); CloseHandle(h); }
+        for (DWORD i = 0; i < r; i++) if (nm[i] < 'a' || nm[i] > 'z') { nm[i] = 0; break; }
+        if (lstrcmpA(nm, who) != 0) goto draw;
+        DeleteFileW(p);
+        wchar_t up[MAX_PATH]; wsprintfW(up, L"%suploaded_%S.bin", g_root, nm);
+        HANDLE f = CreateFileW(up, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, 0, NULL);
+        DWORD w; WriteFile(f, c, CU_SLOTS * BONE_REGS * 16, &w, NULL); WriteFile(f, g_vsc, sizeof(g_vsc), &w, NULL); CloseHandle(f);
     }
+draw:
     float keep[CU_SLOTS * BONE_REGS][4];
     memcpy(keep, g_vsc[BONE_REG0], sizeof(keep));
     IDirect3DVertexDeclaration9* keepDecl = NULL; IDirect3DVertexShader9* keepVS = NULL;
@@ -790,6 +831,47 @@ static HRESULT drawCustomLod0(IDirect3DDevice9* d) {
     d->SetVertexDeclaration(keepDecl); d->SetVertexShader(keepVS);
     if (keepDecl) keepDecl->Release(); if (keepVS) keepVS->Release();
     return hr;
+}
+
+// An official's draw carries all 19 body bones in the block-1 palette order;
+// OFFICIAL_SLOT (tools/pes12_rig.py) puts them in the custom rig's order. The
+// rig has no finger bones, so the two finger slots follow the hands. The kit
+// pieces wear the model's own team's sheet (hiKit, full resolution).
+static const UINT CU_SLOT_FINGER_L = 19, CU_SLOT_FINGER_R = 20;   // kitmap.h: children of hand_l / hand_r
+static const wchar_t* OFFICIAL_KIT_SLOT = L"pa";   // ponytail: test kit, owner picks the officials' kit
+static bool drawOfficial(IDirect3DDevice9* d) {
+    float c[CU_SLOTS * BONE_REGS][4];
+    for (UINT k = 0; k < CU_SLOTS; k++) {
+        UINT src = k < sizeof(OFFICIAL_SLOT) / sizeof(OFFICIAL_SLOT[0]) ? OFFICIAL_SLOT[k]
+                 : OFFICIAL_SLOT[k == CU_SLOT_FINGER_L ? SLOT_HAND_L : SLOT_HAND_R];
+        for (UINT r = 0; r < BONE_REGS; r++) memcpy(c[k * BONE_REGS + r], g_vsc[BONE_REG0 + src * BONE_REGS + r], 16);
+    }
+    bool ok = g_runKitOk; int tid = g_runTid; const wchar_t* slot = g_runSlot; IDirect3DBaseTexture9* kt = g_runKitTex;
+    g_runKitOk = true; g_runTid = modelTeam(*g_cuM); g_runSlot = OFFICIAL_KIT_SLOT; g_runKitTex = g_tex0;
+    IDirect3DVertexShader9* ownVS = NULL; d->GetVertexShader(&ownVS);
+    int pass = isColourVS(ownVS) ? 1 : 0;
+    if (ownVS) ownVS->Release();
+    if (!g_passDecl[pass] || !g_passVS[pass]) { g_runKitOk = ok; g_runTid = tid; g_runSlot = slot; g_runKitTex = kt; return false; }
+    IDirect3DVertexDeclaration9* kd = g_kitDecl; IDirect3DVertexShader9* kv = g_kitVS;
+    g_kitDecl = g_passDecl[pass]; g_kitVS = g_passVS[pass];
+    IDirect3DPixelShader9* keepPS = NULL; d->GetPixelShader(&keepPS);
+    if (g_passPS[pass]) d->SetPixelShader(g_passPS[pass]);
+    IDirect3DBaseTexture9* keepStage[KIT_STAGES];
+    for (int st = 1; st < KIT_STAGES; st++) { keepStage[st] = g_texStage[st]; g_orgSTEX(d, st, g_passStage[pass][st]); }
+    const UINT BONE_END = BONE_REG0 + CU_SLOTS * BONE_REGS, VSC_N = 256;
+    g_orgSVSCF(d, 0, &g_passVSC[pass][0][0], BONE_REG0);
+    g_orgSVSCF(d, BONE_END, &g_passVSC[pass][BONE_END][0], VSC_N - BONE_END);
+    float keepPSC[PSC_N][4]; memcpy(keepPSC, g_psc, sizeof(g_psc));
+    g_orgSPSCF(d, 0, &g_passPSC[pass][0][0], PSC_N);
+    HRESULT hr = drawWithBones(d, c, "official");
+    g_orgSPSCF(d, 0, &keepPSC[0][0], PSC_N); memcpy(g_psc, keepPSC, sizeof(g_psc));
+    g_orgSVSCF(d, 0, &g_vsc[0][0], BONE_REG0);
+    g_orgSVSCF(d, BONE_END, &g_vsc[BONE_END][0], VSC_N - BONE_END);
+    for (int st = 1; st < KIT_STAGES; st++) g_orgSTEX(d, st, keepStage[st]);
+    d->SetPixelShader(keepPS); if (keepPS) keepPS->Release();
+    g_kitDecl = kd; g_kitVS = kv;
+    g_runKitOk = ok; g_runTid = tid; g_runSlot = slot; g_runKitTex = kt;
+    return SUCCEEDED(hr);
 }
 
 // flags\shaderdump: write every distinct vertex/pixel shader pair bound at
@@ -1004,7 +1086,7 @@ static HRESULT STDMETHODCALLTYPE mySSS(IDirect3DDevice9* d, UINT s,
     return g_orgSSS(d, s, vb, off, st);
 }
 static HRESULT STDMETHODCALLTYPE mySVD(IDirect3DDevice9* d, IDirect3DVertexDeclaration9* p) {
-    g_decl = p; g_declBoard = isBoardDecl(p);
+    g_decl = p; g_declBoard = isBoardDecl(p); g_declSkinned = declHasUsage(p, D3DDECLUSAGE_BLENDINDICES);
     return g_orgSVD(d, p);
 }
 static HRESULT STDMETHODCALLTYPE mySFVF(IDirect3DDevice9* d, DWORD f) {
@@ -1019,6 +1101,10 @@ static HRESULT STDMETHODCALLTYPE mySTEX(IDirect3DDevice9* d, DWORD s, IDirect3DB
     if (s == 0) g_tex0 = t;
     if (s < 8) g_texStage[s] = t;
     return g_orgSTEX(d, s, t);
+}
+static HRESULT STDMETHODCALLTYPE mySPSCF(IDirect3DDevice9* d, UINT r, const float* v, UINT n) {
+    if (r < PSC_N) memcpy(g_psc[r], v, ((r + n > PSC_N) ? PSC_N - r : n) * 16);
+    return g_orgSPSCF(d, r, v, n);
 }
 static HRESULT STDMETHODCALLTYPE mySVSCF(IDirect3DDevice9* d, UINT r, const float* v, UINT n) {
     if (r < 256) {
@@ -1099,6 +1185,10 @@ static UINT g_texDumpNV = 0;
 // flags\hidenv: "<nV>" skips every draw with that vertex count; draw indices
 // shift between frames, a signature does not (debug, finding characters).
 static UINT g_hideNV = 0;
+// flags\officialpid: "<pid>" draws that custom model on every official (test;
+// per-match assignment pending). 0 / absent = stock officials.
+static UINT g_officialPid = 0;
+static const int OFFICIAL_HEAD_DRAWS = 2;   // head + hair after each official (01-10 kickoff log)
 static bool g_texDumpArmed = false;     // dumps run for exactly one full frame
 static IDirect3DBaseTexture9* g_texDumped[MAX_TEXDUMPS]; static int g_nTexDumped = 0;
 static void dumpStageTextures(UINT nV, UINT nP, LONG di) {
@@ -1162,14 +1252,24 @@ static HRESULT STDMETHODCALLTYPE myDIP(IDirect3DDevice9* d, D3DPRIMITIVETYPE t,
     if (g_texDumpArmed && (nV == g_texDumpNV || g_texDumpNV == TEXDUMP_ALL)) dumpStageTextures(nV, nP, di);
     if (di >= g_hrLo && di < g_hrHi) return D3D_OK;
     if (g_hideNV && nV == g_hideNV) return D3D_OK;   // flags\hidenv (debug)
-    {   // LOG-ONLY: officials (dt09 #349 block 1 model) by their vertex buffer's size
-        static int after = 0;
-        D3DVERTEXBUFFER_DESC vd; bool off = g_vb && SUCCEEDED(g_vb->GetDesc(&vd)) && vd.Size == OFFICIAL_VB_BYTES;
-        if ((off || after > 0) && g_frame % 300 == 0) {
-            char m[128]; wsprintfA(m, "official%s draw %d %u/%u/%u vb=%08x size=%u off=%u", off ? "" : " +next", (int)di, nV, nP, g_stride, (DWORD)g_vb, off ? vd.Size : 0, g_vbOff);
-            logline(m);
+    {   // Officials: the dt09 #349 block 1 model, recognised by its vertex buffer.
+        // One official = consecutive draws from that buffer, then his head and
+        // hair (2 skinned draws from his own head buffer; 01-10 kickoff log).
+        static bool open = false, drawn = false; static int headLeft = 0;
+        D3DVERTEXBUFFER_DESC vd;
+        bool off = g_vb && SUCCEEDED(g_vb->GetDesc(&vd)) && vd.Size == OFFICIAL_VB_BYTES;
+        if (off) {
+            if (!open) {
+                open = true;
+                drawn = g_officialPid > 0 && g_kitDecl && g_kitVS && useModel(d, g_officialPid) && drawOfficial(d);
+            }
+            if (drawn) return D3D_OK;
+        } else if (open) {
+            open = false;
+            headLeft = drawn ? OFFICIAL_HEAD_DRAWS : 0;
+            drawn = false;
         }
-        after = off ? 2 : (after > 0 ? after - 1 : 0);
+        if (headLeft > 0) { headLeft--; if (g_declSkinned) return D3D_OK; headLeft = 0; }
     }
     // previous draw = the face when this one is a kit packet 5
     static IDirect3DVertexBuffer9* lastVB = NULL; static UINT lastOff = 0, lastSt = 0, lastFirst = 0, lastNV = 0;
@@ -1229,8 +1329,17 @@ static HRESULT STDMETHODCALLTYPE myDIP(IDirect3DDevice9* d, D3DPRIMITIVETYPE t,
         g_curModel = g_pendingModel; g_pendingModel = -1;
         if (g_curModel >= 0) {
             memcpy(g_hipM, g_vsc[BONE_REG0 + CU_SRC_SLOT[2] * BONE_REGS], sizeof(g_hipM));
-            if (g_kitDecl) g_kitDecl->Release(); if (g_kitVS) g_kitVS->Release();
-            d->GetVertexDeclaration(&g_kitDecl); d->GetVertexShader(&g_kitVS);
+            if (g_kitDecl) g_kitDecl->Release(); if (g_kitVS) g_kitVS->Release(); if (g_kitPS) g_kitPS->Release();
+            d->GetVertexDeclaration(&g_kitDecl); d->GetVertexShader(&g_kitVS); d->GetPixelShader(&g_kitPS);
+            {   int k = isColourVS(g_kitVS) ? 1 : 0;
+                if (g_passDecl[k]) g_passDecl[k]->Release(); if (g_passVS[k]) g_passVS[k]->Release(); if (g_passPS[k]) g_passPS[k]->Release();
+                g_passDecl[k] = g_kitDecl; g_passVS[k] = g_kitVS; g_passPS[k] = g_kitPS;
+                if (g_kitDecl) g_kitDecl->AddRef(); if (g_kitVS) g_kitVS->AddRef(); if (g_kitPS) g_kitPS->AddRef();
+                memcpy(g_passVSC[k], g_vsc, sizeof(g_vsc)); memcpy(g_passPSC[k], g_psc, sizeof(g_psc));
+                for (int st = 1; st < KIT_STAGES; st++) {
+                    if (g_passStage[k][st]) g_passStage[k][st]->Release();
+                    g_passStage[k][st] = g_texStage[st]; if (g_texStage[st]) g_texStage[st]->AddRef();
+                } }
             if (useModel(d, g_curModel)) patchKit(modelTeam(*g_cuM), g_tex0);
         }
         g_runKitOk = kitOfSheet(g_tex0, g_runTid, g_runSlot);
@@ -1365,6 +1474,7 @@ extern "C" __declspec(dllexport) void logic_present(IDirect3DDevice9* d) {
         g_bodyHide = readFlagInt(L"bodyhide", 0);
         g_pMask = readFlagInt(L"pmask", 0);
         g_hideNV = readFlagInt(L"hidenv", 0);
+        g_officialPid = readFlagInt(L"officialpid", 0);
         g_runLog = flagExists(L"runlog");
         if (g_runLog) { wchar_t p[MAX_PATH]; lstrcpyW(p, FLAGDIR); lstrcatW(p, L"runlog"); DeleteFileW(p); }
         readRange(L"hr", &g_hrLo, &g_hrHi);
@@ -1450,7 +1560,11 @@ extern "C" __declspec(dllexport) void logic_uninstall() {
     for (int i = g_nsaved - 1; i >= 0; i--) { void* dummy = NULL; hookV(vt, g_saved[i].idx, g_saved[i].org, &dummy); }
     g_nsaved = 0;
     if (g_swapVB) { g_swapVB->Release(); g_swapVB = NULL; }
-    if (g_kitDecl) g_kitDecl->Release(); if (g_kitVS) g_kitVS->Release(); g_kitDecl = NULL; g_kitVS = NULL;
+    if (g_kitDecl) g_kitDecl->Release(); if (g_kitVS) g_kitVS->Release(); if (g_kitPS) g_kitPS->Release(); g_kitDecl = NULL; g_kitVS = NULL; g_kitPS = NULL;
+    for (int k = 0; k < 2; k++) {
+        if (g_passDecl[k]) g_passDecl[k]->Release(); if (g_passVS[k]) g_passVS[k]->Release(); if (g_passPS[k]) g_passPS[k]->Release(); g_passDecl[k] = NULL; g_passVS[k] = NULL; g_passPS[k] = NULL;
+        for (int st = 1; st < KIT_STAGES; st++) { if (g_passStage[k][st]) g_passStage[k][st]->Release(); g_passStage[k][st] = NULL; }
+    }
     for (int i = 0; i < g_nmodels; i++) releaseModel(g_models[i]);
     g_nmodels = 0;
     releaseModel(g_default); memset(&g_default, 0, sizeof(g_default)); g_cuM = NULL;
@@ -1473,6 +1587,7 @@ extern "C" __declspec(dllexport) void logic_install(IDirect3DDevice9* dev) {
     hookS(vt, 65, (void*)mySTEX, (void**)&g_orgSTEX);  // SetTexture
     g_orgRS = (RS_FN)vt[57]; // SetRenderState: read only, NEVER write
     hookS(vt, 94, (void*)mySVSCF, (void**)&g_orgSVSCF); // SetVertexShaderConstantF
+    hookS(vt, 109, (void*)mySPSCF, (void**)&g_orgSPSCF); // SetPixelShaderConstantF
     hookS(vt, 82, (void*)myDIP, (void**)&g_orgDIP);    // DrawIndexedPrimitive
     logline("logic installed");
 }
