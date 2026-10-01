@@ -1095,6 +1095,9 @@ static void grabDraw(IDirect3DDevice9* d, D3DPRIMITIVETYPE t, INT bV, UINT mV,
 static const UINT TEXDUMP_ALL = 1;      // no real draw has a single vertex
 static const int MAX_TEXDUMPS = 1024;   // distinct textures per dump frame
 static UINT g_texDumpNV = 0;
+// flags\hidenv: "<nV>" skips every draw with that vertex count; draw indices
+// shift between frames, a signature does not (debug, finding characters).
+static UINT g_hideNV = 0;
 static bool g_texDumpArmed = false;     // dumps run for exactly one full frame
 static IDirect3DBaseTexture9* g_texDumped[MAX_TEXDUMPS]; static int g_nTexDumped = 0;
 static void dumpStageTextures(UINT nV, UINT nP, LONG di) {
@@ -1157,6 +1160,7 @@ static HRESULT STDMETHODCALLTYPE myDIP(IDirect3DDevice9* d, D3DPRIMITIVETYPE t,
     LONG di = g_drawIdx++;
     if (g_texDumpArmed && (nV == g_texDumpNV || g_texDumpNV == TEXDUMP_ALL)) dumpStageTextures(nV, nP, di);
     if (di >= g_hrLo && di < g_hrHi) return D3D_OK;
+    if (g_hideNV && nV == g_hideNV) return D3D_OK;   // flags\hidenv (debug)
     // previous draw = the face when this one is a kit packet 5
     static IDirect3DVertexBuffer9* lastVB = NULL; static UINT lastOff = 0, lastSt = 0, lastFirst = 0, lastNV = 0;
     static IDirect3DBaseTexture9* lastTex = NULL; g_prevTex = lastTex; lastTex = g_tex0;
@@ -1350,6 +1354,7 @@ extern "C" __declspec(dllexport) void logic_present(IDirect3DDevice9* d) {
         g_hideMask = readFlagInt(L"hide", 0);
         g_bodyHide = readFlagInt(L"bodyhide", 0);
         g_pMask = readFlagInt(L"pmask", 0);
+        g_hideNV = readFlagInt(L"hidenv", 0);
         g_runLog = flagExists(L"runlog");
         if (g_runLog) { wchar_t p[MAX_PATH]; lstrcpyW(p, FLAGDIR); lstrcatW(p, L"runlog"); DeleteFileW(p); }
         readRange(L"hr", &g_hrLo, &g_hrHi);
