@@ -24,10 +24,11 @@ kitserver 12's afs2fs override folder, `kitserver/4cc-dlc`.
 
    (`img.dir = "4cc-dlc"` must be the LAST `img.dir` line; later roots win.)
 3. Run `kitserver/manager.exe`, select `pes2012.exe`, click Install.
-4. Delete `Documents/KONAMI/Pro Evolution Soccer 2012/save/EDIT.bin` if you
-   have one from before: the game reads players and teams from the save
-   once one exists, which would hide the 4cc teams. Use the 4cc EDIT.bin
-   for the tournament instead, or make one with the editor.
+4. A save `Documents/KONAMI/Pro Evolution Soccer 2012/save/EDIT.bin` made
+   before the install shadows the base DB and hides the 4cc teams: delete
+   it, or replace it with the 4cc one. The game does not create a save on
+   its own (in game, 01-10), so a new install needs one from the cup pack
+   or from another PES2012 install before squads can be imported.
 
 ## Uninstall
 
