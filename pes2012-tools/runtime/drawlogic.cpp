@@ -1354,12 +1354,13 @@ static HRESULT STDMETHODCALLTYPE myDIP(IDirect3DDevice9* d, D3DPRIMITIVETYPE t,
             }
             if (hideBody) return D3D_OK;
         } else if (open) {
-            open = false; headLeft = 0; g_offRun++;
+            open = false; headLeft = 0;
             if (g_declSkinned && (g_officialPid > 0 || g_nPool > 0)) {
                 LONG pid = officialPid(g_vb);
                 if (g_offRun < MAX_OFFICIALS_RUNS) g_runPidCur[g_offRun] = pid;
                 if (pid > 0 && useModel(d, pid) && drawOfficial(d, bones)) headLeft = OFFICIAL_HEAD_DRAWS;
             }
+            g_offRun++;
         }
         if (headLeft > 0) { headLeft--; if (g_declSkinned) return D3D_OK; headLeft = 0; }
     }
