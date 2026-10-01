@@ -846,8 +846,9 @@ static const UINT CU_SLOT_FINGER_L = 19, CU_SLOT_FINGER_R = 20;   // kitmap.h: c
 // written by tools/pes12_import_referees.py (OFFICIALS_TID there too); kits
 // custom\kits\<OFFICIALS_TID>\r<n>_hi.dds. Per match each official (keyed by
 // his head vertex buffer) gets a random referee and all of them one random
-// kit; a match ends when no official has drawn for OFFICIAL_FORGET_FRAMES
-// (the menus between matches draw none).
+// kit. A new match = the game creating an officials' vertex buffer
+// (match load builds the officials' models; replays and camera cuts reuse
+// them). The earlier frame-gap rule re-rolled the referees mid-replay (01-10).
 static const int MAX_POOL = 99, MAX_OFFICIALS = 8, MAX_REF_KITS = 9, MAX_OFFICIALS_RUNS = 8;
 static const int OFFICIALS_TID = 999;
 // A model reaching below the knee is a whole figure even when the converter
@@ -862,13 +863,13 @@ static UINT g_officialPid = 0;
 // run k of this frame -> the pid it resolved to; the body draws (before the
 // head names the official) use last frame's to keep or hide the stock body.
 static LONG g_runPidPrev[MAX_OFFICIALS_RUNS], g_runPidCur[MAX_OFFICIALS_RUNS]; static int g_offRun = 0;
-static const LONG OFFICIAL_FORGET_FRAMES = 600;   // 10 s at 60 fps; ponytail: provisional, a real match-start hook if a half-time screen proves longer
+static volatile LONG g_offNewMatch = 1;          // set by myCVB at match load; 1: first use
 static const wchar_t* REF_KIT_SLOTS[MAX_REF_KITS] = { L"r1", L"r2", L"r3", L"r4", L"r5", L"r6", L"r7", L"r8", L"r9" };
 static LONG g_pool[MAX_POOL]; static int g_nPool = -1;      // -1: not probed yet
 static int g_nRefKits = 0;
 struct OfficialSlot { IDirect3DVertexBuffer9* head; LONG pid; };
 static OfficialSlot g_offTab[MAX_OFFICIALS]; static int g_nOff = 0;
-static const wchar_t* g_refKit = NULL; static LONG g_offLast = -1; static DWORD g_rng = 1;
+static const wchar_t* g_refKit = NULL; static DWORD g_rng = 1;
 static DWORD nextRand() { g_rng = g_rng * 1103515245u + 12345u; return g_rng >> 16; }
 static void probePool() {
     g_nPool = 0;
@@ -888,11 +889,10 @@ static LONG officialPid(IDirect3DVertexBuffer9* head) {
     if (g_officialPid > 0) return g_officialPid;               // flags\officialpid test override
     if (g_nPool < 0) probePool();
     if (g_nPool == 0) return -1;
-    if (g_offLast < 0 || g_frame - g_offLast > OFFICIAL_FORGET_FRAMES) {   // a new match
+    if (InterlockedExchange(&g_offNewMatch, 0)) {   // a new match
         g_nOff = 0; g_rng = GetTickCount() | 1;
         g_refKit = g_nRefKits ? REF_KIT_SLOTS[nextRand() % g_nRefKits] : NULL;
     }
-    g_offLast = g_frame;
     for (int i = 0; i < g_nOff; i++) if (g_offTab[i].head == head) return g_offTab[i].pid;
     if (g_nOff == MAX_OFFICIALS) return -1;
     LONG pid;
@@ -1698,6 +1698,18 @@ extern "C" __declspec(dllexport) void logic_present(IDirect3DDevice9* d) {
 
 struct Saved { int idx; void* org; };
 static Saved g_saved[16]; static int g_nsaved = 0;
+typedef HRESULT (STDMETHODCALLTYPE *CVB_FN)(IDirect3DDevice9*, UINT, DWORD, DWORD, D3DPOOL, IDirect3DVertexBuffer9**, HANDLE*);
+static CVB_FN g_orgCVB = NULL;
+static HRESULT STDMETHODCALLTYPE myCVB(IDirect3DDevice9* d, UINT len, DWORD usage, DWORD fvf, D3DPOOL pool,
+                                       IDirect3DVertexBuffer9** vb, HANDLE* sh) {
+    bool farVB = len >= OFFICIAL_VB_LO && len < OFFICIAL_VB_HI, closeVB = len >= CLOSE_VB_LO && len < CLOSE_VB_HI;
+    if (farVB || closeVB) {
+        InterlockedExchange(&g_offNewMatch, 1);
+        char m[96]; wsprintfA(m, "officials: match load (%s model VB, %u bytes, frame %d)", farVB ? "far" : "close", len, (int)g_frame);
+        logline(m);
+    }
+    return g_orgCVB(d, len, usage, fvf, pool, vb, sh);
+}
 static void hookS(void** vt, int idx, void* fn, void** org) {
     g_saved[g_nsaved].idx = idx; g_saved[g_nsaved].org = vt[idx]; g_nsaved++;
     *org = NULL; hookV(vt, idx, fn, org);
@@ -1736,6 +1748,7 @@ extern "C" __declspec(dllexport) void logic_install(IDirect3DDevice9* dev) {
     hookS(vt, 94, (void*)mySVSCF, (void**)&g_orgSVSCF); // SetVertexShaderConstantF
     hookS(vt, 109, (void*)mySPSCF, (void**)&g_orgSPSCF); // SetPixelShaderConstantF
     hookS(vt, 82, (void*)myDIP, (void**)&g_orgDIP);    // DrawIndexedPrimitive
+    hookS(vt, 26, (void*)myCVB, (void**)&g_orgCVB);    // CreateVertexBuffer
     logline("logic installed");
 }
 
