@@ -77,11 +77,22 @@ faces and markers in the GDB. See the script's docstring for every option.
 After reinstalling a team's kits, restart the game: it keeps the old kit
 sheets in memory across matches.
 
-## Balls and stadiums
+## Referees
+
+```sh
+python3 pes12_import_referees.py <PES2015 download/4cc_35_referees.cpk> <game>
+```
+
+Converts the pack's referees and kits into `custom/p2999NN` and
+`custom/kits/999/`; the runtime puts a random referee on every official, per
+match. Needs the `lod.ref.*` pins below.
+
+## Balls, stadiums, adboards
 
 ```sh
 python3 pes12_ball.py ...      # see its docstring
 python3 pes12_stadium.py ...   # see its docstring
+python3 pes12_adboards.py <game> ad1.png [ad2.png ...]   # pitch-side ads; --off = stock
 ```
 
 ## Runtime

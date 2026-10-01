@@ -332,6 +332,7 @@ struct CustomModel {
     CustomSub sub[MAX_SUBS]; UINT nsub;
     UINT nv, ni, stride; DWORD flags; bool tried;
     LONG pid, lastUsed;                          // resident-cache key, frame of last use
+    float minY;                                  // lowest vertex (m): does it stand on its own
 };
 // Bodies are keyed by player id (the face marker IS the pid, tools/mark_face.py)
 // and hot-loaded from custom\p<pid>\ on first draw; the cache holds this many
@@ -672,6 +673,8 @@ static bool loadModel(IDirect3DDevice9* d, CustomModel& M, const wchar_t* dir) {
     bool ok = SUCCEEDED(d->CreateVertexBuffer(vlen, D3DUSAGE_WRITEONLY, 0, D3DPOOL_MANAGED, &M.vb, NULL))
            && SUCCEEDED(d->CreateIndexBuffer(ilen, D3DUSAGE_WRITEONLY, v2 ? D3DFMT_INDEX32 : D3DFMT_INDEX16, D3DPOOL_MANAGED, &M.ib, NULL));
     if (ok && SUCCEEDED(M.vb->Lock(0, vlen, &p, 0))) { memcpy(p, at, vlen); M.vb->Unlock(); }
+    M.minY = 1e9f;   // POSITION is the vertex's first 3 floats (PGB2, pgb2.VERT_FMT)
+    if (ok) for (UINT i = 0; i < M.nv; i++) { float y = *(const float*)(at + i * M.stride + sizeof(float)); if (y < M.minY) M.minY = y; }
     if (ok && SUCCEEDED(M.ib->Lock(0, ilen, &p, 0))) { memcpy(p, at + vlen, ilen); M.ib->Unlock(); }
     HeapFree(GetProcessHeap(), 0, b);
     M.ntex = 0;
@@ -846,6 +849,13 @@ static const UINT CU_SLOT_FINGER_L = 19, CU_SLOT_FINGER_R = 20;   // kitmap.h: c
 // (the menus between matches draw none).
 static const int MAX_POOL = 99, MAX_OFFICIALS = 8, MAX_REF_KITS = 9, MAX_OFFICIALS_RUNS = 8;
 static const int OFFICIALS_TID = 999;
+// A model reaching below the knee is a whole figure even when the converter
+// calls it "head" (PES15 "parts" referees like Tesla, y -0.17..2.62): the
+// stock official body under it is PES12's, bulkier than the PES15 body the
+// model was built on, and shows through (seen 01-10). Face packs (referee025,
+// y 1.30..1.73) keep the stock body. ponytail: knee-height heuristic, a
+// per-referee flag from the pack if one turns up.
+static const float OFFICIAL_FULL_FIGURE_FOOT_M = 0.5f;
 // flags\officialpid: "<pid>" puts that model on every official (test override).
 static UINT g_officialPid = 0;
 // run k of this frame -> the pid it resolved to; the body draws (before the
@@ -1350,7 +1360,7 @@ static HRESULT STDMETHODCALLTYPE myDIP(IDirect3DDevice9* d, D3DPRIMITIVETYPE t,
                 LONG guess = g_offRun < MAX_OFFICIALS_RUNS ? g_runPidPrev[g_offRun] : -1;
                 if (g_officialPid > 0) guess = g_officialPid;
                 hideBody = (g_officialPid > 0 || g_nPool > 0) && g_passVS[1] &&
-                           (guess <= 0 || (useModel(d, guess) && g_cuM->flags == MODE_BODY));
+                           (guess <= 0 || (useModel(d, guess) && (g_cuM->flags == MODE_BODY || g_cuM->minY < OFFICIAL_FULL_FIGURE_FOOT_M)));
             }
             if (hideBody) return D3D_OK;
         } else if (open) {
