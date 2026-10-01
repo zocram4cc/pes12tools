@@ -96,6 +96,39 @@ Shadeless pixel shaders are `runtime/custom_ps.hlsl`, compiled into
 `custom_ps.h` by `runtime/build_shaders.sh` (vkd3d-compiler); rerun it after
 editing the HLSL, before `build.sh`.
 
+The runtime needs kitserver's `lodmixer` (`dll = lodmixer` in `[kload]`)
+pinning players and officials to their full-detail model; lower LODs are
+other meshes the runtime does not replace. In `kitserver/config.txt`:
+
+```ini
+[lodmixer]
+lod.players.entrance.s1 = 0.001
+lod.players.entrance.s2 = 0.001
+lod.players.entrance.s3 = 0.001
+lod.players.inplay.s1 = 0.001
+lod.players.inplay.s2 = 0.001
+lod.players.inplay.s3 = 0.001
+lod.players.misc.s1 = 0.001
+lod.players.misc.s2 = 0.001
+lod.players.misc.s3 = 0.001
+lod.players.replay.s1 = 0.001
+lod.players.replay.s2 = 0.001
+lod.players.replay.s3 = 0.001
+lod.active.player.ck.s1 = 0.001
+lod.active.player.ck.s2 = 0.001
+lod.active.player.ck.s3 = 0.001
+lod.active.player.fk.s1 = 0.001
+lod.active.player.fk.s2 = 0.001
+lod.active.player.fk.s3 = 0.001
+lod.ref.inplay = 0.001
+lod.ref.replay = 0.001
+```
+
+Values at or below 0.0001 are ignored by lodmixer; 0.001 never steps down.
+`runtime/officialmap.h` (the officials' model against the custom rig) is
+generated from your game by `pes12_rig.py <game dir>`; rebuild the runtime
+after regenerating it.
+
 ## Paths
 
 Every path is an argument or relative to the package: `PES12_GAME`

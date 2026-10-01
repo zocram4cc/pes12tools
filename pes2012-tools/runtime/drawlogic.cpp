@@ -12,6 +12,7 @@
 #include <d3d9.h>
 #include <math.h>
 #include "kitmap.h"
+#include "officialmap.h"   // tools/pes12_rig.py: OFFICIAL_SLOT, OFFICIAL_VB_BYTES
 #include "custom_ps.h"
 
 // Paths hang off drawhook's root (<kitserver>\4cc-players\, drawhook.cpp initRoot).
@@ -1161,6 +1162,15 @@ static HRESULT STDMETHODCALLTYPE myDIP(IDirect3DDevice9* d, D3DPRIMITIVETYPE t,
     if (g_texDumpArmed && (nV == g_texDumpNV || g_texDumpNV == TEXDUMP_ALL)) dumpStageTextures(nV, nP, di);
     if (di >= g_hrLo && di < g_hrHi) return D3D_OK;
     if (g_hideNV && nV == g_hideNV) return D3D_OK;   // flags\hidenv (debug)
+    {   // LOG-ONLY: officials (dt09 #349 block 1 model) by their vertex buffer's size
+        static int after = 0;
+        D3DVERTEXBUFFER_DESC vd; bool off = g_vb && SUCCEEDED(g_vb->GetDesc(&vd)) && vd.Size == OFFICIAL_VB_BYTES;
+        if ((off || after > 0) && g_frame % 300 == 0) {
+            char m[128]; wsprintfA(m, "official%s draw %d %u/%u/%u vb=%08x size=%u off=%u", off ? "" : " +next", (int)di, nV, nP, g_stride, (DWORD)g_vb, off ? vd.Size : 0, g_vbOff);
+            logline(m);
+        }
+        after = off ? 2 : (after > 0 ? after - 1 : 0);
+    }
     // previous draw = the face when this one is a kit packet 5
     static IDirect3DVertexBuffer9* lastVB = NULL; static UINT lastOff = 0, lastSt = 0, lastFirst = 0, lastNV = 0;
     static IDirect3DBaseTexture9* lastTex = NULL; g_prevTex = lastTex; lastTex = g_tex0;
