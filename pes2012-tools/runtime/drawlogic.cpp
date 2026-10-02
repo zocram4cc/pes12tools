@@ -1400,6 +1400,66 @@ static HRESULT STDMETHODCALLTYPE mySVSCF(IDirect3DDevice9* d, UINT r, const floa
 }
 
 #include "kitforce.h"
+// The skin draw carries bare hands of its own (stride 76, body bind, the hand
+// from the wrist joint out: palette slots 9/10 and 17/18, the forearm 8/16,
+// 02-10 grab). A model that keeps the skin but not the stock hands (its own
+// hands, e.g. a gloveL/gloveR part) gets the skin minus every triangle past
+// the wrist (Green Is My Pepper: stock palms over his green hands, owner).
+// Per distinct draw, an index list of the other triangles.
+static const int MAX_SKIN_CUTS = 64;
+struct SkinCut { IDirect3DVertexBuffer9* vb; UINT off, first, nv; IDirect3DIndexBuffer9* ib; UINT si, np; D3DPRIMITIVETYPE t; IDirect3DIndexBuffer9* cut; UINT ntris; };
+static SkinCut g_skinCut[MAX_SKIN_CUTS]; static int g_nSkinCut = 0;
+static IDirect3DIndexBuffer9* skinWithoutHands(D3DPRIMITIVETYPE t, INT bV, UINT mV, UINT nV, UINT sI, UINT nP) {
+    UINT first = (UINT)(bV + (INT)mV);
+    for (int i = 0; i < g_nSkinCut; i++) {
+        SkinCut& c = g_skinCut[i];
+        if (c.vb == g_vb && c.off == g_vbOff && c.first == first && c.nv == nV && c.ib == g_ib && c.si == sI && c.np == nP && c.t == t)
+            return c.cut;
+    }
+    if (g_nSkinCut >= MAX_SKIN_CUTS || !g_vb || !g_ib || (t != D3DPT_TRIANGLESTRIP && t != D3DPT_TRIANGLELIST)) return NULL;
+    SkinCut& c = g_skinCut[g_nSkinCut++]; memset(&c, 0, sizeof(c));
+    c.vb = g_vb; c.off = g_vbOff; c.first = first; c.nv = nV; c.ib = g_ib; c.si = sI; c.np = nP; c.t = t;
+    D3DINDEXBUFFER_DESC id; if (FAILED(g_ib->GetDesc(&id))) return NULL;
+    UINT isz = id.Format == D3DFMT_INDEX32 ? 4 : 2, nIdx = t == D3DPT_TRIANGLESTRIP ? nP + 2 : nP * 3;
+    void* vp = NULL; void* ip = NULL;
+    BYTE* hand = (BYTE*)HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY, nV);
+    if (SUCCEEDED(g_vb->Lock(g_vbOff + first * g_stride, nV * g_stride, &vp, D3DLOCK_READONLY)) && vp) {
+        for (UINT v = 0; v < nV; v++) hand[v] = fabsf(*(const float*)((const BYTE*)vp + v * g_stride)) >= HAND_BIND_L[0];   // the wrist joint's |x|
+        g_vb->Unlock();
+    }
+    UINT* out = (UINT*)HeapAlloc(GetProcessHeap(), 0, nIdx * 3 * sizeof(UINT) + sizeof(UINT));
+    UINT n = 0;
+    if (SUCCEEDED(g_ib->Lock(sI * isz, nIdx * isz, &ip, D3DLOCK_READONLY)) && ip) {
+        for (UINT k = 0; k + 2 < nIdx || (t == D3DPT_TRIANGLELIST && k < nIdx); ) {
+            UINT a, b, d3;
+            UINT i0 = isz == 4 ? ((UINT*)ip)[k] : ((WORD*)ip)[k], i1 = isz == 4 ? ((UINT*)ip)[k + 1] : ((WORD*)ip)[k + 1], i2 = isz == 4 ? ((UINT*)ip)[k + 2] : ((WORD*)ip)[k + 2];
+            if (t == D3DPT_TRIANGLESTRIP) { a = i0; b = i1; d3 = i2; if (k & 1) { UINT x = a; a = b; b = x; } k++; }
+            else { a = i0; b = i1; d3 = i2; k += 3; }
+            if (a == b || b == d3 || a == d3) continue;
+            bool in = a >= mV && b >= mV && d3 >= mV && a < mV + nV && b < mV + nV && d3 < mV + nV;
+            if (in && hand[a - mV] && hand[b - mV] && hand[d3 - mV]) continue;   // past the wrist
+            out[n++] = a; out[n++] = b; out[n++] = d3;
+        }
+        g_ib->Unlock();
+    }
+    HeapFree(GetProcessHeap(), 0, hand);
+    c.ntris = n / 3;
+    if (n && SUCCEEDED(g_dev->CreateIndexBuffer(n * 4, D3DUSAGE_WRITEONLY, D3DFMT_INDEX32, D3DPOOL_MANAGED, &c.cut, NULL)) && SUCCEEDED(c.cut->Lock(0, n * 4, &ip, 0))) {
+        memcpy(ip, out, n * 4); c.cut->Unlock();
+    }
+    HeapFree(GetProcessHeap(), 0, out);
+    char m[128]; wsprintfA(m, "skin: %u/%u without its hands -> %u tris", nV, nP, c.ntris); logline(m);
+    return c.cut;
+}
+static HRESULT drawSkinWithout(IDirect3DDevice9* d, IDirect3DIndexBuffer9* cut, INT bV, UINT mV, UINT nV) {
+    SkinCut* c = NULL;
+    for (int i = 0; i < g_nSkinCut; i++) if (g_skinCut[i].cut == cut) c = &g_skinCut[i];
+    IDirect3DIndexBuffer9* keepIB = g_ib;
+    g_orgSI(d, cut);
+    HRESULT hr = g_orgDIP(d, D3DPT_TRIANGLELIST, bV, mV, nV, 0, c ? c->ntris : 0);
+    g_orgSI(d, keepIB);
+    return hr;
+}
 // the stock kit draw, with forced PES14+ UVs and the pack's own sheet when
 // the run wears one of our kits; else the game's draw
 static HRESULT kitDraw(IDirect3DDevice9* d, D3DPRIMITIVETYPE t, INT bV, UINT mV, UINT nV, UINT sI, UINT nP) {
@@ -1612,6 +1672,10 @@ static HRESULT STDMETHODCALLTYPE myDIP(IDirect3DDevice9* d, D3DPRIMITIVETYPE t,
             char m[128]; wsprintfA(m, "run SKIN %u/%u/%u tex=%08x mk=%d pend=%d src=%s %s", nV, nP, g_stride, (DWORD)g_tex0, mk, g_pendingModel, SRC_NAME[g_pendingSrc], col ? "colour" : "other"); logline(m);
         }
         if (g_pendingModel >= 0 && useModel(d, g_pendingModel) && !keeps(g_cuM->keep, PIECE_SKIN)) return D3D_OK;
+        if (g_pendingModel >= 0 && useModel(d, g_pendingModel) && !keeps(g_cuM->keep, PIECE_HANDS)) {
+            IDirect3DIndexBuffer9* noHands = skinWithoutHands(t, bV, mV, nV, sI, nP);
+            if (noHands) return drawSkinWithout(d, noHands, bV, mV, nV);
+        }
     }
     bool hip = nV == KIT_HIP_NV && nP == KIT_HIP_NP && g_stride == KIT_HIP_STRIDE;
     if (hip) { g_runPos = 0; g_runKitTex = g_tex0; }
@@ -1953,6 +2017,8 @@ extern "C" __declspec(dllexport) void logic_uninstall() {
     if (g_flatNormal) { g_flatNormal->Release(); g_flatNormal = NULL; }
     if (g_uvGrid) { g_uvGrid->Release(); g_uvGrid = NULL; }
     freeFwd();   // 25 MB (kitforce.h): reloads must not stack copies
+    for (int i = 0; i < g_nSkinCut; i++) if (g_skinCut[i].cut) g_skinCut[i].cut->Release();
+    g_nSkinCut = 0;
     if (g_psShadeless) g_psShadeless->Release(); if (g_psToon) g_psToon->Release(); g_psShadeless = g_psToon = NULL;
     logline("logic uninstalled");
     if (g_log != INVALID_HANDLE_VALUE) { CloseHandle(g_log); g_log = INVALID_HANDLE_VALUE; }

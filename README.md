@@ -52,7 +52,7 @@ Each player's folder (`kitserver/4cc-players/custom/p<pid>/`) holds
 |---|---|
 | `shorts`, `shirt`, `sleeves`, `socks`, `neck`, `gloves`, `head`, `boots`, `other` | the kit run's part classes (`gloves` also the keeper's detail gloves, `boots` the detail boots) |
 | `skin` | the stride-76 skin draw (arms, legs, neck) |
-| `hands` | the bare detail hands (one 12-bone hand rig each) |
+| `hands` | the stock hands: the bare detail hands and the skin draw's own (cut at the wrist when `skin` stays) |
 
 Default at import: nothing for a whole figure (PES15 hides its body for short
 socks + tucked shirt), everything but `head` for a face-slot player, `boots`

@@ -38,13 +38,15 @@ DXT), and, only to rebuild the runtime, `i686-w64-mingw32-g++` and
 
 ```sh
 pip install -r requirements.txt
-python3 pes12_rig.py "<game dir>"     # -> rig/face_rig.json + rig/body349b2_bones.json
+python3 pes12_rig.py "<game dir>"     # -> rig/face_rig.json + rig/body349b2_bones.json + rig/hand_rig.json
 ```
 
 `pes12_rig.py` reads `img/dt0c.img` entry 132 (face rig: joints in
 head-local space + the face packet's 27-slot palette) and `img/dt09.img`
-entry 349 block 2 (body: bone index, palette slot, parent, id, pos) with
-the vendored KTMDL reader. Both tables come from your game; none ship here.
+entry 349 block 2 (body: bone index, palette slot, parent, id, pos) and
+`img/dt0d.img` entry 589 (the stock bare hands: a 12-bone hand rig per hand)
+with the vendored KTMDL reader. All tables come from your game; none ship
+here.
 
 The kit layout tables (`kitmap/kitmap.npz`, `kitmap/fwd.bin`) build once
 from your **PES2015** Data dir (its own kit garments: shirt, collar, short
@@ -62,6 +64,14 @@ supplies the engine textures some 4cc faces name (eyelashes).
 python3 pes15_to_pes12.py "<Faces>/<pid> - <name>/" <kit.dds> <out dir> [hide|keep]
 ```
 
+The body's header says which stock pieces still draw with it (none for a
+whole figure, everything but the head for a face-slot player, the boots for a
+figure stopping at the ankle; a `gloveL`/`gloveR` part drops the stock
+hands). Override it per player with a `mode` file of piece names - see the
+toolchain page's player settings. A hand rigged on PES15's finger bones is
+also written on the stock hand rig, so its fingers follow the game's hand
+animation.
+
 ## Team import
 
 ```sh
@@ -71,7 +81,8 @@ python3 pes12_import_team.py <aesthetics folder or archive> <save/EDIT.bin> \
     [--rename=<name>] [--all] [--pes21=<PES2021 Data dir>] [--pes15=<PES2015 Data dir>]
 ```
 
-Squads, names and stats go into `EDIT.bin` (close the game first); the DLC
+Squads, names and stats go into `EDIT.bin`; the importer refuses to run
+while `pes2012.exe` is up (the game would overwrite the save). The DLC
 base keeps its PLACEHOLDER rows. Bodies and kits land in the custom dir,
 faces and markers in the GDB. See the script's docstring for every option.
 After reinstalling a team's kits, restart the game: it keeps the old kit
@@ -91,7 +102,7 @@ match. Needs the `lod.ref.*` pins below.
 
 ```sh
 python3 pes12_ball.py ...      # see its docstring
-python3 pes12_stadium.py ...   # see its docstring
+python3 pes12_stadium.py ...   # see its docstring; install takes a stadium folder or <pack.cpk>:<stNNN>
 python3 pes12_adboards.py <game> ad1.png [ad2.png ...]   # pitch-side ads; --off = stock
 ```
 
