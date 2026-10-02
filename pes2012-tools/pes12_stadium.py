@@ -1652,13 +1652,20 @@ def install(meshes, slot, out_root, sky=None, log=print):
                          % (slot.number, len(images), len(images) + 1, len(tslots)))
     white = tslots[-1]
     tex_id = {id(img): t.id for img, t in zip(images, tslots)}
-    writes = {}  # entry -> {block index: image}
+    writes = {}  # entry -> {block index: image, or None = back to the stock block}
     for img, t in zip(images, tslots):
         writes.setdefault(t.entry, {})[t.block] = img
     writes.setdefault(white.entry, {})[white.block] = Image.new("RGBA", (4, 4), NEUTRAL_LIGHTMAP)
+    # The slot's stand textures this install leaves unused go back to stock:
+    # composed over an earlier install's override they kept its art, so a
+    # re-install did not reproduce a clean one (02-10: Karasuno's dt07 #2485
+    # block 2 still held the dropped --retexture run's floor).
+    for t in tslots:
+        writes.setdefault(t.entry, {}).setdefault(t.block, None)
     for e, repl in writes.items():
         blocks = split_bin(read_entry(e)[1])
-        replace_blocks(out_root, e, {bi: encode_block(img, blocks[bi]) for bi, img in repl.items()})
+        replace_blocks(out_root, e, {bi: blocks[bi] if img is None else encode_block(img, blocks[bi])
+                                     for bi, img in repl.items()})
     if decal is not None:
         set_pitch_art([slot], out_root, decal, log=lambda _m: None)
 
@@ -1690,15 +1697,14 @@ def install(meshes, slot, out_root, sky=None, log=print):
         tid = tex_id.get(id(p.image), white.id)
         new[bi] = repoint_textures(K, blk, pk, tid, white.id)
     write_entry(out_root, slot.geometry, tag, join_bin(new))
-    # A slot install must leave no residue: the previous stadium's sky strip,
-    # pitch art and unused stand-texture blocks are the slot's own entries and
-    # the engine still draws them, so a slot reused for another stadium (the
-    # Karasuno slot 1 that had briefly held Final PEStination) rendered a
-    # hybrid of the two (30-09). Drop the overrides this install does not
-    # write, so each of those entries goes back to stock.
+    # A slot install must leave no residue: the previous stadium's sky strip
+    # and pitch art are the slot's own entries and the engine still draws
+    # them, so a slot reused for another stadium (the Karasuno slot 1 that had
+    # briefly held Final PEStination) rendered a hybrid of the two (30-09).
+    # Drop the overrides this install does not write, so each of those
+    # entries goes back to stock (unused stand-texture blocks: reset above).
     stale = ([e for e in slot.skies] if not sky else []) \
-        + ([e for e in slot.pitches] if decal is None else []) \
-        + sorted({t.entry for t in tslots} - set(writes))
+        + ([e for e in slot.pitches] if decal is None else [])
     for e in stale:
         p = _override(out_root, e, DT07)
         if os.path.exists(p):
@@ -1707,7 +1713,8 @@ def install(meshes, slot, out_root, sky=None, log=print):
     if sky:
         install_sky(K, sky, slot, out_root)
     log("slot %d: geometry dt07 #%d (%d pieces), props %s, textures %s, pitch art %s, sky %s"
-        % (slot.number, slot.geometry, len(pieces), slot.props, sorted(writes),
+        % (slot.number, slot.geometry, len(pieces), slot.props,
+           sorted(e for e, r in writes.items() if any(v is not None for v in r.values())),
            slot.pitches if decal is not None else "stock", slot.skies if sky else "stock"))
 
 
@@ -1737,6 +1744,7 @@ USAGE = """usage:
   pes12_stadium.py list                                    slots (geometry, pitch art, props)
   pes12_stadium.py names                                   stadium name ids and names
   pes12_stadium.py install <source> <slots> <root> [--textures=<dir>] [--retexture=<material>:<image>,...]
+      <source>: a PES15/17 stadium folder, or <archive.cpk>:<stNNN> (extracted to a temp folder)
   pes12_stadium.py hide|show <slots> <root> <asset,...>     assets: %s
   pes12_stadium.py pitch <slots> <root> <image|GF stadium dir|stock>
   pes12_stadium.py thumb <ids> <root> <image|stock>
@@ -1781,6 +1789,15 @@ def main(argv):
     if cmd == "pitch":
         set_pitch_art(pick_slots(rest[0], read_slots()), rest[1], rest[2])
         return
+    if ".cpk:" in rest[0].lower():       # <archive.cpk>:<stNNN>: one command from the pack
+        import cpk
+        archive, st = rest[0].rsplit(":", 1)
+        with tempfile.TemporaryDirectory(prefix="pes12_stadium_") as tmp:
+            cpk.extract(archive, tmp, pattern=st)
+            src = os.path.join(tmp, "common", "bg", "model", "bg", "stadium", st)
+            if not os.path.isdir(src):
+                sys.exit("%s has no stadium %s (looked for common/bg/model/bg/stadium/%s)" % (archive, st, st))
+            return main([src if a == rest[0] else a for a in argv])   # the same install, from the extracted folder
     meshes, sky = read_source(rest[0], opts.get("textures"))
     # --retexture=<material>:<image>[,...]: that material's texture replaced
     # by an image (path relative to the source folder), e.g. Karasuno's

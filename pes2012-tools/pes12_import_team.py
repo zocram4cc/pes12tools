@@ -233,8 +233,28 @@ def unpack(path, tmp, single_file=False):
     return max(files, key=os.path.getsize)
 
 
+GAME_EXE = 'pes2012.exe'
+
+
+def game_running():
+    """Is PES2012 running (natively or under wine)? It holds EDIT.bin - the
+    squad write is lost when it saves - and keeps the old kit sheets in memory."""
+    if os.name == 'nt':
+        out = subprocess.run(['tasklist', '/FI', 'IMAGENAME eq ' + GAME_EXE], capture_output=True, text=True).stdout
+        return GAME_EXE in out.lower()
+    for p in os.listdir('/proc'):
+        try:
+            if p.isdigit() and GAME_EXE.encode() in open('/proc/%s/cmdline' % p, 'rb').read().lower():
+                return True
+        except OSError:
+            continue
+    return False
+
+
 def main(aes, edit, custom, gdb, export=None, tid=None, starters_only=True, pes21=None,
          pes17=False, tactics=None, rename=None, pes15=None):
+    if game_running():
+        sys.exit('PES2012 is running: close it first (it holds %s and keeps the old kits loaded)' % edit)
     faces, kit = pack_dirs(aes)
     # export kinds: PES15 bin / PES17 TEXPORT (a real lineup), a 4ccEditor
     # .4ccs (stats + medals, no lineup), none (the face folders are the roster)

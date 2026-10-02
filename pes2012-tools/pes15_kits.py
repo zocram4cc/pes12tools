@@ -863,7 +863,7 @@ def install(data_dir, textures, kits_dir, tid, pes15=None):
         src = os.path.join(textures, f)
         if open(src, 'rb').read(len(DDS_MAGIC)) != DDS_MAGIC:
             # /u/'s u0000g1.dds is no DDS at all (packs ship broken files)
-            print('skipped %s: not a DDS' % f)
+            print('skipped %s: not a DDS - team %d keeps the game\'s own %s kit' % (f, tid, slot))
             continue
         png = os.path.join(out, slot + '.png')
         convert_kit(src, fwd).save(png)
