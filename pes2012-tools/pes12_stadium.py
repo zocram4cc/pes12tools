@@ -1602,9 +1602,10 @@ def install(meshes, slot, out_root, sky=None, log=print):
     slot's per-variant props are hidden (they are stock stadium parts)."""
     from PIL import Image
     K = _ktmdl_reader()
-    _gtag, gbody = read_entry(slot.geometry)
-    budget = sum(1 for b in split_bin(gbody)
-                 if b[:5] == b"KTMDL" and template_packet(K, b) is not None)
+    tag, body = read_entry(slot.geometry)
+    stock = split_bin(body)
+    candidates = [(bi, pk) for bi, b in enumerate(stock) if b[:5] == b"KTMDL"
+                  for pk in [template_packet(K, b)] if pk is not None]
     # The engine skips blocks reaching below y = 0 from the broadcast camera
     # (see tile()). Karasuno's floor sits at y -0.06..-0.03, so every floor
     # block was below ground and a quarter of the court vanished per camera
@@ -1628,7 +1629,13 @@ def install(meshes, slot, out_root, sky=None, log=print):
     pieces = tile([c._replace(pos=[(x, y + lift, z) for x, y, z in c.pos])
                    for m in [opaque_part(m) for m in meshes if m.role == "scene"]
                    for c in chunk(subdivide(wind_to_stock(m), MAX_EDGE_M))
-                   if c.tris], budget)
+                   if c.tris], len(candidates))
+    # tile() cannot merge pieces of different images, so it can stop over
+    # budget; refuse before any override is written, or the slot is left
+    # with its old geometry wearing the new textures and pitch art (P2-2).
+    if len(pieces) > len(candidates):
+        raise ValueError("slot %d: %d mesh pieces, only %d template blocks"
+                         % (slot.number, len(pieces), len(candidates)))
 
     # textures: every distinct stand image takes one stand-texture block,
     # re-encoded at its own size (encode_block); the last stand block becomes
@@ -1656,13 +1663,6 @@ def install(meshes, slot, out_root, sky=None, log=print):
         set_pitch_art([slot], out_root, decal, log=lambda _m: None)
 
     # geometry: empty everything, then one template block per piece.
-    tag, body = read_entry(slot.geometry)
-    stock = split_bin(body)
-    candidates = [(bi, pk) for bi, b in enumerate(stock) if b[:5] == b"KTMDL"
-                  for pk in [template_packet(K, b)] if pk is not None]
-    if len(pieces) > len(candidates):
-        raise ValueError("slot %d: %d mesh pieces, only %d template blocks"
-                         % (slot.number, len(pieces), len(candidates)))
     new = [empty_block(K, b) if b[:5] == b"KTMDL" else b for b in stock]
     # Each piece takes the template block whose STOCK geometry sits nearest
     # (greedy, largest pieces first): the engine decides per block, from
