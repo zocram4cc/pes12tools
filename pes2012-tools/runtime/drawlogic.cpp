@@ -352,6 +352,7 @@ static LONG g_kitRun = 0;              // packet-5 occurrences this frame
 static LONG g_cuDrawn = 0;             // custom LOD0 draws this frame
 static LONG g_runPos = -1;             // draws since the current kit run opened (0 = packet 5), -1 outside
 static bool g_runLog = false;           // flags\runlog: log every run draw of one frame
+static IDirect3DSurface9* g_rtDump = NULL; static bool g_rtDumpArm = false;
 static unsigned g_pMask = 0;           // flags\pmask: debug, hide these Part classes on every stock run
 static float g_hipM[3][4];
 static IDirect3DVertexDeclaration9* g_kitDecl = NULL;
@@ -1061,6 +1062,7 @@ static IDirect3DTexture9* flatNormal(IDirect3DDevice9* d) {
 static HRESULT drawCustom(IDirect3DDevice9* d, bool faceOnly) {
     CustomModel& M = *g_cuM;
     if (g_shaderDump) dumpShaders(d);
+    if (g_rtDumpArm && !g_rtDump && !faceOnly) d->GetRenderTarget(0, &g_rtDump);
     IDirect3DVertexBuffer9* keepVB = g_vb; UINT keepOff = g_vbOff, keepSt = g_stride;
     IDirect3DIndexBuffer9* keepIB = g_ib;
     IDirect3DBaseTexture9* keepTex = g_tex0;
@@ -1101,10 +1103,15 @@ static HRESULT drawCustom(IDirect3DDevice9* d, bool faceOnly) {
         // kit slot: the pack's own sheet for the kit this player is wearing, at
         // full resolution through TEXCOORD0; else the game's bound sheet
         // through TEXCOORD1 (the remapped UVs)
+        // c176 is the UV selector of the colour pass's kit VS only; the depth
+        // and shadow passes' VS read c176 as something else, and the kit subs
+        // wrote far-plane depth into the depth pre-pass (02-10 rtdump: red and
+        // white noise on the shirt and shorts; DoF blurred them, the sun flare
+        // shone through them), so other passes keep the game's c176.
         if ((S.flags & SUB_KIT) && g_runKitTex) {
             IDirect3DTexture9* hi = g_runKitOk && !g_kitForceOff ? hiKit(d, g_runTid, g_runSlot) : NULL;
             g_orgSTEX(d, 0, hi ? (IDirect3DBaseTexture9*)hi : g_runKitTex);
-            g_orgSVSCF(d, UV_SELECT_REG, hi ? UV_SELECT_SET0 : UV_SELECT_SET1, 1);
+            g_orgSVSCF(d, UV_SELECT_REG, !colour ? uvSel : hi ? UV_SELECT_SET0 : UV_SELECT_SET1, 1);
         } else g_orgSVSCF(d, UV_SELECT_REG, uvSel, 1);
         // the material's own states (PES15 .mtl), never the kit draw's leftovers
         bool atest = (S.flags & SUB_ALPHATEST) != 0, blend = (S.flags & SUB_BLEND) != 0;
@@ -1583,16 +1590,21 @@ static HRESULT STDMETHODCALLTYPE myDIP(IDirect3DDevice9* d, D3DPRIMITIVETYPE t,
 
 // flags\shot: write the frame about to be presented to 4cc-players\shots\frame.bmp
 // (XWayland grabs of an occluded window come back black, 27-09).
-static void captureFrame(IDirect3DDevice9* d) {
-    IDirect3DSurface9* bb = NULL; IDirect3DSurface9* sys = NULL;
-    if (FAILED(d->GetBackBuffer(0, 0, D3DBACKBUFFER_TYPE_MONO, &bb)) || !bb) return;
+// flags\rtdump: the render target the next custom model draw goes into (the
+// first of a frame is the depth pre-pass), alpha included, as it stands at
+// Present -> shots\rt.bmp. The scene is not drawn into the back buffer (its
+// alpha is 255 everywhere at Present, 02-10).
+static void dumpSurface(IDirect3DDevice9* d, IDirect3DSurface9* bb, const wchar_t* path, const char* what) {
+    IDirect3DSurface9* sys = NULL;
     D3DSURFACE_DESC sd; bb->GetDesc(&sd);
+    { char m[128]; wsprintfA(m, "%s: surface %08x %ux%u fmt %u ms %u", what, (DWORD)bb, sd.Width, sd.Height, (UINT)sd.Format, (UINT)sd.MultiSampleType); if (lstrcmpA(what, "shot")) logline(m); }
+    if (sd.Format != D3DFMT_A8R8G8B8 && sd.Format != D3DFMT_X8R8G8B8) return;
     if (SUCCEEDED(d->CreateOffscreenPlainSurface(sd.Width, sd.Height, sd.Format, D3DPOOL_SYSTEMMEM, &sys, NULL))
         && SUCCEEDED(d->GetRenderTargetData(bb, sys))) {
         D3DLOCKED_RECT lr;
         if (SUCCEEDED(sys->LockRect(&lr, NULL, D3DLOCK_READONLY))) {
             wchar_t dir[MAX_PATH]; CreateDirectoryW(rootFile(dir, L"shots"), NULL);
-            HANDLE f = CreateFileW(SHOT_PATH, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, 0, NULL);
+            HANDLE f = CreateFileW(path, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, 0, NULL);
             if (f != INVALID_HANDLE_VALUE) {
                 const DWORD BMP_BPP = 4, BMP_HDR = 54, BMP_INFO = 40, BMP_PLANES = 1, BMP_BITS = 32;
                 DWORD img = sd.Width * sd.Height * BMP_BPP, w;
@@ -1606,13 +1618,24 @@ static void captureFrame(IDirect3DDevice9* d) {
             }
             sys->UnlockRect();
         }
-    }
+    } else if (lstrcmpA(what, "shot")) logline("rtdump: GetRenderTargetData failed");
     if (sys) sys->Release();
+}
+static void captureFrame(IDirect3DDevice9* d) {
+    IDirect3DSurface9* bb = NULL;
+    if (FAILED(d->GetBackBuffer(0, 0, D3DBACKBUFFER_TYPE_MONO, &bb)) || !bb) return;
+    dumpSurface(d, bb, SHOT_PATH, "shot");
     bb->Release();
 }
 
 extern "C" __declspec(dllexport) void logic_present(IDirect3DDevice9* d) {
     if (flagExists(L"shot")) { wchar_t p[MAX_PATH]; lstrcpyW(p, FLAGDIR); lstrcatW(p, L"shot"); DeleteFileW(p); captureFrame(d); }
+    if (g_rtDump) {
+        wchar_t p[MAX_PATH]; dumpSurface(d, g_rtDump, rootFile(p, L"shots\\rt.bmp"), "rtdump");
+        g_rtDump->Release(); g_rtDump = NULL; g_rtDumpArm = false;
+    } else if (flagExists(L"rtdump")) {
+        wchar_t p[MAX_PATH]; lstrcpyW(p, FLAGDIR); lstrcatW(p, L"rtdump"); DeleteFileW(p); g_rtDumpArm = true;
+    }
     LONG f = InterlockedIncrement(&g_frame);
     static LONG dumpStart = 0;
     if (g_grabAll == 2) { g_grabAll = 0; char m[64]; wsprintfA(m, "frame %d grabbed all: %d draws", (int)f, (int)g_grabSeq); logline(m); }
