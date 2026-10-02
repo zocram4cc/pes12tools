@@ -2150,9 +2150,10 @@ static UEF_FN g_orgUEF = NULL;
 static DWORD* g_uefSlot[FAULT_LOG_MAX]; static int g_nUefSlot = 0;
 // pes2012+0xdf4230 formats the signed byte this+0x34 with "%d" into a 3-byte stack
 // buffer (sprintf_s wrapper +0x24710); the CRT aborts the game (0xc0000417) when the
-// number needs 3 digits. That byte is the low byte of a heap pointer (+0x34 holds
-// one: 0x1a491e37 -> 55, 0x1a491e64 -> 100), so which player trips it is down to
-// where the heap put him (/s4s/ Ebin, then three more while browsing, 02-10). The
+// number needs 3 digits. +0x34 holds a small number on some objects (0x2c, 0x18)
+// and a pointer 0x1a491eNN on others, read for its low byte (0x1a491e64 -> 100), so
+// which player trips it is down to memory layout (/s4s/ Ebin, then 111 and 122
+// on others while browsing 76 models, 02-10). The
 // buffer is dead - nothing in the function reads it after the call - so a number
 // that does not fit is cut to the buffer instead; fitting ones go through untouched.
 static const DWORD PCTD3_SITE = 0x011f4285;          // e8 rel32 -> PCTD3_WRAPPER

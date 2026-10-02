@@ -126,7 +126,7 @@ drawlogic also fixes two crashes in the game itself, applied at load:
   the game dies; the three lookups now give those ids size 0 and fserv sets
   the real one, as before.
 - `pes2012.exe` prints a byte of a player's model object into a 3-byte
-  buffer that nothing reads; the byte is really part of a heap pointer, and
+  buffer that nothing reads; the byte is often the low byte of a pointer, and
   when it is 100 or more the C runtime aborts the game. Which players trip it
   depends on memory layout; the number is now cut to fit (logged as `pct3`).
 
