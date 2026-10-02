@@ -6,8 +6,14 @@
 // the same mesh whose kit UV (TEXCOORD1) points into the PES14+ sheet, drawn
 // with the pack's own 2048 px sheet.
 //
-// The UVs come from the per-texel remap tools/pes15_kits.py builds (fwd:
-// PES2012 kit uv -> PES14+ uv, 4cc-players\kitmap\fwd.bin). One UV per vertex
+// The UVs come from the per-texel table tools/pes15_kits.py builds
+// (4cc-players\kitmap\fwd.bin, v2): for each PES2012 kit texel up to k
+// candidates, each the PES14+ uv traced from one stock surface point that
+// uses the texel, with that point's bind position. Sections share texels
+// (torso variants, the collar strip beside the long-sleeve charts, the
+// shorts' legs), so a vertex takes the candidate nearest to it in 3D, and
+// values that disagree are never blended (02-10: one value per texel put the
+// wrong section's art on the collar, bib and crest). One UV per vertex
 // cannot follow the remap across a border between two charts of the PES14+
 // sheet (16% of the stock kit's triangles straddle one, 30-09), so a triangle
 // whose corners disagree with the remap inside it is cut in four at its edge
@@ -16,7 +22,9 @@
 
 #include <math.h>
 
-static const DWORD FWD_MAGIC = 0x31445746;          // tools/pes15_kits.py FWD_MAGIC
+static const DWORD FWD_MAGIC = 0x32445746;          // tools/pes15_kits.py FWD_MAGIC ('FWD2')
+static const float FWD_MM_PER_M = 1000.f;           // tools/pes15_kits.py FWD_MM_PER_M
+static const float FWD_REJECT_M = 0.04f;            // twice tools/pes15_kits.py FWD_SAME_SURFACE_M: a kept candidate stands for points up to that far; beyond this the texel is another body region
 static const float FORCE_AGREE_TOL = 0.004f;        // PES14+ uv units, ~8 px of the 2048 sheet (prototype 30-09)
 static const int FORCE_MAX_DEPTH = 4;               // 4 levels: torso 1174 -> 28240 tris in the prototype
 static const int MAX_FORCED = 64;                   // distinct kit draws kept
@@ -24,7 +32,10 @@ static const UINT FORCE_MAX_VERTS = 1u << 20;       // safety cap per draw
 static const float FORCE_JACOBIAN_STEP_TEXELS = 0.5f; // finite-difference step of the remap, in fwd texels (half a PES2012 kit texel)
 static const float PROBES[4][2] = { { 1.f / 3, 1.f / 3 }, { .5f, .25f }, { .25f, .5f }, { .25f, .25f } };
 
-static float* g_fwd = NULL; static UINT g_fwdW = 0, g_fwdH = 0; static bool g_fwdTried = false;
+struct FwdRec { float u, v; short x, y, z, ok; };   // tools/pes15_kits.py FWD_REC
+static BYTE* g_fwdBuf = NULL; static const FwdRec* g_fwd = NULL;
+static UINT g_fwdW = 0, g_fwdH = 0, g_fwdK = 0; static bool g_fwdTried = false;
+static const UINT FWD_HEADER_BYTES = 16;
 static bool loadFwd() {
     if (g_fwdTried) return g_fwd != NULL;
     g_fwdTried = true;
@@ -32,43 +43,73 @@ static bool loadFwd() {
     DWORD n = 0; BYTE* b = readAll(p, &n);
     if (!b) { logline("kitforce: no kitmap\\fwd.bin"); return false; }
     DWORD* h = (DWORD*)b;
-    if (h[0] != FWD_MAGIC || n < 12 + h[1] * h[2] * 8) { HeapFree(GetProcessHeap(), 0, b); logline("kitforce: bad fwd.bin"); return false; }
-    g_fwdW = h[1]; g_fwdH = h[2];
-    g_fwd = (float*)HeapAlloc(GetProcessHeap(), 0, g_fwdW * g_fwdH * 8);
-    memcpy(g_fwd, b + 12, g_fwdW * g_fwdH * 8);
-    HeapFree(GetProcessHeap(), 0, b);
+    if (n < FWD_HEADER_BYTES || h[0] != FWD_MAGIC || n < FWD_HEADER_BYTES + h[1] * h[2] * h[3] * sizeof(FwdRec)) {
+        HeapFree(GetProcessHeap(), 0, b); logline("kitforce: bad fwd.bin (rebuild it with tools/pes15_kits.py)"); return false;
+    }
+    g_fwdW = h[1]; g_fwdH = h[2]; g_fwdK = h[3];
+    g_fwdBuf = b; g_fwd = (const FwdRec*)(b + FWD_HEADER_BYTES);
     return true;
 }
-// bilinear, texel centres at (i + 0.5) / w, clamped (tools/pes15_kits.py sample)
-static void fwdLook(float u, float v, float out[2]) {
+static void freeFwd() { if (g_fwdBuf) HeapFree(GetProcessHeap(), 0, g_fwdBuf); g_fwdBuf = NULL; g_fwd = NULL; g_fwdTried = false; }
+// The PES14+ uv at PES2012 kit uv (u, v) for the stock point pos: per texel of
+// the bilinear footprint (texel centres at (i + 0.5) / w, clamped) the
+// candidate nearest pos; texels from another body region (FWD_REJECT_M) drop
+// out; agreeing texels blend, disagreeing ones give the nearest texel's value.
+static void fwdLook(float u, float v, const float* pos, float out[2]) {
     float x = u * g_fwdW - 0.5f, y = v * g_fwdH - 0.5f;
     if (x < 0) x = 0; if (y < 0) y = 0;
     if (x > g_fwdW - 1) x = (float)(g_fwdW - 1); if (y > g_fwdH - 1) y = (float)(g_fwdH - 1);
     int x0 = (int)x, y0 = (int)y, x1 = x0 + 1 < (int)g_fwdW ? x0 + 1 : x0, y1 = y0 + 1 < (int)g_fwdH ? y0 + 1 : y0;
     float fx = x - x0, fy = y - y0;
-    for (int c = 0; c < 2; c++) {
-        float a = g_fwd[(y0 * g_fwdW + x0) * 2 + c], b = g_fwd[(y0 * g_fwdW + x1) * 2 + c];
-        float e = g_fwd[(y1 * g_fwdW + x0) * 2 + c], f = g_fwd[(y1 * g_fwdW + x1) * 2 + c];
-        out[c] = (a * (1 - fx) + b * fx) * (1 - fy) + (e * (1 - fx) + f * fx) * fy;
+    const int X[4] = { x0, x1, x0, x1 }, Y[4] = { y0, y0, y1, y1 };
+    const float W[4] = { (1 - fx) * (1 - fy), fx * (1 - fy), (1 - fx) * fy, fx * fy };
+    const float NONE = 1e30f, REJECT2 = FWD_REJECT_M * FWD_REJECT_M;
+    float cu[4], cv[4], cd[4];
+    for (int i = 0; i < 4; i++) {
+        const FwdRec* r = g_fwd + ((size_t)Y[i] * g_fwdW + X[i]) * g_fwdK;
+        cd[i] = NONE; cu[i] = cv[i] = 0;
+        for (UINT k = 0; k < g_fwdK; k++) {
+            if (!r[k].ok) continue;
+            float dx = r[k].x / FWD_MM_PER_M - pos[0], dy = r[k].y / FWD_MM_PER_M - pos[1], dz = r[k].z / FWD_MM_PER_M - pos[2];
+            float d = dx * dx + dy * dy + dz * dz;
+            if (d < cd[i]) { cd[i] = d; cu[i] = r[k].u; cv[i] = r[k].v; }
+        }
     }
+    bool keep[4], any = false;
+    for (int i = 0; i < 4; i++) { keep[i] = cd[i] <= REJECT2; any |= keep[i]; }
+    if (!any) for (int i = 0; i < 4; i++) { keep[i] = cd[i] < NONE; any |= keep[i]; }
+    if (!any) { out[0] = u; out[1] = v; return; }   // no candidate in reach: an untraced region
+    float lu = NONE, hu = -NONE, lv = NONE, hv = -NONE;
+    for (int i = 0; i < 4; i++) if (keep[i]) {
+        if (cu[i] < lu) lu = cu[i]; if (cu[i] > hu) hu = cu[i]; if (cv[i] < lv) lv = cv[i]; if (cv[i] > hv) hv = cv[i];
+    }
+    if (hu - lu <= FORCE_AGREE_TOL && hv - lv <= FORCE_AGREE_TOL) {
+        float sw = 0, su = 0, sv = 0;
+        for (int i = 0; i < 4; i++) if (keep[i]) { sw += W[i]; su += W[i] * cu[i]; sv += W[i] * cv[i]; }
+        if (sw > 0) { out[0] = su / sw; out[1] = sv / sw; return; }
+    }
+    int best = -1;
+    for (int i = 0; i < 4; i++) if (keep[i] && (best < 0 || cd[i] < cd[best])) best = i;
+    out[0] = cu[best]; out[1] = cv[best];
 }
 
 // ---- vertex layout of a draw, from its declaration ----
-struct KitLayout { UINT stride; int uvOff; int bwOff, bwN; int biOff; D3DVERTEXELEMENT9 el[32]; UINT ne; };
+struct KitLayout { UINT stride; int uvOff, posOff; int bwOff, bwN; int biOff; D3DVERTEXELEMENT9 el[32]; UINT ne; };
 static bool kitLayout(IDirect3DVertexDeclaration9* decl, UINT stride, KitLayout& L) {
     if (!decl) return false;
     L.ne = 0; decl->GetDeclaration(NULL, &L.ne);
     if (L.ne == 0 || L.ne > 32) return false;
     decl->GetDeclaration(L.el, &L.ne);
-    L.stride = stride; L.uvOff = -1; L.bwOff = -1; L.bwN = 0; L.biOff = -1;
+    L.stride = stride; L.uvOff = -1; L.posOff = -1; L.bwOff = -1; L.bwN = 0; L.biOff = -1;
     for (UINT i = 0; i < L.ne; i++) {
         const D3DVERTEXELEMENT9& e = L.el[i];
         if (e.Stream != 0) continue;
         if (e.Usage == D3DDECLUSAGE_TEXCOORD && e.UsageIndex == 1 && e.Type == D3DDECLTYPE_FLOAT2) L.uvOff = e.Offset;
+        if (e.Usage == D3DDECLUSAGE_POSITION && e.UsageIndex == 0 && e.Type == D3DDECLTYPE_FLOAT3) L.posOff = e.Offset;
         if (e.Usage == D3DDECLUSAGE_BLENDWEIGHT) { L.bwOff = e.Offset; L.bwN = e.Type - D3DDECLTYPE_FLOAT1 + 1; }
         if (e.Usage == D3DDECLUSAGE_BLENDINDICES && e.Type == D3DDECLTYPE_UBYTE4) L.biOff = e.Offset;
     }
-    return L.uvOff >= 0;
+    return L.uvOff >= 0 && L.posOff >= 0;
 }
 static int typeFloats(BYTE t) { return t <= D3DDECLTYPE_FLOAT4 ? t - D3DDECLTYPE_FLOAT1 + 1 : 0; }
 // midpoint of two vertex rows: floats averaged, bone influences merged per bone
@@ -180,11 +221,13 @@ static bool buildForced(IDirect3DDevice9* d, const KitLayout& L, Forced& F, IDir
     while (sn) {
         Item it = st[--sn];
         float* ua = rowUV(rows, F.stride, it.a, L.uvOff), *ub = rowUV(rows, F.stride, it.b, L.uvOff), *uc = rowUV(rows, F.stride, it.c, L.uvOff);
-        float ca[2], cb[2], cc[2]; fwdLook(ua[0], ua[1], ca); fwdLook(ub[0], ub[1], cb); fwdLook(uc[0], uc[1], cc);
+        float* pa = rowUV(rows, F.stride, it.a, L.posOff), *pb = rowUV(rows, F.stride, it.b, L.posOff), *pc = rowUV(rows, F.stride, it.c, L.posOff);
+        float ca[2], cb[2], cc[2]; fwdLook(ua[0], ua[1], pa, ca); fwdLook(ub[0], ub[1], pb, cb); fwdLook(uc[0], uc[1], pc, cc);
         bool ok = true;
         for (int k = 0; k < 4 && ok; k++) {
-            float s = PROBES[k][0], t = PROBES[k][1], want[2];
-            fwdLook(ua[0] + (ub[0] - ua[0]) * s + (uc[0] - ua[0]) * t, ua[1] + (ub[1] - ua[1]) * s + (uc[1] - ua[1]) * t, want);
+            float s = PROBES[k][0], t = PROBES[k][1], want[2], pp[3];
+            for (int c = 0; c < 3; c++) pp[c] = pa[c] + (pb[c] - pa[c]) * s + (pc[c] - pa[c]) * t;
+            fwdLook(ua[0] + (ub[0] - ua[0]) * s + (uc[0] - ua[0]) * t, ua[1] + (ub[1] - ua[1]) * s + (uc[1] - ua[1]) * t, pp, want);
             for (int c = 0; c < 2; c++) if (fabsf(want[c] - (ca[c] + (cb[c] - ca[c]) * s + (cc[c] - ca[c]) * t)) > FORCE_AGREE_TOL) ok = false;
         }
         if (ok || it.depth >= FORCE_MAX_DEPTH || nverts + 3 > FORCE_MAX_VERTS) {
@@ -217,11 +260,13 @@ static bool buildForced(IDirect3DDevice9* d, const KitLayout& L, Forced& F, IDir
         UINT* t = (UINT*)(tris.p + ((UINT*)stuck.p)[s] * 12);
         float* u[3]; for (int k = 0; k < 3; k++) u[k] = rowUV(rows, F.stride, t[k], L.uvOff);
         float c0 = (u[0][0] + u[1][0] + u[2][0]) / 3, c1 = (u[0][1] + u[1][1] + u[2][1]) / 3;
+        float cp[3];                              // the centroid's stock point
+        for (int c = 0; c < 3; c++) { cp[c] = 0; for (int k = 0; k < 3; k++) cp[c] += rowUV(rows, F.stride, t[k], L.posOff)[c] / 3; }
         float C[2], J[2][2];                      // J[axis][out]
-        fwdLook(c0, c1, C);
+        fwdLook(c0, c1, cp, C);
         for (int ax = 0; ax < 2; ax++) {
             float p[2], m[2];
-            fwdLook(c0 + (ax ? 0 : h), c1 + (ax ? h : 0), p); fwdLook(c0 - (ax ? 0 : h), c1 - (ax ? h : 0), m);
+            fwdLook(c0 + (ax ? 0 : h), c1 + (ax ? h : 0), cp, p); fwdLook(c0 - (ax ? 0 : h), c1 - (ax ? h : 0), cp, m);
             // one-sided: the side that jumps a border has the larger step
             bool fwdSide = fabsf(p[0] - C[0]) + fabsf(p[1] - C[1]) <= fabsf(C[0] - m[0]) + fabsf(C[1] - m[1]);
             for (int o = 0; o < 2; o++) J[ax][o] = (fwdSide ? p[o] - C[o] : C[o] - m[o]) / h;
@@ -230,7 +275,7 @@ static bool buildForced(IDirect3DDevice9* d, const KitLayout& L, Forced& F, IDir
             snap[s * 6 + k * 2 + o] = C[o] + J[0][o] * (u[k][0] - c0) + J[1][o] * (u[k][1] - c1);
     }
     // each vertex's kit uv -> the PES14+ sheet
-    for (UINT v = 0; v < nverts; v++) { float* u = rowUV(rows, F.stride, v, L.uvOff); float o[2]; fwdLook(u[0], u[1], o); u[0] = o[0]; u[1] = o[1]; }
+    for (UINT v = 0; v < nverts; v++) { float* u = rowUV(rows, F.stride, v, L.uvOff); float o[2]; fwdLook(u[0], u[1], rowUV(rows, F.stride, v, L.posOff), o); u[0] = o[0]; u[1] = o[1]; }
     for (UINT s = 0; s < nStuck; s++) {
         UINT* t = (UINT*)(tris.p + ((UINT*)stuck.p)[s] * 12);
         for (int k = 0; k < 3; k++) {

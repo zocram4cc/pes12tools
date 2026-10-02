@@ -609,8 +609,43 @@ static const float UV_SELECT_SET0[4] = { 1, 0, 0, 0 }, UV_SELECT_SET1[4] = { 0, 
 static const int MAX_HIKITS = 16;
 struct HiKit { int tid; const wchar_t* slot; IDirect3DTexture9* tex; };
 static HiKit g_hiKits[MAX_HIKITS]; static int g_nHiKits = 0;
+// flags\kituv: the forced kit path draws a UV grid over the PES14+ sheet
+// instead of the team's <slot>_hi.dds, to localise misregistration (02-10).
+// Cells: UV_GRID_CELLS per axis, red = u cell, green = v cell, blue = checker
+// parity; thin dark lines every 1/UV_GRID_FINE, white lines on cell borders.
+static bool g_kitUV = false;
+static IDirect3DTexture9* g_uvGrid = NULL;
+static const UINT UV_GRID_PX = 1024;            // level 0 size; the sheet it stands in for is 2048
+static const int UV_GRID_CELLS = 16, UV_GRID_FINE = 64;
+static const float UV_GRID_FINE_W = 0.08f;      // line width as a fraction of a fine cell (~1.3 px at level 0)
+static const float UV_GRID_CELL_W = 0.05f;      // line width as a fraction of a cell (~3 px at level 0)
+static const BYTE UV_GRID_LO = 40, UV_GRID_STEP = 13, UV_GRID_PAR_HI = 220;   // channel ramp: 40 .. 235
+static IDirect3DTexture9* uvGrid(IDirect3DDevice9* d) {
+    if (g_uvGrid || FAILED(d->CreateTexture(UV_GRID_PX, UV_GRID_PX, 0, 0, D3DFMT_A8R8G8B8, D3DPOOL_MANAGED, &g_uvGrid, NULL))) return g_uvGrid;
+    for (DWORD lv = 0; lv < g_uvGrid->GetLevelCount(); lv++) {
+        D3DSURFACE_DESC sd; g_uvGrid->GetLevelDesc(lv, &sd);
+        D3DLOCKED_RECT lr; if (FAILED(g_uvGrid->LockRect(lv, &lr, NULL, 0))) continue;
+        for (UINT y = 0; y < sd.Height; y++) {
+            DWORD* row = (DWORD*)((BYTE*)lr.pBits + y * lr.Pitch);
+            float v = (y + 0.5f) / sd.Height;
+            for (UINT x = 0; x < sd.Width; x++) {
+                float u = (x + 0.5f) / sd.Width;
+                int cu = (int)(u * UV_GRID_CELLS), cv = (int)(v * UV_GRID_CELLS);
+                float fu = u * UV_GRID_CELLS - cu, fv = v * UV_GRID_CELLS - cv;
+                float gu = u * UV_GRID_FINE - (int)(u * UV_GRID_FINE), gv = v * UV_GRID_FINE - (int)(v * UV_GRID_FINE);
+                DWORD c = D3DCOLOR_ARGB(255, UV_GRID_LO + cu * UV_GRID_STEP, UV_GRID_LO + cv * UV_GRID_STEP, ((cu + cv) & 1) ? UV_GRID_PAR_HI : UV_GRID_LO);
+                if (gu < UV_GRID_FINE_W || gv < UV_GRID_FINE_W) c = D3DCOLOR_ARGB(255, 0, 0, 0);
+                if (fu < UV_GRID_CELL_W || fv < UV_GRID_CELL_W) c = D3DCOLOR_ARGB(255, 255, 255, 255);
+                row[x] = c;
+            }
+        }
+        g_uvGrid->UnlockRect(lv);
+    }
+    return g_uvGrid;
+}
 static IDirect3DTexture9* hiKit(IDirect3DDevice9* d, int tid, const wchar_t* slot) {
     if (!slot) return NULL;
+    if (g_kitUV) return uvGrid(d);
     for (int i = 0; i < g_nHiKits; i++) if (g_hiKits[i].tid == tid && g_hiKits[i].slot == slot) return g_hiKits[i].tex;
     wchar_t path[MAX_PATH]; wsprintfW(path, L"%s%d\\%s%s", KIT_DIR, tid, slot, HI_KIT_SUFFIX);
     IDirect3DTexture9* t = loadTex(d, path);
@@ -1683,6 +1718,7 @@ extern "C" __declspec(dllexport) void logic_present(IDirect3DDevice9* d) {
         g_cuGK = flagExists(L"customgk");
         g_cuCullCW = flagExists(L"cullcw");
         g_kitForceOff = flagExists(L"nokitforce");
+        g_kitUV = flagExists(L"kituv");
         g_kitPatchOff = flagExists(L"nokitpatch");
         g_keepNormalMaps = flagExists(L"gamenormals");
         g_noHairFringe = flagExists(L"nohairfringe");
@@ -1781,6 +1817,8 @@ extern "C" __declspec(dllexport) void logic_uninstall() {
     g_nmodels = 0;
     releaseModel(g_default); memset(&g_default, 0, sizeof(g_default)); g_cuM = NULL;
     if (g_flatNormal) { g_flatNormal->Release(); g_flatNormal = NULL; }
+    if (g_uvGrid) { g_uvGrid->Release(); g_uvGrid = NULL; }
+    freeFwd();   // 25 MB (kitforce.h): reloads must not stack copies
     if (g_psShadeless) g_psShadeless->Release(); if (g_psToon) g_psToon->Release(); g_psShadeless = g_psToon = NULL;
     logline("logic uninstalled");
     if (g_log != INVALID_HANDLE_VALUE) { CloseHandle(g_log); g_log = INVALID_HANDLE_VALUE; }
