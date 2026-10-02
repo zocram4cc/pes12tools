@@ -448,6 +448,10 @@ static const UINT MARKER_SEARCH_LEVELS = 5;            // smallest atlas mips se
 static const int MAX_TEXCACHE = 256;
 static DWORD g_tcTex[MAX_TEXCACHE]; static int g_tcMark[MAX_TEXCACHE]; static int g_ntc = 0;
 static LONG g_pendingModel = -1;                        // pid set by a marked face draw
+// how the pending / current model was decided (attribution log, 02-10)
+enum { SRC_NONE, SRC_MARKER, SRC_KEY, SRC_CARRIED };
+static const char* SRC_NAME[] = { "none", "marker", "key", "carried" };
+static int g_pendingSrc = SRC_NONE, g_curSrc = SRC_NONE; static bool g_hipColour = false;
 // marker unit (tools/mark_face.py): 'P' 'G' 'D' pid (u24 LE) sum ~sum, sum = byte sum of the pid
 static const UINT MARKER_BYTES = 8;
 static int readMarker(const BYTE* q) {
@@ -528,21 +532,12 @@ static const wchar_t* kitSlotOf(IDirect3DBaseTexture9* t, int tid) {
     for (int i = 0; i < g_nts; i++) if (g_tsTeam[i] == tid) return g_tsSlot[i];
     return NULL;
 }
-// One patch per team per match. The sheet the game has bound on a custom
-// player's run is not always that team's sheet - the game interleaves teams
-// within a pass - so a second patch for the same team lands on another
-// team's sheet and that team then wears our kit (01-10: /hm/ in /g/'s art,
-// byte-exact). The FIRST patch of a match is the right one: it happens on the
-// run that opens the team's own strip. flags\kitpatchall restores the old
-// behaviour.
-static const int MAX_KITPATCHED = 64;
-static int g_kitPatchedTid[MAX_KITPATCHED]; static int g_nKitPatched = 0;
-static bool g_kitPatchAll = false;
+// patchKit writes the team's pack sheet into the sheet the game has bound on
+// that team's custom player's hip. Only a colour-pass hip whose model came
+// from the face marker may call it (see the call site): elsewhere the bound
+// texture is not that player's sheet.
 static void patchKit(int tid, IDirect3DBaseTexture9* bt) {
     if (tid <= 0 || !bt || bt->GetType() != D3DRTYPE_TEXTURE) return;
-    if (!g_kitPatchAll)
-        for (int i = 0; i < g_nKitPatched; i++)
-            if (g_kitPatchedTid[i] == tid) return;
     IDirect3DTexture9* t = (IDirect3DTexture9*)bt;
     D3DSURFACE_DESC sd; t->GetLevelDesc(0, &sd);
     if (sd.Width != KIT_W || sd.Height != KIT_H || sd.Format != D3DFMT_A8R8G8B8) {
@@ -552,10 +547,7 @@ static void patchKit(int tid, IDirect3DBaseTexture9* bt) {
         return;
     }
     DWORD h = kitHash(t);
-    for (int i = 0; i < g_nkc; i++) if (g_kcTex[i] == (DWORD)t && g_kcHash[i] == h) {   // ours already
-        if (!g_kitPatchAll && g_nKitPatched < MAX_KITPATCHED) g_kitPatchedTid[g_nKitPatched++] = tid;
-        return;
-    }
+    for (int i = 0; i < g_nkc; i++) if (g_kcTex[i] == (DWORD)t && g_kcHash[i] == h) return;   // ours already
     const wchar_t* slot = NULL;
     for (UINT i = 0; i < sizeof(KIT_SLOTS) / sizeof(KIT_SLOTS[0]); i++) if (KIT_SLOTS[i].hash == h) slot = KIT_SLOTS[i].slot;
     if (!slot) {
@@ -596,9 +588,8 @@ static void patchKit(int tid, IDirect3DBaseTexture9* bt) {
         for (int i = 0; i < g_nkc; i++) if (g_kcTex[i] == (DWORD)t) k = i;
         if (k < 0 && g_nkc < MAX_KITCACHE) k = g_nkc++;
         if (k >= 0) { g_kcTex[k] = (DWORD)t; g_kcHash[k] = after; g_kcSlot[k] = slot; }
-        if (!g_kitPatchAll && g_nKitPatched < MAX_KITPATCHED) g_kitPatchedTid[g_nKitPatched++] = tid;
         noteTeamSlot(tid, slot);
-        char m[128]; wsprintfA(m, "kit: team %d %S -> tex %08x", tid, slot, (DWORD)t); logline(m);
+        char m[160]; wsprintfA(m, "kit: team %d %S -> tex %08x (pid %d by %s, %s pass)", tid, slot, (DWORD)t, (int)g_curModel, SRC_NAME[g_curSrc], g_hipColour ? "colour" : "other"); logline(m);
     }
     HeapFree(GetProcessHeap(), 0, b);
 }
@@ -1449,16 +1440,20 @@ static HRESULT STDMETHODCALLTYPE myDIP(IDirect3DDevice9* d, D3DPRIMITIVETYPE t,
     // the stock skin stays.
     if (g_stride == FACE_STRIDE && nV < FACE_MAX_NV) {
         g_runPos = -1;                  // a skin draw opens the next player
-        if (g_runLog) { char m[96]; wsprintfA(m, "run SKIN %u/%u/%u tex=%08x", nV, nP, g_stride, (DWORD)g_tex0); logline(m); }
         int mk = findMarker(g_tex0);
         float key[3]; runKey(key);
         if (mk >= 0) {
-            g_pendingModel = mk;
+            g_pendingModel = mk; g_pendingSrc = SRC_MARKER;
             if (g_pendingModel >= 0 && g_nKeyCur < MAX_KEYS) {
                 for (int c = 0; c < 3; c++) g_keyCur[g_nKeyCur].p[c] = key[c];
                 g_keyCur[g_nKeyCur++].model = g_pendingModel;
             }
-        } else if (g_pendingModel < 0) g_pendingModel = modelForKey(key);
+        } else if (g_pendingModel < 0) { g_pendingModel = modelForKey(key); g_pendingSrc = g_pendingModel >= 0 ? SRC_KEY : SRC_NONE; }
+        else g_pendingSrc = SRC_CARRIED;
+        if (g_runLog) {
+            IDirect3DVertexShader9* vs = NULL; d->GetVertexShader(&vs); bool col = isColourVS(vs); if (vs) vs->Release();
+            char m[128]; wsprintfA(m, "run SKIN %u/%u/%u tex=%08x mk=%d pend=%d src=%s %s", nV, nP, g_stride, (DWORD)g_tex0, mk, g_pendingModel, SRC_NAME[g_pendingSrc], col ? "colour" : "other"); logline(m);
+        }
         if (g_pendingModel >= 0 && useModel(d, g_pendingModel) && MODE_HIDES_SKIN[g_cuM->flags]) return D3D_OK;
     }
     bool hip = nV == KIT_HIP_NV && nP == KIT_HIP_NP && g_stride == KIT_HIP_STRIDE;
@@ -1492,13 +1487,13 @@ static HRESULT STDMETHODCALLTYPE myDIP(IDirect3DDevice9* d, D3DPRIMITIVETYPE t,
                 logline(m);
             }
         }
-        g_curModel = g_pendingModel; g_pendingModel = -1;
+        g_curModel = g_pendingModel; g_pendingModel = -1; g_curSrc = g_pendingSrc; g_pendingSrc = SRC_NONE;
         {   // every kit hip (stock players too) refreshes its pass's kit context:
             // officials need one even when no custom player is on screen (01-10:
             // a close camera with only the linesman drew him stock)
             IDirect3DVertexDeclaration9* kd = NULL; IDirect3DVertexShader9* kv = NULL; IDirect3DPixelShader9* kp = NULL;
             d->GetVertexDeclaration(&kd); d->GetVertexShader(&kv); d->GetPixelShader(&kp);
-            int k = isColourVS(kv) ? 1 : 0;
+            int k = isColourVS(kv) ? 1 : 0; g_hipColour = k == 1;
             if (g_passDecl[k]) g_passDecl[k]->Release(); if (g_passVS[k]) g_passVS[k]->Release(); if (g_passPS[k]) g_passPS[k]->Release();
             g_passDecl[k] = kd; g_passVS[k] = kv; g_passPS[k] = kp;   // Get* AddRef'd: owned here
             memcpy(g_passVSC[k], g_vsc, sizeof(g_vsc)); memcpy(g_passPSC[k], g_psc, sizeof(g_psc));
@@ -1511,7 +1506,15 @@ static HRESULT STDMETHODCALLTYPE myDIP(IDirect3DDevice9* d, D3DPRIMITIVETYPE t,
             memcpy(g_hipM, g_vsc[BONE_REG0 + CU_SRC_SLOT[2] * BONE_REGS], sizeof(g_hipM));
             if (g_kitDecl) g_kitDecl->Release(); if (g_kitVS) g_kitVS->Release(); if (g_kitPS) g_kitPS->Release();
             d->GetVertexDeclaration(&g_kitDecl); d->GetVertexShader(&g_kitVS); d->GetPixelShader(&g_kitPS);
-            if (useModel(d, g_curModel) && !g_kitPatchOff) patchKit(modelTeam(*g_cuM), g_tex0);
+            // Attribution: in the depth and shadow passes the hip binds no kit
+            // sheet - g_tex0 is whatever was bound last, often the previous
+            // frame's last colour draw, i.e. another team's sheet - and the
+            // model there comes from the bone key. Patching from those hips
+            // put /g/'s art on /hm/'s sheet (01-10 and 02-10, runlog: /g/'s
+            // colour hips bind 22d309d0, /hm/'s 22d73aa8, and the bad patch
+            // went 721 -> 22d73aa8). The colour pass's marked hips are exact.
+            if (useModel(d, g_curModel) && !g_kitPatchOff && g_hipColour && g_curSrc == SRC_MARKER)
+                patchKit(modelTeam(*g_cuM), g_tex0);
         }
         g_runKitOk = kitOfSheet(g_tex0, g_runTid, g_runSlot);
     }
@@ -1520,7 +1523,7 @@ static HRESULT STDMETHODCALLTYPE myDIP(IDirect3DDevice9* d, D3DPRIMITIVETYPE t,
         part = classifyPart((UINT)(bV + (INT)mV), nV);
         if (part == PART_OTHER && !hip) g_runPos = -1;   // left the player
     }
-    if (g_runLog) { char m[128]; wsprintfA(m, "run%s m=%d pos=%d %u/%u/%u part=%d tex=%08x", hip ? " HIP" : "", g_curModel, (int)g_runPos, nV, nP, g_stride, part, (DWORD)g_tex0); logline(m); }
+    if (g_runLog) { char m[160]; wsprintfA(m, "run%s m=%d pos=%d %u/%u/%u part=%d tex=%08x%s%s", hip ? " HIP" : "", g_curModel, (int)g_runPos, nV, nP, g_stride, part, (DWORD)g_tex0, hip ? " src=" : "", hip ? SRC_NAME[g_curSrc] : ""); if (hip) lstrcatA(m, g_hipColour ? " colour" : " other"); logline(m); }
     {
         bool detailBoots = (nV == DETAIL_BOOTS_NV && nP == DETAIL_BOOTS_NP) || (nV == DETAIL_BOOT_NV && (nP == DETAIL_BOOT_L_NP || nP == DETAIL_BOOT_R_NP));
         bool detailHands = nV == DETAIL_HANDS_NV && nP == DETAIL_HANDS_NP;
@@ -1662,7 +1665,7 @@ extern "C" __declspec(dllexport) void logic_present(IDirect3DDevice9* d) {
     // gets consumed by an unrelated player's run - patchKit then writes that
     // team's art into whichever sheet that player had bound (the away team wore
     // /g/'s kit, 01-10). Anything still pending when the frame rolls over is stale.
-    g_pendingModel = -1;
+    g_pendingModel = -1; g_pendingSrc = SRC_NONE;
     memcpy(g_keyPrev, g_keyCur, sizeof(g_keyCur)); g_nKeyPrev = g_nKeyCur; g_nKeyCur = 0;
     g_extCur ^= 1; g_nFeet[g_extCur] = g_nHands[g_extCur] = 0;
     if (f % 60 == 0) {
@@ -1681,7 +1684,6 @@ extern "C" __declspec(dllexport) void logic_present(IDirect3DDevice9* d) {
         g_cuCullCW = flagExists(L"cullcw");
         g_kitForceOff = flagExists(L"nokitforce");
         g_kitPatchOff = flagExists(L"nokitpatch");
-        g_kitPatchAll = flagExists(L"kitpatchall");
         g_keepNormalMaps = flagExists(L"gamenormals");
         g_noHairFringe = flagExists(L"nohairfringe");
         g_shaderDump = flagExists(L"shaderdump");
@@ -1756,7 +1758,6 @@ static HRESULT STDMETHODCALLTYPE myCVB(IDirect3DDevice9* d, UINT len, DWORD usag
     bool farVB = len >= OFFICIAL_VB_LO && len < OFFICIAL_VB_HI, closeVB = len >= CLOSE_VB_LO && len < CLOSE_VB_HI;
     if (farVB || closeVB) {
         InterlockedExchange(&g_offNewMatch, 1);
-        g_nKitPatched = 0;   // new match: each team gets its one patch again
         char m[96]; wsprintfA(m, "officials: match load (%s model VB, %u bytes, frame %d)", farVB ? "far" : "close", len, (int)g_frame);
         logline(m);
     }
