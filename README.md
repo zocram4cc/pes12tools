@@ -42,22 +42,23 @@ README says how)..
 ## Player settings (custom bodies)
 
 Each player's folder (`kitserver/4cc-players/custom/p<pid>/`) holds
-`body.bin` (PGB2: header magic/nv/ni/stride/nsub/**mode** + submesh table
+`body.bin` (PGB2: header magic/nv/ni/stride/nsub/**keep** + submesh table
 + 80-byte verts + u32 indices), `body_<k>.tex` (a DXT DDS, or PGT1), and optionally a
-`mode` file with one word. The mode says which stock parts the model
-replaces (drawlogic reads the PGB2 header word unless `mode` exists):
+`mode` file. `keep` has one bit per stock piece drawn with the model; the
+`mode` file, if present, overrides it with the names of the pieces to keep
+(an empty file keeps none):
 
-| mode | stock drawn |
+| piece | the stock draw |
 |---|---|
-| `body` (0) | nothing (whole characters) |
-| `head` (1) | everything but the head (face-slot players) |
-| `kit` (2) | shirt, sleeves, shorts, socks, boots |
-| `boots` (3) | boots only (model stops at the ankle) |
+| `shorts`, `shirt`, `sleeves`, `socks`, `neck`, `gloves`, `head`, `boots`, `other` | the kit run's part classes (`gloves` also the keeper's detail gloves, `boots` the detail boots) |
+| `skin` | the stride-76 skin draw (arms, legs, neck) |
+| `hands` | the bare detail hands (one 12-bone hand rig each) |
 
-Default at import: PES15 hides its body for short socks + tucked shirt
-(every whole-body model has it, no face-only model does); a hidden body
-keeps boots when the model stops above the floor. The EDIT editor
-(`pes2012-editapp/`) shows each player's mode and writes the `mode` file;
+Default at import: nothing for a whole figure (PES15 hides its body for short
+socks + tucked shirt), everything but `head` for a face-slot player, `boots`
+alone for a figure stopping above the floor. A model that wears the stock kit
+and nothing else: `shirt sleeves shorts socks`. The EDIT editor
+(`pes2012-editapp/`) ticks each player's pieces and writes the `mode` file;
 `flags/reload` applies it live.
 
 ## DLC compilation

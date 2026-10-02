@@ -311,7 +311,7 @@ class EXPORT_OT_pes12_bin(bpy.types.Operator, ExportHelper):
 
 # --- PGB2 bodies ---
 
-PGB2_MODES = tuple((m, m, m) for m in pgb2.MODES)
+PGB2_PIECES = tuple((n, n, 'Keep the stock %s drawn' % n, 1 << i) for i, n in enumerate(pgb2.PIECES))
 # material property -> submesh flag bit (every bit PGB2 defines; the ref
 # byte, bits 8-15, is pgb2_alpha_ref)
 FLAG_PROPS = (
@@ -329,10 +329,10 @@ FLAG_PROPS = (
 
 
 def _ensure_props():
-    if not hasattr(bpy.types.Object, 'pgb2_mode'):
-        bpy.types.Object.pgb2_mode = EnumProperty(
-            name='PGB2 mode', items=PGB2_MODES, default='body',
-            description='Which stock parts this body replaces (drawlogic MODE_*)')
+    if not hasattr(bpy.types.Object, 'pgb2_keep'):
+        bpy.types.Object.pgb2_keep = EnumProperty(
+            name='Stock pieces kept', items=PGB2_PIECES, options={'ENUM_FLAG'}, default=set(),
+            description='Stock pieces drawn with this body (drawlogic PIECE_NAMES); none = a whole figure')
     if not hasattr(bpy.types.Material, 'pgb2_alpha_ref'):
         bpy.types.Material.pgb2_alpha_ref = IntProperty(
             name='Alpha ref', default=0, min=0, max=255,
@@ -397,7 +397,7 @@ def import_body(context, filepath):
             else:
                 continue  # body vert on an out-of-range slot: cannot name
             obj.vertex_groups[name].add([vi], w, 'REPLACE')
-    obj.pgb2_mode = pgb2.MODES[parsed['mode']]
+    obj.pgb2_keep = {n for i, n in enumerate(pgb2.PIECES) if parsed['keep'] >> i & 1}
     obj['pgb2_source'] = os.path.abspath(filepath)
     for mi, s in enumerate(parsed['subs']):
         mat = bpy.data.materials.new('%s_sub%d' % (stem, mi))
@@ -484,10 +484,10 @@ def export_body(filepath, obj):
         mat_flags[mi] = _mat_flags(mat)
         mat_tex[mi] = int(mat['pgb2_tex']) if 'pgb2_tex' in mat else 0
         mat_face[mi] = bool(mat.pgb2_face)
-    mode = pgb2.MODES.index(obj.pgb2_mode)
+    keep = sum(1 << pgb2.PIECES.index(n) for n in obj.pgb2_keep)
     open(filepath, 'wb').write(pgb2.pack_body(
         {mi: tris for mi, tris in tri_by_mat.items() if tris},
-        vert_data, mat_flags, mat_tex, mat_face, mode))
+        vert_data, mat_flags, mat_tex, mat_face, keep))
     return sum(len(t) for t in tri_by_mat.values())
 
 

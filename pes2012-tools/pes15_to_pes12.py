@@ -7,15 +7,16 @@ ModelFile.py (no Blender needed), materials from face.xml -> *.mtl (PES15
 layout) or materials.mtl (PES16+ faceneck layout), and writes the
 drawlogic.dll PGB2 format:
 
-  u32 'PGB2', nv, ni, stride(80), nsub, flags
+  u32 'PGB2', nv, ni, stride(80), nsub, keep
   nsub x (u32 firstIndex, u32 indexCount, u32 texture, u32 subFlags)
   nv x 80-byte vertices (fmdl_to_pes12.py's layout), ni x u32 indices
   body_<texture>.tex per texture (PGT1, see fmdl_to_pes12.write_tex)
 
-flags: which stock parts the model replaces (drawlogic MODE_*): 0 BODY all of
-them, 1 HEAD the head only (face-slot players: head, hair and accessories over
-the stock body), 2 KIT all but shirt/shorts/socks/boots, 3 BOOTS all but the
-boots. <game>/kitserver/4cc-players/custom/<name>/mode (head|body|kit|boots) overrides it.
+keep: the stock pieces drawn with the model, one bit per PIECES name
+(drawlogic PIECE_NAMES): none for a whole figure, everything but the head for
+a face-slot player, the boots alone for a figure stopping at the ankle.
+<game>/kitserver/4cc-players/custom/<name>/mode overrides it with piece names, e.g.
+"shirt sleeves shorts socks" for a model that wears the stock kit.
 subFlags (drawlogic SUB_*), from the material's .mtl states: bit0 alpha test
 (ref = bits 8-15, pass alpha > ref), bit1 alpha blend, bit2 two-sided, bit3 no
 depth write, bit4 kit slot (UVs on PES2012's kit sheet; drawlogic binds the
@@ -49,8 +50,18 @@ MF = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(MF)
 
 BODY2_MAGIC = 0x32424750        # 'PGB2'
-MODE_BODY, MODE_HEAD, MODE_KIT, MODE_BOOTS = 0, 1, 2, 3
-MODE_NAMES = ('body', 'head', 'kit', 'boots')
+# the stock pieces a custom model can keep drawn: drawlogic PIECE_NAMES, same
+# order (the kit run's part classes, then the skin draw and the bare hands)
+PIECES = ('shorts', 'shirt', 'sleeves', 'socks', 'neck', 'gloves', 'head', 'boots', 'other', 'skin', 'hands')
+
+
+def keep_mask(*names):
+    return sum(1 << PIECES.index(n) for n in names)
+
+
+KEEP_NONE = 0                                                    # a whole figure
+KEEP_BUT_HEAD = keep_mask(*(n for n in PIECES if n != 'head'))   # a face-slot player
+KEEP_BOOTS = keep_mask('boots')                                  # a figure stopping at the ankle
 # A hidden-body model reaching the floor brings its own feet; one stopping
 # above it stands in PES's boots (Stallman: y 0.07.., real boots id 1; Terry:
 # y -0.17.., boots id 55 = none).
@@ -948,9 +959,9 @@ def convert(folder, kit_dds, out_dir, hide_body=None):
     ys += [struct.unpack_from('<3f', verts[i])[1] + head_p12[1] for i in face_idx]
     ys = ys or [0]
     whole = geometry_whole if hide_body is None else hide_body
-    mode = (MODE_BODY if min(ys) < OWN_FEET_Y else MODE_BOOTS) if whole else MODE_HEAD
+    keep = (KEEP_NONE if min(ys) < OWN_FEET_Y else KEEP_BOOTS) if whole else KEEP_BUT_HEAD
     with open(os.path.join(out_dir, 'body.bin'), 'wb') as o:
-        o.write(struct.pack('<6I', BODY2_MAGIC, len(verts), len(idx), F.VERTEX_STRIDE, len(subs), mode))
+        o.write(struct.pack('<6I', BODY2_MAGIC, len(verts), len(idx), F.VERTEX_STRIDE, len(subs), keep))
         for s in subs:
             o.write(struct.pack('<4I', *s))
         o.write(b''.join(verts))
@@ -960,9 +971,9 @@ def convert(folder, kit_dds, out_dir, hide_body=None):
     with ThreadPoolExecutor() as pool:
         list(pool.map(lambda kt: write_tex(kt[1], os.path.join(out_dir, 'body_%d.tex' % kt[0])),
                       enumerate(textures)))
-    print('%s: %d verts, %d tris, %d submeshes, %d textures, mode %s, y %.2f..%.2f' % (
+    print('%s: %d verts, %d tris, %d submeshes, %d textures, keeps %s, y %.2f..%.2f' % (
         os.path.basename(folder), len(verts), len(idx) // 3, len(subs), len(textures),
-        MODE_NAMES[mode], min(ys), max(ys)))
+        ' '.join(n for i, n in enumerate(PIECES) if keep >> i & 1) or 'nothing', min(ys), max(ys)))
 
 
 if __name__ == '__main__':

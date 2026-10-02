@@ -36,14 +36,13 @@ TABS = [  # tab title -> field groups shown on it, in order
     ('Accessories', ['Accessories', 'Strip style']),
 ]
 RAW_COLUMNS = 8   # raw-byte tab: bytes per row
-# Custom models (drawlogic): <4cc-players>/custom/p<pid>/body.bin; the mode
-# (which stock parts it replaces) is the PGB2 header word, overridden by a
-# text file 'mode' beside it (09-pes15-import.md). Order = header values.
-MODES = ['body', 'head', 'kit', 'boots']
-MODE_HELP = {'body': 'hides the whole stock player', 'head': 'hides the stock head only',
-             'kit': 'keeps shirt, shorts, socks, boots', 'boots': 'keeps the boots only'}
+# Custom models (drawlogic): <4cc-players>/custom/p<pid>/body.bin; the stock
+# pieces drawn with it are the PGB2 header's keep mask (one bit per PIECES
+# name, drawlogic PIECE_NAMES order), overridden by a text file 'mode' beside
+# it listing the pieces to keep (empty = none: a whole figure).
+PIECES = ['shorts', 'shirt', 'sleeves', 'socks', 'neck', 'gloves', 'head', 'boots', 'other', 'skin', 'hands']
 PGB2_MAGIC = 0x32424750
-PGB2_MODE_WORD = 5            # header: magic nv ni stride nsub mode
+PGB2_KEEP_WORD = 5            # header: magic nv ni stride nsub keep
 CSV_FIXED = ['slot', 'number', 'name', 'shirt']
 POS_COLUMNS = 4
 
@@ -139,13 +138,16 @@ class MainWindow(QMainWindow):
         g = QGroupBox("Custom model")
         gl = QHBoxLayout(g)
         self.cu_label = QLabel("-")
-        self.cu_mode = QComboBox()
-        self.cu_mode.addItems(['%s - %s' % (m, MODE_HELP[m]) for m in MODES])
-        self.cu_mode.currentIndexChanged.connect(self.mode_changed)
+        gl.addWidget(self.cu_label, 1)
+        gl.addWidget(QLabel("keeps stock:"))
+        self.cu_keep = {}
+        for name in PIECES:
+            c = QCheckBox(name)
+            c.toggled.connect(self.keep_changed)
+            self.cu_keep[name] = c
+            gl.addWidget(c)
         b = QPushButton("Reload in game")
         b.clicked.connect(self.reload_models)
-        gl.addWidget(self.cu_label, 1)
-        gl.addWidget(self.cu_mode)
         gl.addWidget(b)
         rl.addWidget(g)
         self.tabs = QTabWidget()
@@ -384,7 +386,8 @@ class MainWindow(QMainWindow):
         d = self.model_dir()
         body = d and os.path.join(d, 'body.bin')
         ok = bool(body and os.path.isfile(body))
-        self.cu_mode.setEnabled(ok)
+        for c in self.cu_keep.values():
+            c.setEnabled(ok)
         if not self.config_manager.get('players_dir'):
             self.cu_label.setText("set File > 4cc-players folder")
             return
@@ -393,21 +396,25 @@ class MainWindow(QMainWindow):
             return
         mode_file = os.path.join(d, 'mode')
         if os.path.isfile(mode_file):
-            word = open(mode_file).read().split()
-            mode = MODES.index(word[0]) if word and word[0] in MODES else 0
+            kept = set(open(mode_file).read().lower().split())
         else:
-            head = open(body, 'rb').read(4 * (PGB2_MODE_WORD + 1))
+            head = open(body, 'rb').read(4 * (PGB2_KEEP_WORD + 1))
             words = struct.unpack('<%dI' % (len(head) // 4), head)
-            mode = words[PGB2_MODE_WORD] if words[0] == PGB2_MAGIC and words[PGB2_MODE_WORD] < len(MODES) else 0
-        self.cu_mode.setCurrentIndex(mode)
+            mask = words[PGB2_KEEP_WORD] if words[0] == PGB2_MAGIC else 0
+            kept = {n for i, n in enumerate(PIECES) if mask >> i & 1}
+        loading, self._loading = self._loading, True
+        for name, c in self.cu_keep.items():
+            c.setChecked(name in kept)
+        self._loading = loading
         self.cu_label.setText("p%d" % self.pid)
 
-    def mode_changed(self, index):
+    def keep_changed(self, _checked):
         if self._loading or not self.model_dir():
             return
+        kept = [n for n in PIECES if self.cu_keep[n].isChecked()]
         with open(os.path.join(self.model_dir(), 'mode'), 'w') as f:
-            f.write(MODES[index] + '\n')
-        self.status_bar.showMessage("mode %s written; Reload in game to apply" % MODES[index], 5000)
+            f.write(' '.join(kept) + '\n')
+        self.status_bar.showMessage("keeps %s; Reload in game to apply" % (' '.join(kept) or 'nothing'), 5000)
 
     def reload_models(self):
         root = self.config_manager.get('players_dir', '')

@@ -121,15 +121,15 @@ pes2012-tools.
 
 - **File > Import > PGB2 body**: one mesh, one material per submesh, vertex
   groups for the 21 body slots and the 27 face slots (`face_00`..`face_26`).
-- Set the object's **PGB2 mode** and per-material flags, then select the
-  mesh and **File > Export > PGB2 body**.
+- Tick the object's **Stock pieces kept** (`pgb2_keep`) and per-material
+  flags, then select the mesh and **File > Export > PGB2 body**.
 
-| object `pgb2_mode` | stock parts drawlogic still draws |
-|---|---|
-| `body` | nothing (whole characters) |
-| `head` | everything but the head |
-| `kit` | shirt, sleeves, shorts, socks, boots |
-| `boots` | boots only |
+`pgb2_keep` = the stock pieces drawlogic still draws with the body (none
+ticked = a whole figure): `shorts`, `shirt`, `sleeves`, `socks`, `neck`,
+`gloves`, `head`, `boots`, `other` (the kit run's part classes; `gloves` and
+`boots` include the detail gloves and boots), `skin` (arms, legs, neck) and
+`hands` (the bare detail hands). A face-slot player keeps everything but
+`head`; a model wearing only the stock kit keeps `shirt sleeves shorts socks`.
 
 | material property | bit | meaning |
 |---|---|---|

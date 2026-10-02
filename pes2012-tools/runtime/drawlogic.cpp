@@ -84,6 +84,16 @@ static const UINT KIT_MAIN_NV = 696, KIT_MAIN_NP = 1929, KIT_MAIN_STRIDE = 72;
 static const UINT DETAIL_HANDS_NV = 466, DETAIL_HANDS_NP = 565;        // both hands, stride 68
 static const UINT DETAIL_BOOTS_NV = 930, DETAIL_BOOTS_NP = 1907;       // both feet, stride 64
 static const UINT DETAIL_BOOT_NV = 228, DETAIL_BOOT_L_NP = 579, DETAIL_BOOT_R_NP = 573;   // one foot each, stride 68
+// The bare hands and keeper gloves (dt0d.img #589 blocks 2-5, 02-10: bytes =
+// the in-game draw), one per hand, each on its own 12-bone hand rig (wrist
+// root, 3-bone thumb, 2 bones per finger); they draw beside the boots, before
+// the player's skin draw, so no kit run holds them (Kurisu's stock palms).
+static const UINT DETAIL_HAND_STRIDE = 80, DETAIL_HAND_L_NV = 305, DETAIL_HAND_L_NP = 731, DETAIL_HAND_R_NV = 302, DETAIL_HAND_R_NP = 715;
+static const UINT DETAIL_GLOVE_STRIDE = 72, DETAIL_GLOVE_NV = 293, DETAIL_GLOVE_L_NP = 711, DETAIL_GLOVE_R_NP = 703;
+// A detail rig's root (the wrist / ankle, bind at the mesh origin) sits in
+// any of its first palette slots (#589: slot 0 for the right hand, slot 2
+// for the left), so ownership takes the nearest of them.
+static const UINT DETAIL_RIG_BONES = 12;
 // owner match: 30-09 replay, hidden players' boots sat 0.17-0.33 m from their
 // projected feet, every other player's 3 m or more
 static const float DETAIL_OWNER_MAX_M = 0.5f;
@@ -244,10 +254,6 @@ static float g_psc[PSC_N][4];
 static const DWORD TEX_MAGIC = 0x31544750;      // 'PGT1'
 static const DWORD CUSTOM_MAGIC = 0x31424750;   // 'PGB1': one texture, u16 indices
 static const DWORD CUSTOM2_MAGIC = 0x32424750;  // 'PGB2': submeshes, u32 indices, flags
-// PGB2 header flags = which stock parts the custom model replaces (PES21 Full
-// Player Customization's four cases). 4cc-players\custom\<name>\mode ("head",
-// "body", "kit", "boots") overrides the header.
-enum { MODE_BODY = 0, MODE_HEAD = 1, MODE_KIT = 2, MODE_BOOTS = 3, MODE_COUNT };
 // The stock player, measured 26-09 from grabbed stock frames (tools/grab.py,
 // bounds of each draw's vertices): one stride-76 skin draw (arms, legs, neck
 // and bare hands; it samples the face atlas the marker rides on), then the
@@ -259,19 +265,19 @@ enum { MODE_BODY = 0, MODE_HEAD = 1, MODE_KIT = 2, MODE_BOOTS = 3, MODE_COUNT };
 enum Part { PART_SHORTS, PART_SHIRT, PART_SLEEVES, PART_SOCKS, PART_NECK, PART_GLOVES,
             PART_HEAD, PART_BOOTS, PART_OTHER, PART_COUNT };
 static const unsigned PART_BIT = 1;
-static const unsigned PARTS_ALL = (PART_BIT << PART_COUNT) - 1;
-static const unsigned PARTS_KIT = (PART_BIT << PART_SHORTS) | (PART_BIT << PART_SHIRT) |
-                                  (PART_BIT << PART_SLEEVES) | (PART_BIT << PART_SOCKS) | (PART_BIT << PART_BOOTS);
-static const unsigned MODE_PART_HIDE[MODE_COUNT] = {
-    PARTS_ALL,                            // body: the custom model is the whole player
-    PART_BIT << PART_HEAD,                // head: stock body and kit stay
-    PARTS_ALL & ~PARTS_KIT,               // kit: only shirt, shorts, socks, boots stay
-    PARTS_ALL & ~(PART_BIT << PART_BOOTS) // boots: only the boots stay
-};
-static const bool MODE_HIDES_SKIN[MODE_COUNT] = { true, false, true, true };
+// The stock pieces a custom model keeps drawn, one bit each: the kit run's
+// part classes, then the skin draw and the detail hands (bare hands; the
+// keeper gloves follow PART_GLOVES, the detail boots PART_BOOTS). PGB2 header
+// field 5 holds the mask (tools/pes15_to_pes12.py PIECES, same order);
+// 4cc-players\custom\<name>\mode overrides it with the names of the pieces
+// to keep, e.g. "shirt sleeves shorts socks" (an empty file keeps nothing).
+enum { PIECE_SKIN = PART_COUNT, PIECE_HANDS, PIECE_COUNT };
+static const char* PIECE_NAMES[PIECE_COUNT] = { "shorts", "shirt", "sleeves", "socks", "neck", "gloves",
+                                                "head", "boots", "other", "skin", "hands" };
+static bool keeps(DWORD keep, int piece) { return (keep >> piece) & 1; }
 // class boundaries (metres, from the 26-09 bounds table)
 static const float LOCAL_SPACE_MAX_Y = 0.3f;    // head pieces/boots top out at 0.17
-static const float BOOT_MAX_Y = 0.03f;          // boots 305/302 verts: y -0.07..0.02; eyes/teeth sit at 0.04+
+static const float BOOT_MAX_Y = 0.03f;          // boots, and the bare hands (305/302 verts, hand-local), y -0.07..0.02; eyes/teeth sit at 0.04+
 static const float BOOT_MIN_WIDTH = 0.1f;       // a boot is 0.15 wide on one side of x = 0; an eye 0.03
 static const float SOCKS_MAX_Y = 0.55f;         // socks 0.06..0.51
 static const float SHORTS_MAX_Y = 1.1f;         // shorts + shorts number 0.61..1.07
@@ -333,7 +339,7 @@ struct CustomModel {
     IDirect3DVertexBuffer9* vb; IDirect3DIndexBuffer9* ib;
     IDirect3DTexture9* tex[MAX_TEXS]; UINT ntex;
     CustomSub sub[MAX_SUBS]; UINT nsub;
-    UINT nv, ni, stride; DWORD flags; bool tried;
+    UINT nv, ni, stride; DWORD keep; bool tried;   // keep: stock pieces drawn (PIECE_NAMES bits)
     LONG pid, lastUsed;                          // resident-cache key, frame of last use
     float minY;                                  // lowest vertex (m): does it stand on its own
 };
@@ -682,19 +688,24 @@ static void releaseModel(CustomModel& M) {
     for (UINT i = 0; i < M.ntex; i++) if (M.tex[i]) M.tex[i]->Release();
     M.vb = NULL; M.ib = NULL; M.ntex = 0;
 }
-// 4cc-players\custom\<name>\mode: first word head|body|kit|boots, else -1
-static int readModeFile(const wchar_t* dir) {
+// 4cc-players\custom\<name>\mode: the stock pieces to keep (PIECE_NAMES,
+// separated by anything that is not a letter) -> mask; no file -> false
+static bool readModeFile(const wchar_t* dir, DWORD* keep) {
     wchar_t p[MAX_PATH]; lstrcpyW(p, dir); lstrcatW(p, L"mode");
     HANDLE f = CreateFileW(p, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE, NULL, OPEN_EXISTING, 0, NULL);
-    if (f == INVALID_HANDLE_VALUE) return -1;
-    char b[16] = {0}; DWORD r = 0; ReadFile(f, b, 15, &r, NULL); CloseHandle(f);
-    for (DWORD i = 0; i < r; i++) b[i] |= 0x20;   // lower case
-    static const char* NAMES[MODE_COUNT] = { "body", "head", "kit", "boots" };
-    for (int m = 0; m < MODE_COUNT; m++) {
-        int n = lstrlenA(NAMES[m]);
-        if (!memcmp(b, NAMES[m], n)) return m;
+    if (f == INVALID_HANDLE_VALUE) return false;
+    char b[256] = {0}; DWORD r = 0; ReadFile(f, b, sizeof(b) - 1, &r, NULL); CloseHandle(f);
+    *keep = 0;
+    for (DWORD i = 0; i < r; ) {
+        while (i < r && !((b[i] | 0x20) >= 'a' && (b[i] | 0x20) <= 'z')) i++;
+        DWORD j = i; while (j < r && (b[j] | 0x20) >= 'a' && (b[j] | 0x20) <= 'z') { b[j] |= 0x20; j++; }
+        if (j == i) break;
+        int k = 0; while (k < PIECE_COUNT && !(lstrlenA(PIECE_NAMES[k]) == (int)(j - i) && !memcmp(b + i, PIECE_NAMES[k], j - i))) k++;
+        if (k < PIECE_COUNT) *keep |= PART_BIT << k;
+        else { char m[96]; b[j] = 0; wsprintfA(m, "custom: unknown stock piece '%s' in mode", b + i); logline(m); }
+        i = j;
     }
-    return -1;
+    return true;
 }
 // dir: folder holding body.bin (+ body.tex | body_<k>.tex)
 static bool loadModel(IDirect3DDevice9* d, CustomModel& M, const wchar_t* dir) {
@@ -707,14 +718,14 @@ static bool loadModel(IDirect3DDevice9* d, CustomModel& M, const wchar_t* dir) {
     M.nv = hd[1]; M.ni = hd[2]; M.stride = hd[3];
     BYTE* at = b + 16;
     if (v2) {
-        M.nsub = hd[4] < (DWORD)MAX_SUBS ? hd[4] : MAX_SUBS; M.flags = hd[5];
+        M.nsub = hd[4] < (DWORD)MAX_SUBS ? hd[4] : MAX_SUBS; M.keep = hd[5];
         memcpy(M.sub, b + 24, M.nsub * sizeof(CustomSub));
         at = b + 24 + hd[4] * sizeof(CustomSub);
     } else {
-        M.nsub = 1; M.flags = 0; M.sub[0].first = 0; M.sub[0].count = M.ni; M.sub[0].tex = 0; M.sub[0].flags = 0;
+        M.nsub = 1; M.keep = 0; M.sub[0].first = 0; M.sub[0].count = M.ni; M.sub[0].tex = 0; M.sub[0].flags = 0;
     }
-    { int o = readModeFile(dir); if (o >= 0) M.flags = (DWORD)o; }
-    if (M.flags >= (DWORD)MODE_COUNT) M.flags = MODE_BODY;
+    { DWORD k; if (readModeFile(dir, &k)) M.keep = k; }
+    M.keep &= (PART_BIT << PIECE_COUNT) - 1;
     UINT isz = v2 ? 4 : 2, vlen = M.nv * M.stride, ilen = M.ni * isz;
     void* p = NULL;
     bool ok = SUCCEEDED(d->CreateVertexBuffer(vlen, D3DUSAGE_WRITEONLY, 0, D3DPOOL_MANAGED, &M.vb, NULL))
@@ -733,7 +744,7 @@ static bool loadModel(IDirect3DDevice9* d, CustomModel& M, const wchar_t* dir) {
         M.tex[k] = loadTex(d, path);
         if (!M.tex[k]) { char e[MAX_PATH + 48]; wsprintfA(e, "custom %s: texture %u failed to load (%S)", M.name, k, path); logline(e); }
     }
-    char m[160]; wsprintfA(m, "custom %s: ok=%d nv=%u ni=%u subs=%u texs=%u mode=%u", M.name, (int)ok, M.nv, M.ni, M.nsub, M.ntex, M.flags); logline(m);
+    char m[160]; wsprintfA(m, "custom %s: ok=%d nv=%u ni=%u subs=%u texs=%u keep=%03x", M.name, (int)ok, M.nv, M.ni, M.nsub, M.ntex, M.keep); logline(m);
     if (!ok) releaseModel(M);
     return ok;
 }
@@ -801,7 +812,7 @@ static int g_facelog = 0;
 // and boots poking out of Kurisu's mode-body model). They are matched to their
 // player on screen: each hidden custom player's feet and hands are projected
 // with exactly what its custom draw uses, each detail draw by its slot-0 bone.
-struct Extremity { float x, y, w; int model; };
+struct Extremity { float x, y, w; int model; DWORD hidden; };   // hidden: PIECE bits of this player's stock pieces it stands for
 static const int MAX_EXTREMITIES = 64;
 static Extremity g_feet[2][MAX_EXTREMITIES], g_hands[2][MAX_EXTREMITIES];
 static int g_nFeet[2], g_nHands[2], g_extCur = 0;
@@ -815,30 +826,42 @@ static Extremity projectBone(const float (*M)[4], const float* p) {
     for (int r = 0; r < 3; r++) w[r] = M[r][0] * p[0] + M[r][1] * p[1] + M[r][2] * p[2] + M[r][3];
     float c[4];
     for (int r = 0; r < 4; r++) c[r] = g_vsc[16 + r][0] * w[0] + g_vsc[16 + r][1] * w[1] + g_vsc[16 + r][2] * w[2] + g_vsc[16 + r][3] * w[3];
-    Extremity e = { c[3] != 0 ? c[0] / c[3] : 0, c[3] != 0 ? c[1] / c[3] : 0, c[3], -1 };
+    Extremity e = { c[3] != 0 ? c[0] / c[3] : 0, c[3] != 0 ? c[1] / c[3] : 0, c[3], -1, 0 };
     return e;
 }
-static void noteExtremities(const float (*c)[4], unsigned hideParts, bool hideSkin, int model) {
+static void noteExtremities(const float (*c)[4], DWORD keep, int model) {
     int k = g_extCur;
-    if ((hideParts >> PART_BOOTS) & 1) {
+    if (!keeps(keep, PART_BOOTS)) {
         const UINT sl[2] = { SLOT_FOOT_L, SLOT_FOOT_R }; const float* bp[2] = { FOOT_BIND_L, FOOT_BIND_R };
-        for (int i = 0; i < 2 && g_nFeet[k] < MAX_EXTREMITIES; i++) { Extremity e = projectBone(c + sl[i] * BONE_REGS, bp[i]); e.model = model; g_feet[k][g_nFeet[k]++] = e; }
+        for (int i = 0; i < 2 && g_nFeet[k] < MAX_EXTREMITIES; i++) { Extremity e = projectBone(c + sl[i] * BONE_REGS, bp[i]); e.model = model; e.hidden = PART_BIT << PART_BOOTS; g_feet[k][g_nFeet[k]++] = e; }
     }
-    if (hideSkin) {
+    DWORD hands = ((keeps(keep, PIECE_HANDS) ? 0 : PART_BIT << PIECE_HANDS) | (keeps(keep, PART_GLOVES) ? 0 : PART_BIT << PART_GLOVES));
+    if (hands) {
         const UINT sl[2] = { SLOT_HAND_L, SLOT_HAND_R }; const float* bp[2] = { HAND_BIND_L, HAND_BIND_R };
-        for (int i = 0; i < 2 && g_nHands[k] < MAX_EXTREMITIES; i++) { Extremity e = projectBone(c + sl[i] * BONE_REGS, bp[i]); e.model = model; g_hands[k][g_nHands[k]++] = e; }
+        for (int i = 0; i < 2 && g_nHands[k] < MAX_EXTREMITIES; i++) { Extremity e = projectBone(c + sl[i] * BONE_REGS, bp[i]); e.model = model; e.hidden = hands; g_hands[k][g_nHands[k]++] = e; }
     }
 }
-// nearest recorded extremity (this frame and the last) to this draw's slot-0 bone, in metres at its depth
-static float nearestExtremity(bool feet, int* model) {
-    float o[3] = { 0, 0, 0 }; Extremity me = projectBone(&g_vsc[BONE_REG0], o);
+// nearest recorded extremity (this frame and the last) to this draw's rig
+// root, in metres at its depth: the nearest of its first DETAIL_RIG_BONES
+// palette bones, each at the mesh origin (#589's pieces are modelled about
+// their wrist / ankle) and at the two bind joints (the 930-vertex boots are
+// both feet in body bind, 02-10 grab: at the origin their bones sat 11 cm off)
+static float nearestExtremity(int piece, int* model) {
+    bool feet = piece == PART_BOOTS;
+    static const float ORIGIN[3] = { 0, 0, 0 };
+    const float* at[3] = { ORIGIN, feet ? FOOT_BIND_L : HAND_BIND_L, feet ? FOOT_BIND_R : HAND_BIND_R };
     float best = 1e9f; *model = -1;
-    for (int f = 0; f < 2; f++) {
-        int n = feet ? g_nFeet[f] : g_nHands[f]; Extremity* a = feet ? g_feet[f] : g_hands[f];
-        for (int i = 0; i < n; i++) {
-            float dx = (a[i].x - me.x) * me.w, dy = (a[i].y - me.y) * me.w, dw = a[i].w - me.w;
-            float dd = sqrtf(dx * dx + dy * dy + dw * dw);
-            if (dd < best) { best = dd; *model = a[i].model; }
+    const UINT NAT = sizeof(at) / sizeof(at[0]);
+    for (UINT b = 0; b < DETAIL_RIG_BONES * NAT; b++) {
+        Extremity me = projectBone(&g_vsc[BONE_REG0 + (b / NAT) * BONE_REGS], at[b % NAT]);
+        for (int f = 0; f < 2; f++) {
+            int n = feet ? g_nFeet[f] : g_nHands[f]; Extremity* a = feet ? g_feet[f] : g_hands[f];
+            for (int i = 0; i < n; i++) {
+                if (!keeps(a[i].hidden, piece)) continue;
+                float dx = (a[i].x - me.x) * me.w, dy = (a[i].y - me.y) * me.w, dw = a[i].w - me.w;
+                float dd = sqrtf(dx * dx + dy * dy + dw * dw);
+                if (dd < best) { best = dd; *model = a[i].model; }
+            }
         }
     }
     return best;
@@ -850,7 +873,7 @@ static HRESULT drawCustomLod0(IDirect3DDevice9* d) {
     for (UINT k = 0; k < CU_SLOTS; k++)
         for (UINT r = 0; r < BONE_REGS; r++)
             memcpy(c[k * BONE_REGS + r], CU_SRC_PKT[k] == 0 ? g_hipM[r] : g_vsc[BONE_REG0 + CU_SRC_SLOT[k] * BONE_REGS + r], 16);
-    noteExtremities(c, MODE_PART_HIDE[g_cuM->flags], MODE_HIDES_SKIN[g_cuM->flags], g_curModel);
+    noteExtremities(c, g_cuM->keep, g_curModel);
     return drawWithBones(d, c, "player");
 }
 
@@ -1438,7 +1461,7 @@ static HRESULT STDMETHODCALLTYPE myDIP(IDirect3DDevice9* d, D3DPRIMITIVETYPE t,
                 LONG guess = g_offRun < MAX_OFFICIALS_RUNS ? g_runPidPrev[g_offRun] : -1;
                 if (g_officialPid > 0) guess = g_officialPid;
                 hideBody = (g_officialPid > 0 || g_nPool > 0) && g_passVS[1] &&
-                           (guess <= 0 || (useModel(d, guess) && (g_cuM->flags == MODE_BODY || g_cuM->minY < OFFICIAL_FULL_FIGURE_FOOT_M)));
+                           (guess <= 0 || (useModel(d, guess) && (g_cuM->keep == 0 || g_cuM->minY < OFFICIAL_FULL_FIGURE_FOOT_M)));
             }
             if (hideBody) return D3D_OK;
         } else if (open) {
@@ -1489,7 +1512,7 @@ static HRESULT STDMETHODCALLTYPE myDIP(IDirect3DDevice9* d, D3DPRIMITIVETYPE t,
             IDirect3DVertexShader9* vs = NULL; d->GetVertexShader(&vs); bool col = isColourVS(vs); if (vs) vs->Release();
             char m[128]; wsprintfA(m, "run SKIN %u/%u/%u tex=%08x mk=%d pend=%d src=%s %s", nV, nP, g_stride, (DWORD)g_tex0, mk, g_pendingModel, SRC_NAME[g_pendingSrc], col ? "colour" : "other"); logline(m);
         }
-        if (g_pendingModel >= 0 && useModel(d, g_pendingModel) && MODE_HIDES_SKIN[g_cuM->flags]) return D3D_OK;
+        if (g_pendingModel >= 0 && useModel(d, g_pendingModel) && !keeps(g_cuM->keep, PIECE_SKIN)) return D3D_OK;
     }
     bool hip = nV == KIT_HIP_NV && nP == KIT_HIP_NP && g_stride == KIT_HIP_STRIDE;
     if (hip) { g_runPos = 0; g_runKitTex = g_tex0; }
@@ -1561,16 +1584,19 @@ static HRESULT STDMETHODCALLTYPE myDIP(IDirect3DDevice9* d, D3DPRIMITIVETYPE t,
     if (g_runLog) { char m[160]; wsprintfA(m, "run%s m=%d pos=%d %u/%u/%u part=%d tex=%08x%s%s", hip ? " HIP" : "", g_curModel, (int)g_runPos, nV, nP, g_stride, part, (DWORD)g_tex0, hip ? " src=" : "", hip ? SRC_NAME[g_curSrc] : ""); if (hip) lstrcatA(m, g_hipColour ? " colour" : " other"); logline(m); }
     {
         bool detailBoots = (nV == DETAIL_BOOTS_NV && nP == DETAIL_BOOTS_NP) || (nV == DETAIL_BOOT_NV && (nP == DETAIL_BOOT_L_NP || nP == DETAIL_BOOT_R_NP));
-        bool detailHands = nV == DETAIL_HANDS_NV && nP == DETAIL_HANDS_NP;
-        if (detailBoots || detailHands) {
-            int who; float dm = nearestExtremity(detailBoots, &who);
-            if (g_runLog) { char m[128]; wsprintfA(m, "  detail %s %u/%u/%u: nearest hidden model %d at %d mm", detailBoots ? "boots" : "hands", nV, nP, g_stride, who, (int)(dm * 1000)); logline(m); }
+        bool detailHands = (nV == DETAIL_HANDS_NV && nP == DETAIL_HANDS_NP) ||
+            (g_stride == DETAIL_HAND_STRIDE && ((nV == DETAIL_HAND_L_NV && nP == DETAIL_HAND_L_NP) || (nV == DETAIL_HAND_R_NV && nP == DETAIL_HAND_R_NP)));
+        bool detailGloves = g_stride == DETAIL_GLOVE_STRIDE && nV == DETAIL_GLOVE_NV && (nP == DETAIL_GLOVE_L_NP || nP == DETAIL_GLOVE_R_NP);
+        if (detailBoots || detailHands || detailGloves) {
+            int piece = detailBoots ? (int)PART_BOOTS : detailHands ? (int)PIECE_HANDS : (int)PART_GLOVES;
+            int who; float dm = nearestExtremity(piece, &who);
+            if (g_runLog) { char m[128]; wsprintfA(m, "  detail %s %u/%u/%u: nearest hiding model %d at %d mm", PIECE_NAMES[piece], nV, nP, g_stride, who, (int)(dm * 1000)); logline(m); }
             if (dm < DETAIL_OWNER_MAX_M) return D3D_OK;   // a hidden custom player's own
         }
     }
     if (g_runPos >= 0 && g_curModel >= 0 && useModel(d, g_curModel)) {
         bool main = nV == KIT_MAIN_NV && nP == KIT_MAIN_NP && g_stride == KIT_MAIN_STRIDE;
-        bool hidden = (MODE_PART_HIDE[g_cuM->flags] >> part) & 1;
+        bool hidden = !keeps(g_cuM->keep, part);
         bool faceDraw = (nV == FACE_DRAW_NV_A || nV == FACE_DRAW_NV_B) && g_stride == FACE_DRAW_STRIDE;
         if (faceDraw && g_kitVS) {
             if (!hidden) g_orgDIP(d, t, bV, mV, nV, sI, nP);

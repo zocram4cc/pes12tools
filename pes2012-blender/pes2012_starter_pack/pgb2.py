@@ -1,11 +1,11 @@
 """PGB2 custom body codec: drawlogic.dll's per-player body format.
 
 Pure python, no Blender. Provenance: tools/pes15_to_pes12.py docstring and
-(header magic/nv/ni/stride/nsub/mode, submesh table,
+(header magic/nv/ni/stride/nsub/keep, submesh table,
 80-byte vertices, u32 indices, body_<k>.tex PGT1 textures).
 
 Layout:
-  u32 magic 'PGB2', nv, ni, stride(80), nsub, mode
+  u32 magic 'PGB2', nv, ni, stride(80), nsub, keep (stock pieces drawn, PIECES bits)
   nsub x (u32 firstIndex, u32 indexCount, u32 texture, u32 subFlags)
   nv x 80-byte vertices, ni x u32 indices
 
@@ -24,8 +24,8 @@ STRIDE = 80
 TEX_MAGIC = 0x31544750  # 'PGT1'
 VERT_FMT = '<3f3f4B3f3f3f2f2f'
 
-MODE_BODY, MODE_HEAD, MODE_KIT, MODE_BOOTS = 0, 1, 2, 3
-MODES = ('body', 'head', 'kit', 'boots')
+# stock pieces a body can keep drawn: drawlogic PIECE_NAMES, same bit order
+PIECES = ('shorts', 'shirt', 'sleeves', 'socks', 'neck', 'gloves', 'head', 'boots', 'other', 'skin', 'hands')
 
 SUB_ALPHATEST, SUB_BLEND, SUB_TWOSIDED, SUB_NOZWRITE = 1, 2, 4, 8
 SUB_KIT, SUB_OUTLINE, SUB_FACE = 16, 32, 64
@@ -97,8 +97,8 @@ def unpack_vertex(buf, off=0):
 
 
 def parse(data):
-    """bytes -> dict(mode, subs, verts, idx); verts are unpack_vertex dicts."""
-    magic, nv, ni, stride, nsub, mode = struct.unpack_from('<6I', data, 0)
+    """bytes -> dict(keep, subs, verts, idx); verts are unpack_vertex dicts."""
+    magic, nv, ni, stride, nsub, keep = struct.unpack_from('<6I', data, 0)
     if magic != MAGIC:
         raise ValueError('not a PGB2 body')
     if stride != STRIDE:
@@ -108,17 +108,17 @@ def parse(data):
     verts = [unpack_vertex(data, vbase + STRIDE * k) for k in range(nv)]
     ibase = vbase + STRIDE * nv
     idx = list(struct.unpack_from('<%dI' % ni, data, ibase))
-    return dict(mode=mode, subs=[dict(first=s[0], count=s[1], tex=s[2],
+    return dict(keep=keep, subs=[dict(first=s[0], count=s[1], tex=s[2],
                                       flags=s[3]) for s in subs],
                 verts=verts, idx=idx)
 
 
-def build(mode, verts, idx, subs):
+def build(keep, verts, idx, subs):
     """verts: unpack_vertex-style dicts (pos/slots/weights/...); returns bytes."""
     nv, ni = len(verts), len(idx)
     if nv > 0xFFFFFFFF or ni > 0xFFFFFFFF:
         raise ValueError('body too large')
-    out = bytearray(struct.pack('<6I', MAGIC, nv, ni, STRIDE, len(subs), mode))
+    out = bytearray(struct.pack('<6I', MAGIC, nv, ni, STRIDE, len(subs), keep))
     for s in subs:
         out += struct.pack('<4I', s['first'], s['count'], s['tex'], s['flags'])
     for v in verts:
@@ -128,7 +128,7 @@ def build(mode, verts, idx, subs):
     return bytes(out)
 
 
-def pack_body(tris_by_mat, vert_data, mat_flags, mat_tex, mat_face, mode):
+def pack_body(tris_by_mat, vert_data, mat_flags, mat_tex, mat_face, keep):
     """Pure assembly: per-vert data + triangle soup -> PGB2 bytes.
     Blender's export_body is a thin adapter reading mesh state into these
     plain dicts; tests/ drives this directly against p272101.
@@ -163,13 +163,13 @@ def pack_body(tris_by_mat, vert_data, mat_flags, mat_tex, mat_face, mode):
                 idx.append(len(verts) - 1)
         subs.append(dict(first=first, count=len(idx) - first,
                          tex=mat_tex.get(mi, 0), flags=flags))
-    return build(mode, verts, idx, subs)
+    return build(keep, verts, idx, subs)
 
 
 def round_trip(data):
     """Parse-compare helper: returns (parsed, rebuilt_bytes)."""
     p = parse(data)
-    return p, build(p['mode'], p['verts'], p['idx'], p['subs'])
+    return p, build(p['keep'], p['verts'], p['idx'], p['subs'])
 
 
 # --- PGT1 textures (body_<k>.tex): u32 'PGT1', w, h, nmips, BGRA8 mips ---

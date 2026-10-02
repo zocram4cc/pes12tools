@@ -71,8 +71,8 @@ On Wayland it runs natively; `QT_QPA_PLATFORM=xcb` forces X11 if needed.
   (asks for the game folder, which it reads for the stock team names).
 - **Custom model** (needs **File > Set 4cc-players folder**, i.e.
   `kitserver/4cc-players` of the custom-body runtime): shows whether the
-  player has `custom/p<id>/body.bin`, sets which stock parts it replaces,
-  and **Reload in game** makes drawlogic reload models within a second.
+  player has `custom/p<id>/body.bin`, ticks which stock pieces stay drawn
+  with it (written to its `mode` file), and **Reload in game** makes drawlogic reload models within a second.
 
 Settings (last folder, game folder, 4cc-players folder) are kept in
 `%APPDATA%\PES12EditApp\config.yaml` on Windows and
