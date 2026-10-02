@@ -292,6 +292,15 @@ static const DWORD SUB_ALPHATEST = 1, SUB_BLEND = 2, SUB_TWOSIDED = 4, SUB_NOZWR
 // replace the game's lit kit shader for those submeshes in the colour pass.
 static const DWORD SUB_SHADELESS = 1u << 16, SUB_TOON = 1u << 17;
 static const DWORD SUB_HAIR = 1u << 18;   // PES Hair shader: opaque, plus the alpha fringe pass
+// One-hand parts (tools/pes15_to_pes12.py HAND_RIG_BONE): SUB_HAND_L/R on the
+// rigid body copy, plus SUB_HAND_RIG on the hand-local copy weighted to the
+// stock hand's 12-bone palette, drawn at the stock hand draw instead of it
+// (its fingers then follow the game's hand animation); the body copy is
+// skipped in a pass whose stock hand drew the rig copy.
+static const DWORD SUB_HAND_L = 1u << 19, SUB_HAND_R = 1u << 20, SUB_HAND_RIG = 1u << 21;
+static const DWORD SUB_HAND_SIDE[2] = { SUB_HAND_L, SUB_HAND_R };
+// which submeshes a drawCustom call draws
+enum { DRAW_BODY, DRAW_FACE, DRAW_HAND_L, DRAW_HAND_R };
 static IDirect3DPixelShader9 *g_psShadeless = NULL, *g_psToon = NULL;
 // Is vs the game's colour-pass kit shader (it outputs the UVs in TEXCOORD4;
 // the depth and shadow passes' shaders do not)? Parsed from its dcl tokens.
@@ -340,6 +349,8 @@ struct CustomModel {
     IDirect3DTexture9* tex[MAX_TEXS]; UINT ntex;
     CustomSub sub[MAX_SUBS]; UINT nsub;
     UINT nv, ni, stride; DWORD keep; bool tried;   // keep: stock pieces drawn (PIECE_NAMES bits)
+    bool handRig[2];                             // has SUB_HAND_RIG subs, per side (L, R)
+    bool handRigged[2];                          // its rig copy drew since its last body draw
     LONG pid, lastUsed;                          // resident-cache key, frame of last use
     float minY;                                  // lowest vertex (m): does it stand on its own
 };
@@ -726,6 +737,10 @@ static bool loadModel(IDirect3DDevice9* d, CustomModel& M, const wchar_t* dir) {
     }
     { DWORD k; if (readModeFile(dir, &k)) M.keep = k; }
     M.keep &= (PART_BIT << PIECE_COUNT) - 1;
+    for (int h = 0; h < 2; h++) {
+        M.handRig[h] = M.handRigged[h] = false;
+        for (UINT i = 0; i < M.nsub; i++) if ((M.sub[i].flags & SUB_HAND_RIG) && (M.sub[i].flags & SUB_HAND_SIDE[h])) M.handRig[h] = true;
+    }
     UINT isz = v2 ? 4 : 2, vlen = M.nv * M.stride, ilen = M.ni * isz;
     void* p = NULL;
     bool ok = SUCCEEDED(d->CreateVertexBuffer(vlen, D3DUSAGE_WRITEONLY, 0, D3DPOOL_MANAGED, &M.vb, NULL))
@@ -798,7 +813,7 @@ static bool adboardTex(IDirect3DDevice9* d) {
     return g_adTex != NULL;
 }
 
-static HRESULT drawCustom(IDirect3DDevice9* d, bool faceOnly = false);
+static HRESULT drawCustom(IDirect3DDevice9* d, int part = DRAW_BODY);
 
 static const UINT FACE_PRINT_BYTES = 32;        // vertex bytes fingerprinting a face draw
 static IDirect3DBaseTexture9* g_prevTex = NULL;
@@ -994,7 +1009,7 @@ static HRESULT drawFaceRigid(IDirect3DDevice9* d, const float (*c)[4]) {
     d->GetVertexDeclaration(&keepDecl); d->GetVertexShader(&keepVS);
     d->SetVertexDeclaration(g_kitDecl); d->SetVertexShader(g_kitVS);
     g_orgSVSCF(d, BONE_REG0, &f[0][0], FACE_SLOTS * BONE_REGS);
-    HRESULT hr = drawCustom(d, true);
+    HRESULT hr = drawCustom(d, DRAW_FACE);
     g_orgSVSCF(d, BONE_REG0, &keep[0][0], FACE_SLOTS * BONE_REGS);
     d->SetVertexDeclaration(keepDecl); d->SetVertexShader(keepVS);
     if (keepDecl) keepDecl->Release(); if (keepVS) keepVS->Release();
@@ -1108,10 +1123,10 @@ static IDirect3DTexture9* flatNormal(IDirect3DDevice9* d) {
     return g_flatNormal;
 }
 
-static HRESULT drawCustom(IDirect3DDevice9* d, bool faceOnly) {
+static HRESULT drawCustom(IDirect3DDevice9* d, int part) {
     CustomModel& M = *g_cuM;
     if (g_shaderDump) dumpShaders(d);
-    if (g_rtDumpArm && !g_rtDump && !faceOnly) d->GetRenderTarget(0, &g_rtDump);
+    if (g_rtDumpArm && !g_rtDump && part == DRAW_BODY) d->GetRenderTarget(0, &g_rtDump);
     IDirect3DVertexBuffer9* keepVB = g_vb; UINT keepOff = g_vbOff, keepSt = g_stride;
     IDirect3DIndexBuffer9* keepIB = g_ib;
     IDirect3DBaseTexture9* keepTex = g_tex0;
@@ -1144,8 +1159,12 @@ static HRESULT drawCustom(IDirect3DDevice9* d, bool faceOnly) {
     for (int k = 0; k < NNS; k++) { keepNrm[k] = NULL; d->GetTexture(NORMAL_MAP_STAGES[k], &keepNrm[k]); if (!g_keepNormalMaps && flatNormal(d)) g_orgSTEX(d, NORMAL_MAP_STAGES[k], g_flatNormal); }
     for (UINT i = 0; i < M.nsub; i++) {
         const CustomSub& S = M.sub[i];
-        // face subs are head-local on the face palette: only at the face draw
-        if (((S.flags & SUB_FACE) != 0) != faceOnly) continue;
+        // face subs are head-local on the face palette: only at the face draw;
+        // hand-rig subs hand-local on the stock hand palette: only at its draw
+        bool face = (S.flags & SUB_FACE) != 0, rig = (S.flags & SUB_HAND_RIG) != 0;
+        if (part == DRAW_FACE ? !face : part == DRAW_BODY ? face || rig
+            : !rig || !(S.flags & SUB_HAND_SIDE[part - DRAW_HAND_L])) continue;
+        if (part == DRAW_BODY && ((S.flags & SUB_HAND_L && M.handRigged[0]) || (S.flags & SUB_HAND_R && M.handRigged[1]))) continue;
         // a texture that failed to load binds nothing, never the previous sub's
         // texture (01-10: Eustace's chair drew his newspaper)
         if (!g_cuKeepGameTex) g_orgSTEX(d, 0, S.tex < M.ntex ? M.tex[S.tex] : NULL);
@@ -1202,6 +1221,8 @@ static HRESULT drawCustom(IDirect3DDevice9* d, bool faceOnly) {
     g_orgSTEX(d, 0, keepTex);
     g_orgSI(d, keepIB);
     g_orgSSS(d, 0, keepVB, keepOff, keepSt);
+    if (part == DRAW_BODY) M.handRigged[0] = M.handRigged[1] = false;
+    else if (part != DRAW_FACE) M.handRigged[part - DRAW_HAND_L] = true;
     return hr;
 }
 
@@ -1251,7 +1272,7 @@ static HRESULT drawCustomFace(IDirect3DDevice9* d) {
     IDirect3DVertexDeclaration9* keepDecl = NULL; IDirect3DVertexShader9* keepVS = NULL;
     d->GetVertexDeclaration(&keepDecl); d->GetVertexShader(&keepVS);
     d->SetVertexDeclaration(g_kitDecl); d->SetVertexShader(g_kitVS);
-    HRESULT hr = drawCustom(d, true);
+    HRESULT hr = drawCustom(d, DRAW_FACE);
     d->SetVertexDeclaration(keepDecl); d->SetVertexShader(keepVS);
     if (keepDecl) keepDecl->Release(); if (keepVS) keepVS->Release();
     return hr;
@@ -1591,7 +1612,14 @@ static HRESULT STDMETHODCALLTYPE myDIP(IDirect3DDevice9* d, D3DPRIMITIVETYPE t,
             int piece = detailBoots ? (int)PART_BOOTS : detailHands ? (int)PIECE_HANDS : (int)PART_GLOVES;
             int who; float dm = nearestExtremity(piece, &who);
             if (g_runLog) { char m[128]; wsprintfA(m, "  detail %s %u/%u/%u: nearest hiding model %d at %d mm", PIECE_NAMES[piece], nV, nP, g_stride, who, (int)(dm * 1000)); logline(m); }
-            if (dm < DETAIL_OWNER_MAX_M) return D3D_OK;   // a hidden custom player's own
+            if (dm < DETAIL_OWNER_MAX_M) {               // a custom player's, who does not keep it
+                // his own hand on this rig, if he has one: the game has just
+                // uploaded this hand's palette, which the rig copy is weighted to
+                int side = nV == DETAIL_HAND_L_NV ? 0 : nV == DETAIL_HAND_R_NV ? 1 : -1;
+                if (detailHands && g_stride == DETAIL_HAND_STRIDE && side >= 0 && useModel(d, who) && g_cuM->handRig[side])
+                    drawCustom(d, DRAW_HAND_L + side);
+                return D3D_OK;
+            }
         }
     }
     if (g_runPos >= 0 && g_curModel >= 0 && useModel(d, g_curModel)) {

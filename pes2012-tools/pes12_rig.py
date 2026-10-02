@@ -1,6 +1,6 @@
 """PES2012 rig tables, extracted from the user's own game files.
 
-    python3 pes12_rig.py <game dir>   # -> rig/face_rig.json + rig/body349b2_bones.json
+    python3 pes12_rig.py <game dir>   # -> rig/face_rig.json + rig/body349b2_bones.json + hand_rig.json
 
 Face rig = the stock face model's 29-bone table (dt0c.img BIN FACE_ENTRY,
 block 0): joints in head-local space (origin = the head joint; bone 0 is the
@@ -8,6 +8,13 @@ skull and moves exactly with the body's head bone, 27-09 grab) and the face
 packet's 27-slot bone palette. drawlogic draws a custom model's face part
 with the palette the game uploads for that packet, so the converter needs
 slot numbers, not bones.
+
+Hand rig = the stock bare hands (dt0d.img HAND_ENTRY, one block per hand):
+each a 12-bone rig in hand-local space (bone 0 = the wrist, at the origin;
+thumb 1 -> 6 -> 11; index, middle, ring, pinky 2-5, their second segments
+7-10) and its packet's palette. drawlogic draws a custom model's hand at the
+stock hand draw with the palette the game uploads for it (pes15_to_pes12
+SUB_HAND_RIG), so its fingers follow the game's hand animation.
 
 Officials map (runtime/officialmap.h, compiled into drawlogic): the
 referee/linesman full-detail model (dt09 #349 block 1) against the custom
@@ -71,6 +78,36 @@ def face_rig(game=GAME):
 
 def load_face_rig(path=None):
     path = path or FACE_JSON
+    if not os.path.exists(path):
+        raise SystemExit('no %s: run pes12_rig.py <game dir> first' % path)
+    return json.load(open(path))
+
+
+HAND_IMG, HAND_ENTRY = 'dt0d.img', 589      # the stock detail boots, bare hands and keeper gloves (02-10)
+HAND_BLOCKS = {'l': 2, 'r': 3}               # bare hands: 305 v (left), 302 v (right), stride 80
+HAND_JSON = os.path.join(OUT_DIR, 'hand_rig.json')
+
+
+def hand_rig(game=GAME):
+    """{side: joints (hand-local, m), parents, palette} of the stock bare hands."""
+    K = ktmdl_reader()
+    raw = afs.read(os.path.join(game, 'img', HAND_IMG), HAND_ENTRY)
+    data = zlib.decompress(raw[16:]) if raw[3:8] == b'WESYS' else raw
+    starts, at = [], 0
+    while (b := data.find(b'KTMDL', at)) >= 0:
+        starts.append(b)
+        at = b + 1
+    out = {}
+    for side, block in HAND_BLOCKS.items():
+        model = K.parse_bytes(data[starts[block]:])
+        out[side] = {'joints': [np.array(b['matrix'], float).reshape(4, 4)[3, :3].round(5).tolist() for b in model['bones']],
+                     'parents': [b['parentIndex'] for b in model['bones']],
+                     'palette': model['packets'][0]['bonePalette']}
+    return out
+
+
+def load_hand_rig(path=None):
+    path = path or HAND_JSON
     if not os.path.exists(path):
         raise SystemExit('no %s: run pes12_rig.py <game dir> first' % path)
     return json.load(open(path))
@@ -224,6 +261,8 @@ def write(game=GAME):
     print('wrote', FACE_JSON)
     json.dump(body_bones(game), open(BODY_JSON, 'w'), indent=1)
     print('wrote', BODY_JSON)
+    json.dump(hand_rig(game), open(HAND_JSON, 'w'), indent=1)
+    print('wrote', HAND_JSON)
     print('wrote', write_official_h(game))
 
 

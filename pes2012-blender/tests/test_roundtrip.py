@@ -39,9 +39,9 @@ def test_pgb2():
     t = pgb2.build_tex(4, 2, mips)
     q = pgb2.parse_tex(t)
     assert pgb2.build_tex(q['w'], q['h'], q['mips']) == t
-    print('pgb2 p272101: %d verts %d tris %d subs mode %s OK'
-          % (len(parsed['verts']), len(parsed['idx']) // 3,
-             len(parsed['subs']), pgb2.MODES[parsed['mode']]))
+    print('pgb2 p272101: %d verts %d tris %d subs keeps %s OK'
+          % (len(parsed['verts']), len(parsed['idx']) // 3, len(parsed['subs']),
+             ' '.join(n for i, n in enumerate(pgb2.PIECES) if parsed['keep'] >> i & 1) or 'nothing'))
 
 
 def _influence_map(parsed):
@@ -76,7 +76,7 @@ def test_pack_body():
         mat_flags[mi], mat_tex[mi] = s['flags'], s['tex']
         mat_face[mi] = bool(s['flags'] & pgb2.SUB_FACE)
     out = pgb2.pack_body(tris_by_mat, vert_data, mat_flags, mat_tex,
-                         mat_face, parsed['mode'])
+                         mat_face, parsed['keep'])
     check = pgb2.parse(out)
     assert len(check['subs']) == len(parsed['subs']) and len(check['subs']) > 0
     assert [s['flags'] for s in check['subs']] == [s['flags'] for s in parsed['subs']]

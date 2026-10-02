@@ -143,6 +143,8 @@ ticked = a whole figure): `shorts`, `shirt`, `sleeves`, `socks`, `neck`,
 | `pgb2_shadeless` | 16 | drawlogic's shadeless pixel shader |
 | `pgb2_toon` | 17 | drawlogic's toon (Pony) pixel shader |
 | `pgb2_hair` | 18 | hair: opaque core plus alpha fringe pass |
+| `pgb2_hand_l` / `pgb2_hand_r` | 19 / 20 | a one-hand part (its rigid body copy) |
+| `pgb2_hand_rig` | 21 | that part's hand-local copy, weights on `hand_l_00..11` / `hand_r_00..11` (the stock hand palette) |
 | `pgb2_tex` (int) | - | texture slot `body_<k>` |
 
 Body slots, in order: `sk_thigh_r sk_leg_r dsk_hip sk_thigh_l sk_leg_l

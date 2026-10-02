@@ -325,6 +325,9 @@ FLAG_PROPS = (
     ('pgb2_shadeless', pgb2.SUB_SHADELESS, 'Shadeless pixel shader (bit 16)'),
     ('pgb2_toon', pgb2.SUB_TOON, 'Toon (Pony) pixel shader (bit 17)'),
     ('pgb2_hair', pgb2.SUB_HAIR, 'Hair: opaque core plus alpha fringe pass (bit 18)'),
+    ('pgb2_hand_l', pgb2.SUB_HAND_L, 'Left-hand part (bit 19)'),
+    ('pgb2_hand_r', pgb2.SUB_HAND_R, 'Right-hand part (bit 20)'),
+    ('pgb2_hand_rig', pgb2.SUB_HAND_RIG, 'Hand-rig copy: hand-local verts on hand_<side>_XX (bit 21)'),
 )
 
 
@@ -365,6 +368,9 @@ def import_body(context, filepath):
     mesh = bpy.data.meshes.new(stem)
     face_verts = {i for s in parsed['subs'] if s['flags'] & pgb2.SUB_FACE
                   for i in parsed['idx'][s['first']:s['first'] + s['count']]}
+    hand_side = {i: 'l' if s['flags'] & pgb2.SUB_HAND_L else 'r' for s in parsed['subs']
+                 if s['flags'] & pgb2.SUB_HAND_RIG
+                 for i in parsed['idx'][s['first']:s['first'] + s['count']]}
     positions = []
     for vi, v in enumerate(parsed['verts']):
         p = v['pos']
@@ -385,13 +391,16 @@ def import_body(context, filepath):
     obj = bpy.data.objects.new(stem, mesh)
     col.objects.link(obj)
     for name in list(pgb2.SLOT_BONES) + [
-            pgb2.FACE_GROUP_FMT % i for i in range(pgb2.N_FACE_SLOTS)]:
+            pgb2.FACE_GROUP_FMT % i for i in range(pgb2.N_FACE_SLOTS)] + [
+            pgb2.HAND_GROUP_FMT % (s, i) for s in 'lr' for i in range(pgb2.N_HAND_SLOTS)]:
         obj.vertex_groups.new(name=name)
     for vi, v in enumerate(parsed['verts']):
         infl = pgb2.slots_to_influences(v['slots'], v['weights'])
         for slot, w in infl.items():
             if vi in face_verts:
                 name = pgb2.FACE_GROUP_FMT % slot
+            elif vi in hand_side:
+                name = pgb2.HAND_GROUP_FMT % (hand_side[vi], slot)
             elif slot < len(pgb2.SLOT_BONES):
                 name = pgb2.SLOT_BONES[slot]
             else:
@@ -450,7 +459,7 @@ def export_body(filepath, obj):
                     uvs.append((u, v))
             key = (vi, uvs[0], uvs[1])
             if key not in vert_data:
-                infl, face = {}, {}
+                infl, face, hand = {}, {}, {}
                 for g in mesh.vertices[vi].groups:
                     name = obj.vertex_groups[g.group].name
                     if name in pgb2.SLOT_OF:
@@ -460,6 +469,11 @@ def export_body(filepath, obj):
                         try:
                             face[int(name[5:])] = face.get(
                                 int(name[5:]), 0.0) + g.weight
+                        except ValueError:
+                            pass
+                    elif name.startswith('hand_'):
+                        try:
+                            hand[int(name[7:])] = hand.get(int(name[7:]), 0.0) + g.weight
                         except ValueError:
                             pass
                 if has_tan:
@@ -473,7 +487,7 @@ def export_body(filepath, obj):
                 vert_data[key] = dict(pos=pos_of[vi], nrm=nrm_of[vi],
                                       tan=tan, bin=bin_,
                                       uv0=uvs[0], uv1=uvs[1],
-                                      infl=infl, face=face)
+                                      infl=infl, face=face, hand=hand)
             corners.append(key)
         tri_by_mat.setdefault(t.material_index, []).append(tuple(corners))
     mats = list(obj.data.materials)

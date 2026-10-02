@@ -31,6 +31,11 @@ SUB_ALPHATEST, SUB_BLEND, SUB_TWOSIDED, SUB_NOZWRITE = 1, 2, 4, 8
 SUB_KIT, SUB_OUTLINE, SUB_FACE = 16, 32, 64
 # drawlogic's own pixel shaders and hair pass (dllprobe/drawlogic.cpp SUB_*)
 SUB_SHADELESS, SUB_TOON, SUB_HAIR = 1 << 16, 1 << 17, 1 << 18
+# one-hand parts (tools/pes15_to_pes12.py HAND_RIG_BONE): SUB_HAND_L/R on the
+# rigid body copy, plus SUB_HAND_RIG on the hand-local copy weighted to the
+# stock hand's 12-slot palette (tools/pes12_rig.py hand_rig), drawn at the
+# stock hand draw
+SUB_HAND_L, SUB_HAND_R, SUB_HAND_RIG = 1 << 19, 1 << 20, 1 << 21
 SUB_REF_SHIFT = 8  # bits 8-15: alpha-test ref (pass alpha > ref)
 
 MAX_INFLUENCES = 4
@@ -58,6 +63,11 @@ HEAD_POS = (0.0, 1.65, -0.005)
 # Groups are named face_00..face_26 in palette order.
 FACE_GROUP_FMT = 'face_%02d'
 N_FACE_SLOTS = 27
+# SUB_HAND_RIG verts are stored hand-local (the stock hand rig's bind, wrist
+# at the origin) and index that hand's 12-slot palette: groups hand_l_00..11 /
+# hand_r_00..11 in palette order.
+HAND_GROUP_FMT = 'hand_%s_%02d'
+N_HAND_SLOTS = 12
 
 
 def influences_to_slots(infl):
@@ -134,11 +144,14 @@ def pack_body(tris_by_mat, vert_data, mat_flags, mat_tex, mat_face, keep):
     plain dicts; tests/ drives this directly against p272101.
 
     vert_data: {vi: dict(pos, nrm, tan, bin, uv0, uv1,
-                         infl={slot: w} body slots, face={slot: w} face slots)}.
+                         infl={slot: w} body slots, face={slot: w} face slots,
+                         hand={slot: w} hand-rig slots)}.
     tris_by_mat: {material_index: [(a, b, c)]}. One submesh per used
     material slot, blended ones last (tools/pes15_to_pes12.py).
     mat_face: {material_index: bool} SUB_FACE submeshes: positions stored
-    head-local (minus HEAD_POS) and weights on the face palette.
+    head-local (minus HEAD_POS) and weights on the face palette;
+    SUB_HAND_RIG submeshes (by their flags): hand-local positions, weights on
+    the hand palette.
     """
     order = sorted(tris_by_mat,
                    key=lambda mi: bool(mat_flags.get(mi, 0) & SUB_BLEND))
@@ -150,7 +163,7 @@ def pack_body(tris_by_mat, vert_data, mat_flags, mat_tex, mat_face, keep):
         for tri in tris_by_mat[mi]:
             for vi in tri:
                 d = vert_data[vi]
-                infl = d['face'] if face else d['infl']
+                infl = d['face'] if face else d.get('hand', {}) if flags & SUB_HAND_RIG else d['infl']
                 slots, ws = influences_to_slots(infl or {0: 1.0})
                 p = d['pos']
                 if face:

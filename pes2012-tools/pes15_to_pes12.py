@@ -22,7 +22,10 @@ subFlags (drawlogic SUB_*), from the material's .mtl states: bit0 alpha test
 depth write, bit4 kit slot (UVs on PES2012's kit sheet; drawlogic binds the
 kit being worn), bit5 toon outline shell (drawn depth-biased), bit6 face part:
 head-local vertices on the PES2012 face palette, drawn at the game's face draw
-so jaw, lips, eyelids and brows animate (pes12_rig.py). Blended submeshes are written last so they blend over the rest.
+so jaw, lips, eyelids and brows animate (pes12_rig.py); bits 19/20 a one-hand
+part's rigid body copy (left/right), with bit 21 its hand-local copy on the
+stock hand's 12-bone palette, drawn at the stock hand draw so the fingers
+follow the game's hand animation (HAND_RIG_BONE). Blended submeshes are written last so they blend over the rest.
 
 Skeleton: PES15 bone matrices are inverse binds whose joints sit exactly on
 PES21's render bind (sk_upperarm_l 0.195, 1.467, 0.033 in both), so the
@@ -84,6 +87,11 @@ OPAQUE_SHADERS = ('Hair',)
 # Stallman, Rossmann, No Time For Love): drawlogic draws a SUB_HAIR sub opaque
 # and adds a blended fringe pass from its alpha (30-09: matte hair).
 SUB_HAIR = 1 << 18
+# A one-hand part: SUB_HAND_<side> on its rigid body copy (drawn unless its
+# rigged copy was), plus SUB_HAND_RIG on the hand-local copy drawn at the stock
+# hand draw on the stock hand's palette (HAND_RIG_BONE, drawlogic SUB_HAND_*).
+SUB_HAND_L, SUB_HAND_R, SUB_HAND_RIG = 1 << 19, 1 << 20, 1 << 21
+SUB_HAND_SIDE = {'l': SUB_HAND_L, 'r': SUB_HAND_R}
 # A Hair texture whose alpha is mostly empty is not an opacity map (DEVELOPERS'
 # hair_col: 87 % zero, drawn by alpha the hair vanished, 27-09); one with this
 # share of solid texels is (Stallman 55 %, No Time For Love 56 %).
@@ -133,12 +141,12 @@ def joint(bone):
     return tuple(-sum(r[k][i] * t[k] for k in range(3)) for i in range(3))
 
 
-# PES2012's in-match body has one bone per hand; its own hands are modelled
-# curled. A 4cc PES15 hand is authored flat on finger bones this game does not
-# have, so it is bent into PES's relaxed hand before being baked onto the hand
-# bone: the flexion of PES's normal.gani (GameplayFootball AGENTS.md: mcp 15,
-# pip 32, dip 20 degrees). The thumb is left as authored.
-# ponytail: one fixed pose; per-player grips (fists, keepers) would need the finger bones
+# PES2012's in-match body has one bone per hand (its fingers live on the
+# separate stock hand rig, HAND_RIG_BONE below); its own hands are modelled
+# curled. A 4cc PES15 hand is authored flat, so it is bent into PES's relaxed
+# hand: baked onto the hand bone for the rigid body copy, and as the bind of
+# the hand-rig copy - the flexion of PES's normal.gani (GameplayFootball
+# AGENTS.md: mcp 15, pip 32, dip 20 degrees). The thumb is left as authored.
 FINGER_CURL_DEG = {'mcp': 15.0, 'pip': 32.0, 'dip': 20.0}
 FINGER_CHAIN = ('dip', 'pip', 'mcp')    # distal first, each about its own joint
 FINGER_BONE = re.compile(r'skh_(index|middle|ring|pinky)_(mcp|pip|dip)_([lr])$')
@@ -334,6 +342,10 @@ def model_materials(folder):
 # oral_hair, y -0.15..0.17 around the head joint; placed at the origin it lay
 # on the pitch).
 HEAD_TYPES = ('head',)
+# face.xml types PES puts in the glove slot: they replace PES's own hands
+# (Green Is My Pepper's oral_hand_l/r are gloveL/gloveR), so the stock hands
+# and keeper gloves are not kept with them
+GLOVE_TYPES = ('gloveL', 'gloveR')
 # face.xml types whose diffuse PES replaces with the kit texture (Rigged Wiki
 # Blender tutorials: a "uniform" line's diffuse "will always be forced to the
 # kit texture"; the rest are PES's own garment parts).
@@ -569,6 +581,88 @@ def pack_face_vertex(pos, head_pos, raw, fslots, skull_slot, rest, dist=None):
     return struct.pack('<3f3f4B', *[a - b for a, b in zip(pos, head_pos)], *ws, *slots) + rest
 
 
+# A 4cc hand on PES15's finger rig (skh_<finger>_<mata|mcp|pip|dip>_<side>)
+# is also drawn on the stock hand's own 12-bone rig (pes12_rig.hand_rig,
+# dt0d #589), at the stock hand draw with the palette the game uploads for
+# it, so its fingers follow the game's hand animation (SUB_HAND_RIG); the
+# body keeps a rigid copy on the hand bone for when no stock hand is drawn
+# (far LODs). PES15 bone (side stripped) -> stock rig bone: the metacarpals
+# ride the wrist root, the thumb 1 -> 6 -> 11, each finger's proximal
+# phalanx its root (index 2, middle 3, ring 4, pinky 5, thumb side first:
+# the stock right hand's roots sit at z +0.027, 0, -0.018, -0.039) and its
+# middle and distal phalanges the second segment (7-10).
+HAND_RIG_BONE = {'sk_hand': 0, 'skh_index_mata': 0, 'skh_middle_mata': 0, 'skh_ring_mata': 0, 'skh_pinky_mata': 0,
+                 'skh_thumb_mata': 1, 'skh_thumb_mcp': 6, 'skh_thumb_pip': 11, 'skh_thumb_dip': 11,
+                 'skh_index_mcp': 2, 'skh_index_pip': 7, 'skh_index_dip': 7,
+                 'skh_middle_mcp': 3, 'skh_middle_pip': 8, 'skh_middle_dip': 8,
+                 'skh_ring_mcp': 4, 'skh_ring_pip': 9, 'skh_ring_dip': 9,
+                 'skh_pinky_mcp': 5, 'skh_pinky_pip': 10, 'skh_pinky_dip': 10}
+# the PES15 joint at each stock rig bone's base
+HAND_RIG_JOINT = {0: 'sk_hand', 1: 'skh_thumb_mata', 6: 'skh_thumb_mcp', 11: 'skh_thumb_pip',
+                  2: 'skh_index_mcp', 7: 'skh_index_pip', 3: 'skh_middle_mcp', 8: 'skh_middle_pip',
+                  4: 'skh_ring_mcp', 9: 'skh_ring_pip', 5: 'skh_pinky_mcp', 10: 'skh_pinky_pip'}
+HAND_RIG_PARENT = {'pip': 'mcp', 'dip': 'pip'}   # a finger joint rides its parent bone through the curl
+UV_TAIL_OFF = 64                                 # TEXCOORD0/1 in the 80-byte vertex
+
+
+def hand_side(raw):
+    """'l' / 'r' when every influence is one hand's (HAND_RIG_BONE), else None."""
+    sides = {name[-1] for name, w in raw if w > 0 and name[-2:] in ('_l', '_r') and name[:-2] in HAND_RIG_BONE}
+    if len(sides) != 1 or any(w > 0 and name[:-2] not in HAND_RIG_BONE for name, w in raw):
+        return None
+    return sides.pop()
+
+
+def hand_fit(bind, rig, side):
+    """PES15 hand (this model's bind) -> the stock rig's hand-local bind, or
+    None without a full finger rig: the fingers curled into PES's relaxed hand
+    (curl_fingers), a rigid fit at the wrist (Kabsch over the rig joints),
+    then each rig bone's segment snapped onto its stock joint (Green Is My
+    Pepper, 02-10: after the fit, the joints sat 6-32 mm off the stock ones,
+    the hand flat where the stock one is modelled curled)."""
+    import numpy as np
+    names = {b: '%s_%s' % (n, side) for b, n in HAND_RIG_JOINT.items()}
+    if any(n not in bind for n in names.values()):
+        return None
+    tb = {k: tuple(v) for k, v in bind.items()}
+
+    def curled(name):
+        finger, _, joint_name = name[:-2].rpartition('_')
+        if joint_name not in HAND_RIG_PARENT:
+            return np.array(bind[name])
+        parent = '%s_%s_%s' % (finger, HAND_RIG_PARENT[joint_name], side)
+        return np.array(curl_fingers(tb[name], (0.0, 1.0, 0.0), [(parent, 1.0)], tb)[0])
+    rig_j = np.array(rig['joints'])
+    src = np.array([curled(names[b]) for b in range(len(rig_j))])
+    a, b = src[1:] - src[0], rig_j[1:] - rig_j[0]
+    U, _, Vt = np.linalg.svd(a.T @ b)
+    rot = (U @ np.diag([1, 1, np.sign(np.linalg.det(U @ Vt))]) @ Vt).T
+    fitted = (src - src[0]) @ rot.T + rig_j[0]
+    return {'origin': src[0], 'rot': rot, 'rig_origin': rig_j[0], 'snap': rig_j - fitted, 'palette': rig['palette']}
+
+
+def pack_hand_vertex(p, n, tg, raw, fit, uv_tail):
+    """The hand-local copy of a one-hand vertex (p, n, tg: curled PES15 bind)
+    on the stock hand palette, its segment snapped to the stock joint."""
+    import numpy as np
+    w = {}
+    for name, x in raw:
+        if x > 0:
+            b = HAND_RIG_BONE[name[:-2]]
+            w[b] = w.get(b, 0.0) + x
+    top = sorted(w.items(), key=lambda kv: -kv[1])[:F.MAX_INFLUENCES]
+    tw = sum(x for _, x in top) or 1.0
+    top = [(b, x / tw) for b, x in top]
+    rot = fit['rot']
+    pos = rot @ (np.array(p) - fit['origin']) + fit['rig_origin'] + sum(x * fit['snap'][b] for b, x in top)
+    nrm, tan = rot @ np.array(n), rot @ np.array(tg)
+    nrm /= np.linalg.norm(nrm) or 1.0
+    tan /= np.linalg.norm(tan) or 1.0
+    ws, slots = F.skin_pack([(fit['palette'].index(b), x) for b, x in top])
+    return struct.pack('<3f3f4B3f3f3f', *pos, *ws[:3], *slots, *nrm, *np.cross(nrm, tan), *tan) + uv_tail
+
+
+
 # PES's deform helpers (dsk_*) turn part of the way between the two bones of
 # a joint; PES2012's skeleton has no such bones. Glued onto one neighbour
 # (fmdl_to_pes12.main_bone) a knee helper swings wholly with the shin and the
@@ -781,6 +875,7 @@ def convert(folder, kit_dds, out_dir, hide_body=None):
     types = model_types(folder)
     head_world = head_to_world(folder)
     rig = pes12_rig.load_face_rig()
+    hand_rig = pes12_rig.load_hand_rig()
     seams = _seam_table(p12, used_bones(folder, mats))
     skull_slot = rig['palette'].index(FACE_SKULL_BONE)
     head_p12 = p12[F.FOX_TO_PES12[HEAD_BONE]]
@@ -797,6 +892,7 @@ def convert(folder, kit_dds, out_dir, hide_body=None):
         bind = {b.name: joint(b) for b in m.bones}
         on_head = types.get(fname) in HEAD_TYPES and head_world is not None
         fslots = face_slots(bind, rig)
+        fits = {s: hand_fit(bind, hand_rig[s], s) for s in SUB_HAND_SIDE}
         fdist = face_bone_dist(m, bind, face_align(bind), rig)
         for mesh in m.meshes:
             if SKIP_MATERIALS.search(mesh.material or '') or len(mesh.faces) < 1:
@@ -829,6 +925,7 @@ def convert(folder, kit_dds, out_dir, hide_body=None):
             bones = mesh.boneGroup.bones if mesh.boneGroup else []
             index_of = {id(v): k for k, v in enumerate(mesh.vertices)}
             face_of = {}                 # body vertex index -> face-local copy (bytes)
+            hand_of = {}                 # body vertex index -> (side, hand-local copy bytes)
             face_src = {}                # body vertex index -> (position, packed tail) of its face copy
             for v in mesh.vertices:
                 infl, raw = {}, []
@@ -870,6 +967,8 @@ def convert(folder, kit_dds, out_dir, hide_body=None):
                     n = tuple(a - b for a, b in zip(head_world(n), o))   # rotation only
                 p, n = curl_fingers(p, n, raw, bind)
                 tg = (v.tangent.x, v.tangent.y, v.tangent.z) if v.tangent else (1.0, 0.0, 0.0)
+                hside = hand_side(raw)
+                hfit = fits.get(hside) if hside else None
                 pos, nrm, tan = [0.0] * 3, [0.0] * 3, [0.0] * 3
                 for (fox, _), w in top:
                     a = retarget.PES_RENDER_BIND[fox][0]
@@ -901,6 +1000,8 @@ def convert(folder, kit_dds, out_dir, hide_body=None):
                 if all(fox == HEAD_BONE for (fox, _) in infl):
                     face_of[len(verts)] = pack_face_vertex(pos, head_p12, raw, fslots, skull_slot, packed[F.FACE_REST_OFF:], fdist)
                     face_src[len(verts)] = (pos, packed[F.FACE_REST_OFF:])
+                if hfit is not None:
+                    hand_of[len(verts)] = (hside, pack_hand_vertex(p, n, tg, raw, hfit, packed[UV_TAIL_OFF:]))
                 verts.append(packed)
             face_tris, body_tris = [], []
             for face in mesh.faces:
@@ -923,9 +1024,28 @@ def convert(folder, kit_dds, out_dir, hide_body=None):
             flags = sub_flags(states) | (SUB_KIT if kit_slot else 0) | (SUB_OUTLINE if OUTLINE_MATERIAL.search(mesh.material or '') else 0)
             if flags & SUB_HAIR and not hair_has_opacity(tex):
                 flags &= ~SUB_HAIR       # PES's Hair shader ignores this texture's alpha: plain opaque
+            # one-hand triangles: a rigid body copy (SUB_HAND_<side>) and the
+            # hand-local copy on the stock hand rig (+ SUB_HAND_RIG)
+            hand_tris = {s: [tri for tri in body_tris if all(t in hand_of and hand_of[t][0] == s for t in tri)]
+                         for s in SUB_HAND_SIDE}
+            in_hand = {tuple(tri) for v in hand_tris.values() for tri in v}
+            body_tris = [tri for tri in body_tris if tuple(tri) not in in_hand]
             if body_tris:
                 subs.append((len(idx), 3 * len(body_tris), tex_index[tex], flags))
                 idx.extend(t for tri in body_tris for t in tri)
+            for side, tris in hand_tris.items():
+                if not tris:
+                    continue
+                subs.append((len(idx), 3 * len(tris), tex_index[tex], flags | SUB_HAND_SIDE[side]))
+                idx.extend(t for tri in tris for t in tri)
+                remap = {}
+                for tri in tris:
+                    for t in tri:
+                        if t not in remap:
+                            remap[t] = len(verts)
+                            verts.append(hand_of[t][1])
+                subs.append((len(idx), 3 * len(tris), tex_index[tex], flags | SUB_HAND_SIDE[side] | SUB_HAND_RIG))
+                idx.extend(remap[t] for tri in tris for t in tri)
             if face_tris:
                 remap = {}
                 for tri in face_tris:
@@ -953,13 +1073,15 @@ def convert(folder, kit_dds, out_dir, hide_body=None):
         if f.startswith('body'):
             os.remove(os.path.join(out_dir, f))
     # extents in body space: face-part vertices are head-local
-    body_idx = {i for s in subs if not s[3] & SUB_FACE for i in idx[s[0]:s[0] + s[1]]}
+    body_idx = {i for s in subs if not s[3] & (SUB_FACE | SUB_HAND_RIG) for i in idx[s[0]:s[0] + s[1]]}
     face_idx = {i for s in subs if s[3] & SUB_FACE for i in idx[s[0]:s[0] + s[1]]}
     ys = [struct.unpack_from('<3f', verts[i])[1] for i in body_idx]
     ys += [struct.unpack_from('<3f', verts[i])[1] + head_p12[1] for i in face_idx]
     ys = ys or [0]
     whole = geometry_whole if hide_body is None else hide_body
     keep = (KEEP_NONE if min(ys) < OWN_FEET_Y else KEEP_BOOTS) if whole else KEEP_BUT_HEAD
+    if any(t in GLOVE_TYPES for t in types.values()):
+        keep &= ~keep_mask('hands', 'gloves')
     with open(os.path.join(out_dir, 'body.bin'), 'wb') as o:
         o.write(struct.pack('<6I', BODY2_MAGIC, len(verts), len(idx), F.VERTEX_STRIDE, len(subs), keep))
         for s in subs:
