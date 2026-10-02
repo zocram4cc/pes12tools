@@ -10,6 +10,8 @@ drawlogic.dll PGB2 format:
   u32 'PGB2', nv, ni, stride(80), nsub, keep
   nsub x (u32 firstIndex, u32 indexCount, u32 texture, u32 subFlags)
   nv x 80-byte vertices (fmdl_to_pes12.py's layout), ni x u32 indices
+  [HRIG_MAGIC trailer with SUB_HAND_RIG subs: the hands' palettes, parents
+   and the model's own joints (hrig_trailer)]
   body_<texture>.tex per texture (PGT1, see fmdl_to_pes12.write_tex)
 
 keep: the stock pieces drawn with the model, one bit per PIECES name
@@ -583,26 +585,32 @@ def pack_face_vertex(pos, head_pos, raw, fslots, skull_slot, rest, dist=None):
 
 # A 4cc hand on PES15's finger rig (skh_<finger>_<mata|mcp|pip|dip>_<side>)
 # is also drawn on the stock hand's own 12-bone rig (pes12_rig.hand_rig,
-# dt0d #589), at the stock hand draw with the palette the game uploads for
-# it, so its fingers follow the game's hand animation (SUB_HAND_RIG); the
-# body keeps a rigid copy on the hand bone for when no stock hand is drawn
-# (far LODs). PES15 bone (side stripped) -> stock rig bone: the metacarpals
-# ride the wrist root, the thumb 1 -> 6 -> 11, each finger's proximal
-# phalanx its root (index 2, middle 3, ring 4, pinky 5, thumb side first:
-# the stock right hand's roots sit at z +0.027, 0, -0.018, -0.039) and its
-# middle and distal phalanges the second segment (7-10).
+# dt0d #589), so its fingers follow the game's hand animation
+# (SUB_HAND_RIG); the body keeps a rigid copy on the hand bone for when no
+# stock hand is drawn (far LODs). PES15 bone (side stripped) -> stock rig
+# bone: the metacarpals - the thumb's too - ride the wrist root, so the
+# vertices it shares with the wrist (dsk_wrist / dsk_forearm + metacarpal)
+# move alike in both copies; then the thumb 6 -> 11, each finger's proximal
+# phalanx its root (index 2, middle 3, ring 4, pinky 5, thumb side first: the
+# stock right hand's roots sit at z +0.027, 0, -0.018, -0.039) and its middle
+# and distal phalanges the second segment (7-10).
 HAND_RIG_BONE = {'sk_hand': 0, 'skh_index_mata': 0, 'skh_middle_mata': 0, 'skh_ring_mata': 0, 'skh_pinky_mata': 0,
-                 'skh_thumb_mata': 1, 'skh_thumb_mcp': 6, 'skh_thumb_pip': 11, 'skh_thumb_dip': 11,
+                 'skh_thumb_mata': 0, 'skh_thumb_mcp': 6, 'skh_thumb_pip': 11, 'skh_thumb_dip': 11,
                  'skh_index_mcp': 2, 'skh_index_pip': 7, 'skh_index_dip': 7,
                  'skh_middle_mcp': 3, 'skh_middle_pip': 8, 'skh_middle_dip': 8,
                  'skh_ring_mcp': 4, 'skh_ring_pip': 9, 'skh_ring_dip': 9,
                  'skh_pinky_mcp': 5, 'skh_pinky_pip': 10, 'skh_pinky_dip': 10}
-# the PES15 joint at each stock rig bone's base
+# the PES15 joint at each stock rig bone's base: drawlogic turns the bone
+# about it (the model's own joint, not the stock one - the stock palm is
+# cupped, Green Is My Pepper's flat: ring and pinky joints 2-4 cm apart)
 HAND_RIG_JOINT = {0: 'sk_hand', 1: 'skh_thumb_mata', 6: 'skh_thumb_mcp', 11: 'skh_thumb_pip',
                   2: 'skh_index_mcp', 7: 'skh_index_pip', 3: 'skh_middle_mcp', 8: 'skh_middle_pip',
                   4: 'skh_ring_mcp', 9: 'skh_ring_pip', 5: 'skh_pinky_mcp', 10: 'skh_pinky_pip'}
 HAND_RIG_PARENT = {'pip': 'mcp', 'dip': 'pip'}   # a finger joint rides its parent bone through the curl
-UV_TAIL_OFF = 64                                 # TEXCOORD0/1 in the 80-byte vertex
+# body.bin trailer after the indices: 'HRIG', then per side (l, r) the stock
+# palette (12 u8: slot -> rig bone), the rig parents (12 i8) and the model's
+# joints in hand-local space (12 x 3 f32, by rig bone; zeros: side absent)
+HRIG_MAGIC = b'HRIG'
 
 
 def hand_side(raw):
@@ -613,14 +621,11 @@ def hand_side(raw):
     return sides.pop()
 
 
-def hand_fit(bind, rig, side):
-    """PES15 hand (this model's bind) -> the stock rig's hand-local bind, or
-    None without a full finger rig: the fingers curled into PES's relaxed hand
-    (curl_fingers), a rigid fit at the wrist (Kabsch over the rig joints),
-    then each rig bone's segment snapped onto its stock joint (Green Is My
-    Pepper, 02-10: after the fit, the joints sat 6-32 mm off the stock ones,
-    the hand flat where the stock one is modelled curled)."""
-    import numpy as np
+def hand_joints(bind, side, to_body, wrist):
+    """This model's 12 rig-bone joints in hand-local space (body bind minus the
+    wrist: the hand bone binds unrotated), curled with the fingers
+    (curl_fingers) and placed as the rigid copy places them (to_body), or None
+    without a full finger rig."""
     names = {b: '%s_%s' % (n, side) for b, n in HAND_RIG_JOINT.items()}
     if any(n not in bind for n in names.values()):
         return None
@@ -629,22 +634,16 @@ def hand_fit(bind, rig, side):
     def curled(name):
         finger, _, joint_name = name[:-2].rpartition('_')
         if joint_name not in HAND_RIG_PARENT:
-            return np.array(bind[name])
+            return tb[name]
         parent = '%s_%s_%s' % (finger, HAND_RIG_PARENT[joint_name], side)
-        return np.array(curl_fingers(tb[name], (0.0, 1.0, 0.0), [(parent, 1.0)], tb)[0])
-    rig_j = np.array(rig['joints'])
-    src = np.array([curled(names[b]) for b in range(len(rig_j))])
-    a, b = src[1:] - src[0], rig_j[1:] - rig_j[0]
-    U, _, Vt = np.linalg.svd(a.T @ b)
-    rot = (U @ np.diag([1, 1, np.sign(np.linalg.det(U @ Vt))]) @ Vt).T
-    fitted = (src - src[0]) @ rot.T + rig_j[0]
-    return {'origin': src[0], 'rot': rot, 'rig_origin': rig_j[0], 'snap': rig_j - fitted, 'palette': rig['palette']}
+        return curl_fingers(tb[name], (0.0, 1.0, 0.0), [(parent, 1.0)], tb)[0]
+    return [tuple(a - w for a, w in zip(to_body(curled(names[b])), wrist)) for b in range(len(HAND_RIG_JOINT))]
 
 
-def pack_hand_vertex(p, n, tg, raw, fit, uv_tail):
-    """The hand-local copy of a one-hand vertex (p, n, tg: curled PES15 bind)
-    on the stock hand palette, its segment snapped to the stock joint."""
-    import numpy as np
+def pack_hand_vertex(pos, raw, palette, wrist, rest):
+    """The hand-local copy of a one-hand vertex: its rigid copy's position
+    minus the wrist (rest = that copy's normal/binormal/tangent/uv tail, the
+    frame being the same), weights on the stock hand palette."""
     w = {}
     for name, x in raw:
         if x > 0:
@@ -652,15 +651,18 @@ def pack_hand_vertex(p, n, tg, raw, fit, uv_tail):
             w[b] = w.get(b, 0.0) + x
     top = sorted(w.items(), key=lambda kv: -kv[1])[:F.MAX_INFLUENCES]
     tw = sum(x for _, x in top) or 1.0
-    top = [(b, x / tw) for b, x in top]
-    rot = fit['rot']
-    pos = rot @ (np.array(p) - fit['origin']) + fit['rig_origin'] + sum(x * fit['snap'][b] for b, x in top)
-    nrm, tan = rot @ np.array(n), rot @ np.array(tg)
-    nrm /= np.linalg.norm(nrm) or 1.0
-    tan /= np.linalg.norm(tan) or 1.0
-    ws, slots = F.skin_pack([(fit['palette'].index(b), x) for b, x in top])
-    return struct.pack('<3f3f4B3f3f3f', *pos, *ws[:3], *slots, *nrm, *np.cross(nrm, tan), *tan) + uv_tail
+    ws, slots = F.skin_pack([(palette.index(b), x / tw) for b, x in top])
+    return struct.pack('<3f3f4B', *[a - b for a, b in zip(pos, wrist)], *ws[:3], *slots) + rest
 
+
+def hrig_trailer(hand_rig, joints):
+    """HRIG_MAGIC trailer for the sides with a rig copy (joints: side -> 12 joints)."""
+    out = HRIG_MAGIC
+    for side in ('l', 'r'):
+        rig = hand_rig[side]
+        out += bytes(rig['palette']) + struct.pack('<12b', *rig['parents'])
+        out += struct.pack('<36f', *[c for j in joints.get(side, [(0.0, 0.0, 0.0)] * 12) for c in j])
+    return out
 
 
 # PES's deform helpers (dsk_*) turn part of the way between the two bones of
@@ -880,6 +882,7 @@ def convert(folder, kit_dds, out_dir, hide_body=None):
     skull_slot = rig['palette'].index(FACE_SKULL_BONE)
     head_p12 = p12[F.FOX_TO_PES12[HEAD_BONE]]
     verts, idx, subs, textures = [], [], [], []
+    hand_joints_of = {}              # side -> the joints of the model its rig copy came from
     tex_index = {}
     geometry_whole = False
     for fname, mtl in mats.items():
@@ -892,7 +895,18 @@ def convert(folder, kit_dds, out_dir, hide_body=None):
         bind = {b.name: joint(b) for b in m.bones}
         on_head = types.get(fname) in HEAD_TYPES and head_world is not None
         fslots = face_slots(bind, rig)
-        fits = {s: hand_fit(bind, hand_rig[s], s) for s in SUB_HAND_SIDE}
+        hand_at = {}             # side -> (wrist, this model's joints) when it has a full finger rig
+        for s_ in SUB_HAND_SIDE:
+            fox = 'sk_hand_' + s_
+            wrist = p12[F.FOX_TO_PES12[fox]]
+            a_, q_ = retarget.PES_RENDER_BIND[fox][0], retarget.PES_ALIGN.get(fox, (0.0, 0.0, 0.0, 1.0))
+
+            def to_body(c, fox=fox, wrist=wrist, a_=a_, q_=q_):   # the rigid copy's placement, on the hand bone
+                r = retarget._q_rot(q_, tuple(ci - ai for ci, ai in zip(c, a_)))
+                return [w + rk + sk for w, rk, sk in zip(wrist, r, seam_offset(fox, c, seams))]
+            j = hand_joints(bind, s_, to_body, wrist)
+            if j is not None:
+                hand_at[s_] = (wrist, j)
         fdist = face_bone_dist(m, bind, face_align(bind), rig)
         for mesh in m.meshes:
             if SKIP_MATERIALS.search(mesh.material or '') or len(mesh.faces) < 1:
@@ -968,7 +982,6 @@ def convert(folder, kit_dds, out_dir, hide_body=None):
                 p, n = curl_fingers(p, n, raw, bind)
                 tg = (v.tangent.x, v.tangent.y, v.tangent.z) if v.tangent else (1.0, 0.0, 0.0)
                 hside = hand_side(raw)
-                hfit = fits.get(hside) if hside else None
                 pos, nrm, tan = [0.0] * 3, [0.0] * 3, [0.0] * 3
                 for (fox, _), w in top:
                     a = retarget.PES_RENDER_BIND[fox][0]
@@ -1000,8 +1013,10 @@ def convert(folder, kit_dds, out_dir, hide_body=None):
                 if all(fox == HEAD_BONE for (fox, _) in infl):
                     face_of[len(verts)] = pack_face_vertex(pos, head_p12, raw, fslots, skull_slot, packed[F.FACE_REST_OFF:], fdist)
                     face_src[len(verts)] = (pos, packed[F.FACE_REST_OFF:])
-                if hfit is not None:
-                    hand_of[len(verts)] = (hside, pack_hand_vertex(p, n, tg, raw, hfit, packed[UV_TAIL_OFF:]))
+                if hside in hand_at:
+                    hand_of[len(verts)] = (hside, pack_hand_vertex(pos, raw, hand_rig[hside]['palette'], hand_at[hside][0],
+                                                                   packed[F.FACE_REST_OFF:]))
+                    hand_joints_of.setdefault(hside, hand_at[hside][1])
                 verts.append(packed)
             face_tris, body_tris = [], []
             for face in mesh.faces:
@@ -1088,6 +1103,8 @@ def convert(folder, kit_dds, out_dir, hide_body=None):
             o.write(struct.pack('<4I', *s))
         o.write(b''.join(verts))
         o.write(struct.pack('<%dI' % len(idx), *idx))
+        if any(sf & SUB_HAND_RIG for *_x, sf in subs):
+            o.write(hrig_trailer(hand_rig, hand_joints_of))
     # magick encodes in its own processes: one per texture at once
     from concurrent.futures import ThreadPoolExecutor
     with ThreadPoolExecutor() as pool:

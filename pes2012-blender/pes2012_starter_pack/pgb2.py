@@ -8,6 +8,9 @@ Layout:
   u32 magic 'PGB2', nv, ni, stride(80), nsub, keep (stock pieces drawn, PIECES bits)
   nsub x (u32 firstIndex, u32 indexCount, u32 texture, u32 subFlags)
   nv x 80-byte vertices, ni x u32 indices
+  [optional trailer: 'HRIG' + per hand the stock hand palette, rig parents and
+   the model's own hand joints (tools/pes15_to_pes12.py hrig_trailer); kept
+   byte for byte]
 
 Vertex (struct '<3f3f4B3f3f3f2f2f', tools/fmdl_to_pes12.py):
   POSITION f3 | BLENDWEIGHT f3 (n-1 explicit) | BLENDINDICES ubyte4 |
@@ -120,10 +123,10 @@ def parse(data):
     idx = list(struct.unpack_from('<%dI' % ni, data, ibase))
     return dict(keep=keep, subs=[dict(first=s[0], count=s[1], tex=s[2],
                                       flags=s[3]) for s in subs],
-                verts=verts, idx=idx)
+                verts=verts, idx=idx, trailer=bytes(data[ibase + 4 * ni:]))
 
 
-def build(keep, verts, idx, subs):
+def build(keep, verts, idx, subs, trailer=b''):
     """verts: unpack_vertex-style dicts (pos/slots/weights/...); returns bytes."""
     nv, ni = len(verts), len(idx)
     if nv > 0xFFFFFFFF or ni > 0xFFFFFFFF:
@@ -135,10 +138,10 @@ def build(keep, verts, idx, subs):
         out += struct.pack(VERT_FMT, *v['pos'], *v['weights'], *v['slots'],
                            *v['nrm'], *v['bin'], *v['tan'], *v['uv0'], *v['uv1'])
     out += struct.pack('<%dI' % ni, *idx)
-    return bytes(out)
+    return bytes(out) + trailer
 
 
-def pack_body(tris_by_mat, vert_data, mat_flags, mat_tex, mat_face, keep):
+def pack_body(tris_by_mat, vert_data, mat_flags, mat_tex, mat_face, keep, trailer=b''):
     """Pure assembly: per-vert data + triangle soup -> PGB2 bytes.
     Blender's export_body is a thin adapter reading mesh state into these
     plain dicts; tests/ drives this directly against p272101.
@@ -176,13 +179,13 @@ def pack_body(tris_by_mat, vert_data, mat_flags, mat_tex, mat_face, keep):
                 idx.append(len(verts) - 1)
         subs.append(dict(first=first, count=len(idx) - first,
                          tex=mat_tex.get(mi, 0), flags=flags))
-    return build(keep, verts, idx, subs)
+    return build(keep, verts, idx, subs, trailer)
 
 
 def round_trip(data):
     """Parse-compare helper: returns (parsed, rebuilt_bytes)."""
     p = parse(data)
-    return p, build(p['keep'], p['verts'], p['idx'], p['subs'])
+    return p, build(p['keep'], p['verts'], p['idx'], p['subs'], p['trailer'])
 
 
 # --- PGT1 textures (body_<k>.tex): u32 'PGT1', w, h, nmips, BGRA8 mips ---

@@ -408,6 +408,7 @@ def import_body(context, filepath):
             obj.vertex_groups[name].add([vi], w, 'REPLACE')
     obj.pgb2_keep = {n for i, n in enumerate(pgb2.PIECES) if parsed['keep'] >> i & 1}
     obj['pgb2_source'] = os.path.abspath(filepath)
+    obj['pgb2_trailer'] = parsed['trailer'].hex()   # the HRIG hand joints, written back on export
     for mi, s in enumerate(parsed['subs']):
         mat = bpy.data.materials.new('%s_sub%d' % (stem, mi))
         obj.data.materials.append(mat)
@@ -501,7 +502,7 @@ def export_body(filepath, obj):
     keep = sum(1 << pgb2.PIECES.index(n) for n in obj.pgb2_keep)
     open(filepath, 'wb').write(pgb2.pack_body(
         {mi: tris for mi, tris in tri_by_mat.items() if tris},
-        vert_data, mat_flags, mat_tex, mat_face, keep))
+        vert_data, mat_flags, mat_tex, mat_face, keep, bytes.fromhex(obj.get('pgb2_trailer', ''))))
     return sum(len(t) for t in tri_by_mat.values())
 
 

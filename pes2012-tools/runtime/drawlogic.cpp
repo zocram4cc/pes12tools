@@ -299,6 +299,12 @@ static const DWORD SUB_HAIR = 1u << 18;   // PES Hair shader: opaque, plus the a
 // skipped in a pass whose stock hand drew the rig copy.
 static const DWORD SUB_HAND_L = 1u << 19, SUB_HAND_R = 1u << 20, SUB_HAND_RIG = 1u << 21;
 static const DWORD SUB_HAND_SIDE[2] = { SUB_HAND_L, SUB_HAND_R };
+// body.bin trailer after the indices (pes15_to_pes12 HRIG_MAGIC): per side
+// the stock palette (slot -> rig bone), the rig parents and the model's own
+// joints, hand-local (wrist at the origin, the hand bone binds unrotated)
+static const DWORD HRIG_MAGIC = 0x47495248;   // 'HRIG'
+static const UINT HAND_RIG_BONES = 12;        // dt0d #589's hand rig (pes12_rig.hand_rig)
+static const UINT HRIG_SIDE_BYTES = HAND_RIG_BONES * (1 + 1 + 3 * sizeof(float));
 // which submeshes a drawCustom call draws
 enum { DRAW_BODY, DRAW_FACE, DRAW_HAND_L, DRAW_HAND_R };
 static IDirect3DPixelShader9 *g_psShadeless = NULL, *g_psToon = NULL;
@@ -349,8 +355,12 @@ struct CustomModel {
     IDirect3DTexture9* tex[MAX_TEXS]; UINT ntex;
     CustomSub sub[MAX_SUBS]; UINT nsub;
     UINT nv, ni, stride; DWORD keep; bool tried;   // keep: stock pieces drawn (PIECE_NAMES bits)
-    bool handRig[2];                             // has SUB_HAND_RIG subs, per side (L, R)
-    bool handRigged[2];                          // its rig copy drew since its last body draw
+    bool handRig[2];                             // has SUB_HAND_RIG subs and their HRIG joints, per side (L, R)
+    BYTE hrigBone[2][HAND_RIG_BONES];            // HRIG trailer: palette slot -> rig bone
+    signed char hrigParent[2][HAND_RIG_BONES];   // rig bone -> parent (-1: the wrist root)
+    float hrigJoint[2][HAND_RIG_BONES][3];       // the model's joints, hand-local, by rig bone
+    bool handCaught[2];                          // its stock hand drew this frame: handRel holds the pose
+    float handRel[2][HAND_RIG_BONES * BONE_REGS][4];   // each palette slot relative to the rig root
     LONG pid, lastUsed;                          // resident-cache key, frame of last use
     float minY;                                  // lowest vertex (m): does it stand on its own
 };
@@ -737,10 +747,6 @@ static bool loadModel(IDirect3DDevice9* d, CustomModel& M, const wchar_t* dir) {
     }
     { DWORD k; if (readModeFile(dir, &k)) M.keep = k; }
     M.keep &= (PART_BIT << PIECE_COUNT) - 1;
-    for (int h = 0; h < 2; h++) {
-        M.handRig[h] = M.handRigged[h] = false;
-        for (UINT i = 0; i < M.nsub; i++) if ((M.sub[i].flags & SUB_HAND_RIG) && (M.sub[i].flags & SUB_HAND_SIDE[h])) M.handRig[h] = true;
-    }
     UINT isz = v2 ? 4 : 2, vlen = M.nv * M.stride, ilen = M.ni * isz;
     void* p = NULL;
     bool ok = SUCCEEDED(d->CreateVertexBuffer(vlen, D3DUSAGE_WRITEONLY, 0, D3DPOOL_MANAGED, &M.vb, NULL))
@@ -749,6 +755,17 @@ static bool loadModel(IDirect3DDevice9* d, CustomModel& M, const wchar_t* dir) {
     M.minY = 1e9f;   // POSITION is the vertex's first 3 floats (PGB2, pgb2.VERT_FMT)
     if (ok) for (UINT i = 0; i < M.nv; i++) { float y = *(const float*)(at + i * M.stride + sizeof(float)); if (y < M.minY) M.minY = y; }
     if (ok && SUCCEEDED(M.ib->Lock(0, ilen, &p, 0))) { memcpy(p, at + vlen, ilen); M.ib->Unlock(); }
+    const BYTE* tr = at + vlen + ilen;
+    bool hrig = v2 && tr + sizeof(DWORD) + 2 * HRIG_SIDE_BYTES <= b + n && *(const DWORD*)tr == HRIG_MAGIC;
+    for (int h = 0; h < 2; h++) {
+        M.handRig[h] = M.handCaught[h] = false;
+        if (!hrig) continue;
+        const BYTE* q = tr + sizeof(DWORD) + h * HRIG_SIDE_BYTES;
+        memcpy(M.hrigBone[h], q, HAND_RIG_BONES);
+        memcpy(M.hrigParent[h], q + HAND_RIG_BONES, HAND_RIG_BONES);
+        memcpy(M.hrigJoint[h], q + 2 * HAND_RIG_BONES, sizeof(M.hrigJoint[h]));
+        for (UINT i = 0; i < M.nsub; i++) if ((M.sub[i].flags & SUB_HAND_RIG) && (M.sub[i].flags & SUB_HAND_SIDE[h])) M.handRig[h] = true;
+    }
     HeapFree(GetProcessHeap(), 0, b);
     M.ntex = 0;
     for (UINT i = 0; i < M.nsub; i++) if (M.sub[i].tex + 1 > M.ntex) M.ntex = M.sub[i].tex + 1;
@@ -882,6 +899,61 @@ static float nearestExtremity(int piece, int* model) {
     return best;
 }
 
+// 3x4 affine bone matrices (rows = x, y, z; column 3 = translation)
+static void affMul(const float (*A)[4], const float (*B)[4], float (*O)[4]) {
+    for (int r = 0; r < 3; r++)
+        for (int c = 0; c < 4; c++)
+            O[r][c] = A[r][0] * B[0][c] + A[r][1] * B[1][c] + A[r][2] * B[2][c] + (c == 3 ? A[r][3] : 0.0f);
+}
+static void affInv(const float (*M)[4], float (*O)[4]) {   // general (the game's bones carry scale)
+    float a = M[0][0], b = M[0][1], c = M[0][2], d = M[1][0], e = M[1][1], f = M[1][2], g = M[2][0], h = M[2][1], i = M[2][2];
+    float A = e * i - f * h, B = f * g - d * i, C = d * h - e * g, det = a * A + b * B + c * C;
+    float k = det != 0 ? 1.0f / det : 0.0f;
+    float R[3][3] = { { A * k, (c * h - b * i) * k, (b * f - c * e) * k },
+                      { B * k, (a * i - c * g) * k, (c * d - a * f) * k },
+                      { C * k, (b * g - a * h) * k, (a * e - b * d) * k } };
+    for (int r = 0; r < 3; r++) {
+        for (int q = 0; q < 3; q++) O[r][q] = R[r][q];
+        O[r][3] = -(R[r][0] * M[0][3] + R[r][1] * M[1][3] + R[r][2] * M[2][3]);
+    }
+}
+// The stock hand draw's palette, each slot relative to the rig root: the
+// finger pose without the game's own placement of the hand rig, which sits
+// about 6 deg and 3 % off the body's hand bone (02-10 grab) - drawn where the
+// game puts it, the hand broke away from the wrist (owner, Green Is My Pepper).
+static void captureHand(CustomModel& M, int side) {
+    UINT root = 0;
+    while (root < HAND_RIG_BONES && M.hrigBone[side][root] != 0) root++;
+    if (root == HAND_RIG_BONES) return;
+    float inv[3][4]; affInv(&g_vsc[BONE_REG0 + root * BONE_REGS], inv);
+    for (UINT k = 0; k < HAND_RIG_BONES; k++) affMul(inv, &g_vsc[BONE_REG0 + k * BONE_REGS], &M.handRel[side][k * BONE_REGS]);
+    M.handCaught[side] = true;
+}
+// That pose on this draw's hand bone, each rig bone turned about the model's
+// own joint (its rotation from the game, its pivot from HRIG: the stock palm
+// is cupped, a 4cc hand's joints sit up to 4 cm elsewhere) -> the 12-slot
+// palette its SUB_HAND_RIG vertices are weighted to.
+static void handPalette(const CustomModel& M, int side, const float (*handBone)[4], float (*pal)[4]) {
+    const float* wrist = side ? HAND_BIND_R : HAND_BIND_L;
+    float anchor[3][4]; memcpy(anchor, handBone, sizeof(anchor));
+    for (int r = 0; r < 3; r++) anchor[r][3] += anchor[r][0] * wrist[0] + anchor[r][1] * wrist[1] + anchor[r][2] * wrist[2];
+    UINT slot[HAND_RIG_BONES];
+    for (UINT k = 0; k < HAND_RIG_BONES; k++) if (M.hrigBone[side][k] < HAND_RIG_BONES) slot[M.hrigBone[side][k]] = k;
+    float bone[HAND_RIG_BONES][3][4];
+    for (UINT b = 0; b < HAND_RIG_BONES; b++) {           // parents come first (#589: 0; 1-5 <- 0; 6-10 <- 1-5; 11 <- 6)
+        const float (*R)[4] = &M.handRel[side][slot[b] * BONE_REGS];
+        int par = M.hrigParent[side][b];
+        const float (*P)[4] = par >= 0 && (UINT)par < b ? bone[par] : R;
+        const float* c = M.hrigJoint[side][b];
+        for (int r = 0; r < 3; r++) {
+            float moved = P[r][0] * c[0] + P[r][1] * c[1] + P[r][2] * c[2] + P[r][3];   // the joint, carried by its parent
+            for (int q = 0; q < 3; q++) bone[b][r][q] = R[r][q];
+            bone[b][r][3] = moved - (R[r][0] * c[0] + R[r][1] * c[1] + R[r][2] * c[2]);
+        }
+    }
+    for (UINT k = 0; k < HAND_RIG_BONES; k++) affMul(anchor, bone[M.hrigBone[side][k] < HAND_RIG_BONES ? M.hrigBone[side][k] : 0], &pal[k * BONE_REGS]);
+}
+
 static HRESULT drawWithBones(IDirect3DDevice9* d, const float (*c)[4], const char* who);
 static HRESULT drawCustomLod0(IDirect3DDevice9* d) {
     float c[CU_SLOTS * BONE_REGS][4];
@@ -916,6 +988,14 @@ draw:
     d->SetVertexDeclaration(g_kitDecl); d->SetVertexShader(g_kitVS);
     g_orgSVSCF(d, BONE_REG0, &c[0][0], CU_SLOTS * BONE_REGS);
     HRESULT hr = drawCustom(d);
+    for (int s = 0; s < 2; s++) {                // his hands on the stock hand's pose (captureHand)
+        if (!g_cuM->handCaught[s]) continue;
+        g_cuM->handCaught[s] = false;
+        float pal[HAND_RIG_BONES * BONE_REGS][4];
+        handPalette(*g_cuM, s, &c[(s ? SLOT_HAND_R : SLOT_HAND_L) * BONE_REGS], pal);
+        g_orgSVSCF(d, BONE_REG0, &pal[0][0], HAND_RIG_BONES * BONE_REGS);
+        drawCustom(d, DRAW_HAND_L + s);
+    }
     g_orgSVSCF(d, BONE_REG0, &keep[0][0], CU_SLOTS * BONE_REGS);
     d->SetVertexDeclaration(keepDecl); d->SetVertexShader(keepVS);
     if (keepDecl) keepDecl->Release(); if (keepVS) keepVS->Release();
@@ -1164,7 +1244,7 @@ static HRESULT drawCustom(IDirect3DDevice9* d, int part) {
         bool face = (S.flags & SUB_FACE) != 0, rig = (S.flags & SUB_HAND_RIG) != 0;
         if (part == DRAW_FACE ? !face : part == DRAW_BODY ? face || rig
             : !rig || !(S.flags & SUB_HAND_SIDE[part - DRAW_HAND_L])) continue;
-        if (part == DRAW_BODY && ((S.flags & SUB_HAND_L && M.handRigged[0]) || (S.flags & SUB_HAND_R && M.handRigged[1]))) continue;
+        if (part == DRAW_BODY && ((S.flags & SUB_HAND_L && M.handCaught[0]) || (S.flags & SUB_HAND_R && M.handCaught[1]))) continue;
         // a texture that failed to load binds nothing, never the previous sub's
         // texture (01-10: Eustace's chair drew his newspaper)
         if (!g_cuKeepGameTex) g_orgSTEX(d, 0, S.tex < M.ntex ? M.tex[S.tex] : NULL);
@@ -1221,8 +1301,6 @@ static HRESULT drawCustom(IDirect3DDevice9* d, int part) {
     g_orgSTEX(d, 0, keepTex);
     g_orgSI(d, keepIB);
     g_orgSSS(d, 0, keepVB, keepOff, keepSt);
-    if (part == DRAW_BODY) M.handRigged[0] = M.handRigged[1] = false;
-    else if (part != DRAW_FACE) M.handRigged[part - DRAW_HAND_L] = true;
     return hr;
 }
 
@@ -1614,10 +1692,12 @@ static HRESULT STDMETHODCALLTYPE myDIP(IDirect3DDevice9* d, D3DPRIMITIVETYPE t,
             if (g_runLog) { char m[128]; wsprintfA(m, "  detail %s %u/%u/%u: nearest hiding model %d at %d mm", PIECE_NAMES[piece], nV, nP, g_stride, who, (int)(dm * 1000)); logline(m); }
             if (dm < DETAIL_OWNER_MAX_M) {               // a custom player's, who does not keep it
                 // his own hand on this rig, if he has one: the game has just
-                // uploaded this hand's palette, which the rig copy is weighted to
+                // uploaded this hand's palette; its pose relative to the rig
+                // root is kept for his body draw (drawWithBones), which
+                // anchors it on his own hand bone
                 int side = nV == DETAIL_HAND_L_NV ? 0 : nV == DETAIL_HAND_R_NV ? 1 : -1;
                 if (detailHands && g_stride == DETAIL_HAND_STRIDE && side >= 0 && useModel(d, who) && g_cuM->handRig[side])
-                    drawCustom(d, DRAW_HAND_L + side);
+                    captureHand(*g_cuM, side);
                 return D3D_OK;
             }
         }
