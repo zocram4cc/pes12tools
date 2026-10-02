@@ -2001,7 +2001,13 @@ static void hookS(void** vt, int idx, void* fn, void** org) {
     g_saved[g_nsaved].idx = idx; g_saved[g_nsaved].org = vt[idx]; g_nsaved++;
     *org = NULL; hookV(vt, idx, fn, org);
 }
+static PVOID g_veh = NULL;   // faultLog's vectored handler (below)
+static void unhookGameUEF();
+static void unhookPct3();
 extern "C" __declspec(dllexport) void logic_uninstall() {
+    if (g_veh) { RemoveVectoredExceptionHandler(g_veh); g_veh = NULL; }
+    unhookGameUEF();
+    unhookPct3();
     void** vt = *(void***)g_dev;
     for (int i = g_nsaved - 1; i >= 0; i--) { void* dummy = NULL; hookV(vt, g_saved[i].idx, g_saved[i].org, &dummy); }
     g_nsaved = 0;
@@ -2024,6 +2030,205 @@ extern "C" __declspec(dllexport) void logic_uninstall() {
     if (g_log != INVALID_HANDLE_VALUE) { CloseHandle(g_log); g_log = INVALID_HANDLE_VALUE; }
 }
 
+// kitserver12 afsio's three size hooks (afsio.cpp afsioAtGetBinSizeCallPoint1/2,
+// afsioAtGetBufferSizeCallPoint) re-run the game's own lookup, size table[file id],
+// before asking fserv. fserv's face/hair ids are FIRST_FACE_SLOT + 2 * player-table
+// row (fserv.cpp), far past the end of dt0c's 6274-entry table: the reads are out
+// of bounds, and fault when the page is unmapped (/s4s/ Ebin, id 0xaada, 02-10).
+// Ids from FIRST_FACE_SLOT up get size 0 instead; fserv then sets the real size for
+// its files, as before. Patched once per process: the stubs live in their own
+// allocation, so they outlive drawlogic reloads, and a reload finds the sites
+// already patched.
+static const DWORD FSERV_FIRST_FACE_SLOT = 27000;      // fserv.cpp FIRST_FACE_SLOT
+static const int AFSIO_SITE_MAX = 12;                  // longest original instruction run
+static const int AFSIO_STUB_MAX = 32;
+struct AfsioSite { DWORD rva; BYTE n; BYTE org[AFSIO_SITE_MAX]; BYTE sn; BYTE stub[AFSIO_STUB_MAX]; BYTE cmpAt; };
+#define FSERV_SLOT_IMM 0, 0, 0, 0                      // FSERV_FIRST_FACE_SLOT, filled in at patch time
+static const AfsioSite AFSIO_SITES[] = {
+    // CallPoint1: mov ecx,[esi+edi*4+11c]  (file id edi)
+    { 0x12ad, 8, { 0x3e, 0x8b, 0x8c, 0xbe, 0x1c, 0x01, 0x00, 0x00 },
+      19, { 0x81, 0xff, FSERV_SLOT_IMM,              // cmp edi,FSERV_FIRST_FACE_SLOT
+            0x73, 0x08,                              // jae served
+            0x8b, 0x8c, 0xbe, 0x1c, 0x01, 0x00, 0x00, // mov ecx,[esi+edi*4+11c]
+            0xc3,                                    // ret
+            0x31, 0xc9, 0xc3 }, 2 },                 // served: xor ecx,ecx / ret
+    // CallPoint2: mov edx,[esi+edi*4+11c]
+    { 0x12dd, 8, { 0x3e, 0x8b, 0x94, 0xbe, 0x1c, 0x01, 0x00, 0x00 },
+      19, { 0x81, 0xff, FSERV_SLOT_IMM, 0x73, 0x08,
+            0x8b, 0x94, 0xbe, 0x1c, 0x01, 0x00, 0x00, 0xc3,
+            0x31, 0xd2, 0xc3 }, 2 },                 // xor edx,edx
+    // BufferSize: mov edx,[ebx+10] / mov eax,[eax+edx*4] / mov ecx,[ebx+0c]
+    { 0x130d, 12, { 0x3e, 0x8b, 0x53, 0x10, 0x3e, 0x8b, 0x04, 0x90, 0x3e, 0x8b, 0x4b, 0x0c },
+      21, { 0x8b, 0x53, 0x10,                        // mov edx,[ebx+10]   file id
+            0x8b, 0x4b, 0x0c,                        // mov ecx,[ebx+0c]   afs id
+            0x81, 0xfa, FSERV_SLOT_IMM,              // cmp edx,FSERV_FIRST_FACE_SLOT
+            0x73, 0x04,                              // jae served
+            0x8b, 0x04, 0x90, 0xc3,                  // mov eax,[eax+edx*4] / ret
+            0x31, 0xc0, 0xc3 }, 8 },                 // served: xor eax,eax / ret
+};
+static void guardAfsioSizeReads() {
+    BYTE* afsio = (BYTE*)GetModuleHandleA("afsio.dll");
+    if (!afsio) return;
+    const int n = sizeof(AFSIO_SITES) / sizeof(AFSIO_SITES[0]);
+    BYTE* stubs = NULL;
+    for (int i = 0; i < n; i++) {
+        const AfsioSite& a = AFSIO_SITES[i];
+        BYTE* site = afsio + a.rva;
+        char m[96];
+        if (site[0] == 0xE8) { wsprintfA(m, "afsio size read +%x: already guarded", a.rva); logline(m); continue; }
+        if (memcmp(site, a.org, a.n)) { wsprintfA(m, "afsio size read +%x: unknown afsio build, not guarded", a.rva); logline(m); continue; }
+        if (!stubs && !(stubs = (BYTE*)VirtualAlloc(NULL, n * AFSIO_STUB_MAX, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE))) return;
+        BYTE* stub = stubs + i * AFSIO_STUB_MAX;
+        memcpy(stub, a.stub, a.sn);
+        memcpy(stub + a.cmpAt, &FSERV_FIRST_FACE_SLOT, 4);
+        BYTE patch[AFSIO_SITE_MAX]; memset(patch, 0x90, sizeof(patch));
+        patch[0] = 0xE8; LONG rel = (LONG)(stub - (site + 5)); memcpy(patch + 1, &rel, 4);
+        DWORD prot;
+        if (!VirtualProtect(site, a.n, PAGE_EXECUTE_READWRITE, &prot)) continue;
+        memcpy(site, patch, a.n);
+        VirtualProtect(site, a.n, prot, &prot);
+        FlushInstructionCache(GetCurrentProcess(), site, a.n);
+        wsprintfA(m, "afsio size read +%x: guarded for fserv ids", a.rva); logline(m);
+    }
+}
+
+// First-chance fault log: the game turns faults into a CRT abort (0xc0000417) and
+// terminates before an attached winedbg can read them (/s4s/ Ebin, 02-10). A
+// vectored handler sees each fault before the game's SEH does and logs where it
+// happened plus every stack word that points into a loaded module (the call chain).
+static const int FAULT_LOG_MAX = 32;            // faults logged per drawlogic instance
+static const int FAULT_SAME_EIP_MAX = 2;        // a benign fault the game retries is logged twice, not 32 times
+static const int FAULT_STACK_WORDS = 256;       // stack dwords scanned for return addresses
+static const DWORD STATUS_CRT_INVALID_PARAMETER = 0xC0000417;
+static const DWORD MODULE_CODE_MAX = 0x1000000;  // offsets past 16 MB are not code (pes2012.exe is 0x18dd000; drops wrapped sign words)
+static volatile LONG g_faults = 0;
+static DWORD g_faultEip[FAULT_LOG_MAX]; static BYTE g_faultSeen[FAULT_LOG_MAX];
+static bool moduleOf(DWORD a, char* out, DWORD* off) {
+    HMODULE m = NULL;
+    if (!GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT, (LPCSTR)a, &m) || !m) return false;
+    char path[MAX_PATH]; if (!GetModuleFileNameA(m, path, MAX_PATH)) return false;
+    const char* b = path; for (const char* q = path; *q; q++) if (*q == '\\' || *q == '/') b = q + 1;
+    lstrcpynA(out, b, 32); *off = a - (DWORD)m; return true;
+}
+static void logStack(const DWORD* sp) {
+    char m[96], mod[32]; DWORD off;
+    MEMORY_BASIC_INFORMATION mi;
+    if (!VirtualQuery(sp, &mi, sizeof(mi)) || mi.State != MEM_COMMIT) return;
+    DWORD avail = (DWORD)((BYTE*)mi.BaseAddress + mi.RegionSize - (BYTE*)sp) / 4;
+    for (DWORD i = 0; i < FAULT_STACK_WORDS && i < avail; i++)
+        if (moduleOf(sp[i], mod, &off) && lstrcmpiA(mod, "drawlogic.dll") && off < MODULE_CODE_MAX) {
+            wsprintfA(m, "  [esp+%03lx] %s+%lx", i * 4, mod, off); logline(m);
+        }
+}
+static LONG CALLBACK faultLog(EXCEPTION_POINTERS* e) {
+    EXCEPTION_RECORD* r = e->ExceptionRecord; CONTEXT* c = e->ContextRecord;
+    if (r->ExceptionCode != EXCEPTION_ACCESS_VIOLATION && r->ExceptionCode != STATUS_CRT_INVALID_PARAMETER) return EXCEPTION_CONTINUE_SEARCH;
+    for (int i = 0; i < FAULT_LOG_MAX && i < g_faults; i++)
+        if (g_faultEip[i] == c->Eip && ++g_faultSeen[i] > FAULT_SAME_EIP_MAX) return EXCEPTION_CONTINUE_SEARCH;
+    LONG k = InterlockedIncrement(&g_faults) - 1;
+    if (k >= FAULT_LOG_MAX) return EXCEPTION_CONTINUE_SEARCH;
+    g_faultEip[k] = c->Eip; g_faultSeen[k] = 1;
+    char mod[32] = "?", m[256]; DWORD off = 0;
+    moduleOf(c->Eip, mod, &off);
+    wsprintfA(m, "FAULT %08lx at %s+%lx (eip %08lx) %s %08lx thread %lu", r->ExceptionCode, mod, off, c->Eip,
+              r->NumberParameters >= 2 ? (r->ExceptionInformation[0] ? "write" : "read") : "-",
+              r->NumberParameters >= 2 ? (DWORD)r->ExceptionInformation[1] : 0, GetCurrentThreadId());
+    logline(m);
+    wsprintfA(m, "  eax %08lx ebx %08lx ecx %08lx edx %08lx esi %08lx edi %08lx ebp %08lx esp %08lx",
+              c->Eax, c->Ebx, c->Ecx, c->Edx, c->Esi, c->Edi, c->Ebp, c->Esp);
+    logline(m);
+    logStack((const DWORD*)c->Esp);
+    return EXCEPTION_CONTINUE_SEARCH;
+}
+
+// The game's static CRT reports a bad argument to a *_s call (0xc0000417) by
+// calling UnhandledExceptionFilter directly - no exception is raised, so faultLog
+// never sees it. The game's import of it is redirected here to log the context
+// the CRT captured and the stack, then forwarded.
+typedef LONG (WINAPI* UEF_FN)(EXCEPTION_POINTERS*);
+static UEF_FN g_orgUEF = NULL;
+static DWORD* g_uefSlot[FAULT_LOG_MAX]; static int g_nUefSlot = 0;
+// pes2012+0xdf4230 formats the signed byte this+0x34 with "%d" into a 3-byte stack
+// buffer (sprintf_s wrapper +0x24710); the CRT aborts the game (0xc0000417) when the
+// number needs 3 digits. That byte is the low byte of a heap pointer (+0x34 holds
+// one: 0x1a491e37 -> 55, 0x1a491e64 -> 100), so which player trips it is down to
+// where the heap put him (/s4s/ Ebin, then three more while browsing, 02-10). The
+// buffer is dead - nothing in the function reads it after the call - so a number
+// that does not fit is cut to the buffer instead; fitting ones go through untouched.
+static const DWORD PCTD3_SITE = 0x011f4285;          // e8 rel32 -> PCTD3_WRAPPER
+static const DWORD PCTD3_WRAPPER = 0x00424710;       // int f(char buf[3], const char* fmt, ...)
+static const int PCTD3_BUF_BYTES = 3;
+static BYTE g_pctOrg[5]; static bool g_pctHooked = false;
+extern "C" int __cdecl pctWrap(DWORD self, DWORD ret, char* buf, const char* fmt, int v) {
+    char tmp[16]; wsprintfA(tmp, fmt, v);
+    bool fits = lstrlenA(tmp) < PCTD3_BUF_BYTES;
+    if (fits) return ((int (__cdecl*)(char*, const char*, ...))PCTD3_WRAPPER)(buf, fmt, v);
+    char m[96]; wsprintfA(m, "pct3: this %08lx value %d cut to fit (the game would abort)", self, v); logline(m);
+    lstrcpynA(buf, tmp, PCTD3_BUF_BYTES);
+    return PCTD3_BUF_BYTES - 1;
+}
+__attribute__((naked)) static void pctWrapStub() {
+    __asm__ volatile("push %esi\n\tcall _pctWrap\n\tadd $4, %esp\n\tret\n");   // esi = this at the site
+}
+static void hookPct3() {
+    BYTE* site = (BYTE*)PCTD3_SITE;
+    if (site[0] != 0xE8 || (DWORD)(site + 5 + *(LONG*)(site + 1)) != PCTD3_WRAPPER) { logline("pct3: site not found"); return; }
+    memcpy(g_pctOrg, site, 5);
+    BYTE patch[5] = { 0xE8 }; LONG rel = (LONG)((BYTE*)pctWrapStub - (site + 5)); memcpy(patch + 1, &rel, 4);
+    DWORD prot;
+    if (!VirtualProtect(site, 5, PAGE_EXECUTE_READWRITE, &prot)) return;
+    memcpy(site, patch, 5); VirtualProtect(site, 5, prot, &prot); FlushInstructionCache(GetCurrentProcess(), site, 5);
+    g_pctHooked = true; logline("pct3: wrapped");
+}
+static void unhookPct3() {
+    if (!g_pctHooked) return;
+    DWORD prot; BYTE* site = (BYTE*)PCTD3_SITE;
+    if (VirtualProtect(site, 5, PAGE_EXECUTE_READWRITE, &prot)) { memcpy(site, g_pctOrg, 5); VirtualProtect(site, 5, prot, &prot); FlushInstructionCache(GetCurrentProcess(), site, 5); }
+    g_pctHooked = false;
+}
+static LONG WINAPI uefLog(EXCEPTION_POINTERS* e) {
+    char m[160], mod[32] = "?"; DWORD off = 0;
+    DWORD code = e && e->ExceptionRecord ? e->ExceptionRecord->ExceptionCode : 0;
+    DWORD eip = e && e->ContextRecord ? e->ContextRecord->Eip : 0;
+    moduleOf(eip, mod, &off);
+    wsprintfA(m, "UNHANDLED %08lx at %s+%lx (eip %08lx) thread %lu", code, mod, off, eip, GetCurrentThreadId());
+    logline(m);
+    if (e && e->ContextRecord) {
+        CONTEXT* c = e->ContextRecord;
+        wsprintfA(m, "  eax %08lx ebx %08lx ecx %08lx edx %08lx esi %08lx edi %08lx ebp %08lx esp %08lx",
+                  c->Eax, c->Ebx, c->Ecx, c->Edx, c->Esi, c->Edi, c->Ebp, c->Esp);
+        logline(m);
+        logStack((const DWORD*)c->Esp);
+    }
+    DWORD here; logline("  caller stack:"); logStack(&here);
+    return g_orgUEF ? g_orgUEF(e) : EXCEPTION_CONTINUE_SEARCH;
+}
+static void hookGameUEF() {
+    BYTE* base = (BYTE*)GetModuleHandleA(NULL);
+    IMAGE_NT_HEADERS* nt = (IMAGE_NT_HEADERS*)(base + ((IMAGE_DOS_HEADER*)base)->e_lfanew);
+    DWORD size = nt->OptionalHeader.SizeOfImage;
+    DWORD targets[2] = { (DWORD)GetProcAddress(GetModuleHandleA("kernel32.dll"), "UnhandledExceptionFilter"),
+                         (DWORD)GetProcAddress(GetModuleHandleA("kernelbase.dll"), "UnhandledExceptionFilter") };
+    g_orgUEF = (UEF_FN)targets[0];
+    // the exe is packed on disk: its import table only exists in memory, so scan the image for the pointer
+    for (DWORD o = 0; o + 4 <= size && g_nUefSlot < FAULT_LOG_MAX; o += 4) {
+        MEMORY_BASIC_INFORMATION mi;
+        if (!VirtualQuery(base + o, &mi, sizeof(mi)) || mi.State != MEM_COMMIT || (mi.Protect & (PAGE_NOACCESS | PAGE_GUARD))) {
+            o = (DWORD)((BYTE*)mi.BaseAddress + mi.RegionSize - base) - 4; continue;
+        }
+        DWORD* p = (DWORD*)(base + o);
+        if (*p && (*p == targets[0] || *p == targets[1])) {
+            DWORD prot;
+            if (VirtualProtect(p, 4, PAGE_READWRITE, &prot)) { *p = (DWORD)uefLog; VirtualProtect(p, 4, prot, &prot); g_uefSlot[g_nUefSlot++] = p; }
+        }
+    }
+    char m[96]; wsprintfA(m, "UnhandledExceptionFilter imports redirected: %d", g_nUefSlot); logline(m);
+}
+static void unhookGameUEF() {
+    for (int i = 0; i < g_nUefSlot; i++) { DWORD prot; if (VirtualProtect(g_uefSlot[i], 4, PAGE_READWRITE, &prot)) { *g_uefSlot[i] = (DWORD)g_orgUEF; VirtualProtect(g_uefSlot[i], 4, prot, &prot); } }
+    g_nUefSlot = 0;
+}
+
 extern "C" __declspec(dllexport) void logic_install(IDirect3DDevice9* dev) {
     initPaths();
     g_log = CreateFileW(LOGPATH, FILE_APPEND_DATA, FILE_SHARE_READ, NULL,
@@ -2040,6 +2245,10 @@ extern "C" __declspec(dllexport) void logic_install(IDirect3DDevice9* dev) {
     hookS(vt, 109, (void*)mySPSCF, (void**)&g_orgSPSCF); // SetPixelShaderConstantF
     hookS(vt, 82, (void*)myDIP, (void**)&g_orgDIP);    // DrawIndexedPrimitive
     hookS(vt, 26, (void*)myCVB, (void**)&g_orgCVB);    // CreateVertexBuffer
+    guardAfsioSizeReads();
+    g_veh = AddVectoredExceptionHandler(1, faultLog);
+    hookGameUEF();
+    hookPct3();
     logline("logic installed");
 }
 

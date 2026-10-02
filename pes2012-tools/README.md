@@ -118,6 +118,21 @@ Shadeless pixel shaders are `runtime/custom_ps.hlsl`, compiled into
 `custom_ps.h` by `runtime/build_shaders.sh` (vkd3d-compiler); rerun it after
 editing the HLSL, before `build.sh`.
 
+drawlogic also fixes two crashes in the game itself, applied at load:
+
+- kitserver 12's `afsio.dll` looks up every file's size in the img's size
+  table before asking fserv, also for fserv's face ids (27000 + 2 x player
+  row), far past the table's end. Where that read lands on unmapped memory
+  the game dies; the three lookups now give those ids size 0 and fserv sets
+  the real one, as before.
+- `pes2012.exe` prints a byte of a player's model object into a 3-byte
+  buffer that nothing reads; the byte is really part of a heap pointer, and
+  when it is 100 or more the C runtime aborts the game. Which players trip it
+  depends on memory layout; the number is now cut to fit (logged as `pct3`).
+
+A crash the game turns into an abort is logged to `drawhook.log` as
+`UNHANDLED` (with registers and the call chain), a fault as `FAULT`.
+
 ## Build a whole 4cc DLC
 
 The step-by-step build (32-64 teams with full aesthetics, all stadiums,
