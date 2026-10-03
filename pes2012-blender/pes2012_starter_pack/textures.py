@@ -279,8 +279,11 @@ def decode(block):
         p = np.frombuffer(block, np.uint8, PALETTE_ENTRIES * 4, pal).reshape(-1, 4)
         idx = np.frombuffer(block, np.uint8, w * h, pix)
         return w, h, p[idx].reshape(h, w, 4).copy()
-    if bpp == 32:
-        return w, h, np.frombuffer(block, np.uint8, w * h * 4, pix).reshape(h, w, 4).copy()
+    if bpp in (24, 32):
+        px = np.frombuffer(block, np.uint8, w * h * (bpp // 8), pix).reshape(h, w, -1)
+        if bpp == 32:
+            return w, h, px.copy()
+        return w, h, np.dstack([px, np.full((h, w, 1), 255, np.uint8)])   # RGB888, opaque
     raise ValueError('WE00 texture %d: kind %d not supported' % (texture_id(block), bpp))
 
 
@@ -305,7 +308,9 @@ def encode(block, rgba):
     bpp = block[KIND_OFF]
     _, _, pal, pix = _raw_fields(block)
     out = bytearray(block)
-    if bpp == 32:
+    if bpp == 24:
+        out[pix:pix + w * h * 3] = rgba[:, :, :3].tobytes()
+    elif bpp == 32:
         out[pix:pix + w * h * 4] = rgba.tobytes()
     else:
         # ponytail: nearest colour of the block's own palette; a re-quantised

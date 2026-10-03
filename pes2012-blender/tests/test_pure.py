@@ -326,6 +326,29 @@ def test_textures_reencode_each_format():
         print('textures: %r (%s #%d %dx%d) re-encodes, mean error %.2f' % (key, img, i, w, h, err))
 
 
+def test_textures_raw24_roundtrip():
+    """The stadium sky strip's own format: a raw 24-bit RGB888 block (kind
+    24, w*h*3 payload, no palette). Decodes with opaque alpha and re-encodes
+    byte for byte. Synthetic row: the stock game carries no 24-bit WE00."""
+    import struct
+    import textures
+    w, h = 6, 4
+    px = np.arange(w * h * 3, dtype=np.uint8).reshape(h, w, 3)
+    b = (b'WE00' + struct.pack('<HB', 10692, 3) + bytes([24])
+         + struct.pack('<4H', w, h, 0, textures.HEADER) + px.tobytes())
+    gw, gh, got = textures.decode(b)
+    assert (gw, gh) == (w, h), (gw, gh)
+    assert got.shape == (h, w, 4) and (got[..., 3] == 255).all()
+    assert (got[..., :3] == px).all(), 'raw 24 pixels changed'
+    assert textures.encode(b, got) == b, 'raw 24 round trip is not byte exact'
+    got2 = got.copy()
+    got2[1, 2] = (1, 2, 3, 255)
+    back = textures.encode(b, got2)
+    _, _, again = textures.decode(back)
+    assert (again[1, 2, :3] == (1, 2, 3)).all() and (again[0, 0, :3] == px[0, 0]).all()
+    print('textures: raw 24-bit block decodes with opaque alpha and re-encodes exactly')
+
+
 def test_textures_edit_lands():
     """A painted square appears after encode, the rest stays put."""
     import textures
@@ -348,6 +371,7 @@ TESTS = [test_corpus_found, test_container_unedited_exact, test_container_block_
          test_skeleton_per_block,
          test_export_unedited_byte_exact, test_export_edited,
          test_export_survives_dropped_custom_normals,
+         test_textures_raw24_roundtrip,
          test_textures_decode_every_block, test_textures_reencode_each_format, test_textures_edit_lands,
          test_export_corpus_byte_exact]
 

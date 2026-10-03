@@ -43,6 +43,7 @@ GAME_PROP = 'pes12_game'          # collection: the game folder it was read from
 ROOT_PROP = 'pes12_root'          # collection: the afs2fs root it reads overrides from
 ENTRY_PROP = 'pes12_entry'        # sub-collection: its dt07 entry
 TEX_ENTRY_PROP = 'pes12_tex_entry'  # image: the dt07 entry holding its block
+TEX_IMAGES_PROP = 'pes12_tex_images'  # collection: its texture entries' images (on no object)
 BIN_SELF = -1                     # image of a single-BIN import: its own BIN
 
 
@@ -161,7 +162,9 @@ def _packet_objects(col):
 
 
 def _collection_images(col):
-    """Every imported image the collection's materials use, once."""
+    """Every imported image the collection's materials use, once, plus the
+    texture entries' own images (a slot's pitch art and sky, which no
+    material carries)."""
     seen = {}
     for o in col.all_objects:
         for slot in getattr(o, 'material_slots', ()):
@@ -170,6 +173,10 @@ def _collection_images(col):
                 img = getattr(node, 'image', None)
                 if img is not None and blender_io.TEX_BLOCK_PROP in img:
                     seen[img.name] = img
+    for name in col.get(TEX_IMAGES_PROP, ()):
+        img = bpy.data.images.get(name)
+        if img is not None:
+            seen[img.name] = img
     return list(seen.values())
 
 
@@ -207,12 +214,10 @@ def import_slot(context, game, number, root=None):
     index = stadium.texture_index(game, s, root)
     cache, images = {}, {}
 
-    def texture_of(row_id, _datas):
-        where = index.get(row_id)
-        if where is None:
-            return None
+    def image_of(e, k):
+        """The image of one WE00 block of one entry, made once."""
+        where = (e, k)
         if where not in images:
-            e, k = where
             if e not in cache:
                 cache[e] = container.read(stadium.read_raw(game, e, root))
             _, _, px = textures.decode(cache[e].blocks[k].data)
@@ -220,6 +225,10 @@ def import_slot(context, game, number, root=None):
             img[TEX_ENTRY_PROP] = e
             images[where] = img
         return images[where]
+
+    def texture_of(row_id, _datas):
+        where = index.get(row_id)
+        return image_of(*where) if where is not None else None
 
     roles = stadium.slot_entries(s)
     n = 0
@@ -230,6 +239,24 @@ def import_slot(context, game, number, root=None):
             sub[ENTRY_PROP] = e
             _activate(context, sub, top)
             n += _import_container(context, sub, 'dt07_%d' % e, container.read(stadium.read_raw(game, e, root)), texture_of)
+    # The texture entries themselves, block by block: the pitch art and the
+    # sky sit on UV1 rows (or on no row at all - the five variants repeat the
+    # same texture ids, so texture_index can only name the first entry), so no
+    # packet picks them as its diffuse and they would be lost on the next
+    # export. They are editable on their own; they go back through the same
+    # encode, so a paint lands in the entry the block lives in.
+    free = []
+    for role in ('stand', 'pitch', 'sky'):
+        for e in roles[role]:
+            if e not in cache:
+                cache[e] = container.read(stadium.read_raw(game, e, root))
+            for k, b in enumerate(cache[e].blocks):
+                if textures.is_texture(b.data) and (e, k) not in images:
+                    img = image_of(e, k)
+                    img.use_fake_user = True      # no object carries it
+                    free.append(img.name)
+    if free:
+        col[TEX_IMAGES_PROP] = free
     return col, n
 
 

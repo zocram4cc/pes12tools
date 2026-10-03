@@ -240,6 +240,47 @@ def test_slot_converter_override_round_trip():
           % (SLOT, n), flush=True)
 
 
+def test_slot_pitch_and_sky_are_editable():
+    """Every texture block of the slot's stand, pitch and sky entries is an
+    editable image: painting one writes exactly that entry, with the paint
+    decoded back out of the written override. Covers the entries no packet
+    binds as its diffuse (pitch art, sky) and the converter's white lightmap
+    stand-in (stand #2658)."""
+    import shutil
+    import numpy as np
+    import blender_io
+    import stadium
+    import textures
+    if not SLOT_ROOT or not os.path.isdir(SLOT_ROOT):
+        print('blender: pitch/sky editable: skipped (PES12_TEST_SLOT_ROOT)')
+        return
+    _fresh()
+    col, _n = P.import_slot(bpy.context, corpus.GAME, SLOT, SLOT_ROOT)
+    models = {int(c[P.ENTRY_PROP]) for c in col.children if P.ENTRY_PROP in c}
+    imgs = {int(i[P.TEX_ENTRY_PROP]): i for i in P._collection_images(col)
+            if int(i[P.TEX_ENTRY_PROP]) not in models}
+    roles = stadium.slot_entries({x.number: x for x in stadium.slots(corpus.GAME)}[SLOT])
+    for role in ('stand', 'pitch', 'sky'):
+        for e in roles[role]:
+            assert e in imgs, (role, e, sorted(imgs))
+    root = os.path.join(OUT, 'pitch_root')
+    shutil.rmtree(root, ignore_errors=True)
+    for e in (roles['pitch'][0], roles['sky'][0]):
+        px = blender_io.image_rgba(imgs[e])
+        px[0:8, 0:8] = (255, 0, 255, 255)
+        imgs[e].pixels.foreach_set((np.flipud(px).astype(np.float32) / 255.0).ravel())
+    out = {int(os.path.basename(f)[5:-4]) for f in P.export_slot(col, root)}
+    # the model entries come out too: this root starts empty and their source
+    # bytes are the converter's overrides, which differ from stock
+    assert out == {roles['pitch'][0], roles['sky'][0]} | models, (out, models)
+    for e in (roles['pitch'][0], roles['sky'][0]):
+        c = container.read(open(stadium.override_path(root, e), 'rb').read())
+        _, _, back = textures.decode(c.blocks[int(imgs[e][blender_io.TEX_BLOCK_PROP])].data)
+        assert (np.abs(back[0:8, 0:8].astype(int) - (255, 0, 255, 255)) <= 8).all(), e
+    print('blender: slot %d: %d texture entries editable, pitch + sky edits export'
+          % (SLOT, len(imgs)), flush=True)
+
+
 
 def test_slot_edits_write_their_entries():
     """Move a vertex of the geometry and paint a stand texture: exactly those
@@ -282,6 +323,7 @@ if __name__ == '__main__':
         test_texture_edit_exports()
         test_slot_unedited_no_overrides()
         test_slot_converter_override_round_trip()
+        test_slot_pitch_and_sky_are_editable()
         test_slot_edits_write_their_entries()
     test_pgb2_flags()
     print('BLENDER TESTS PASS', flush=True)
