@@ -20,7 +20,7 @@ tutorial [DLC build](12-dlc-build.md).
 `dt04`/`dt06` overrides start from the stock tables). Everything the tools
 produce from PES2015/PES2017/PES2021 data or from 4cc packs is never
 shipped: it rebuilds from your own installs by a script (each folder's
-README says how)..
+README says how).
 
 ## Build order (from a bare checkout)
 
