@@ -12,7 +12,7 @@ files, and nothing PES- or 4cc-derived ships.
 |---|---|
 | `pes12_import_team.py` | team import: squad, lineup, formation, bodies, kits |
 | `pes15_to_pes12.py` | PES2015 face folder -> custom body |
-| `fmdl_to_pes12.py` | PES21 fmdl -> custom body; skin-weight packing (`skin_pack`) |
+| `fmdl_to_pes12.py` | PES21 fmdl -> custom body; the shared PGB2 writer for both engines (`build()`), skin-weight packing (`skin_pack`) |
 | `pes15export.py`, `pes15crypt.py` | 4cc PES2015 tactical export reader + crypto |
 | `pes17export.py`, `pes17crypt.py` | PES2017 TEXPORT reader + crypto (`--pes17`) |
 | `pes12edit.py`, `pes12crypt.py` | the game's `save/EDIT.bin` (squads, names, stats) |
@@ -33,6 +33,24 @@ External programs: `7z` (the importer unpacks `.7z`/`.zip`/`.rar` packs),
 ImageMagick `magick` (DXT re-encoding of textures that are not already
 DXT), and, only to rebuild the runtime, `i686-w64-mingw32-g++` and
 `vkd3d-compiler`.
+
+## Convert a PES2021 model
+
+```sh
+python3 fmdl_to_pes12.py <body.fmdl> <texture.dds> <out dir>
+```
+
+Writes the same `PGB2` custom body the PES2015 converter does, from one shared
+writer, so the two engines' paths cannot drift: 32-bit indices, one submesh
+per mesh, the keep mask, `dsk_*` helper splits across their joint, seam
+offsets, kit-slot UVs, curled fingers on the stock hand rig, and face parts.
+Models come out of a PES2021 install's `dt*.cpk` archives
+(`python3 cpk.py <cpk> <dest> --filter=<substring>`); the full-figure kit
+models under `Asset/model/character/face/real/<id>/#Win/` cover most of the
+body bones.
+
+`PES21_DATA=<install>` points the cross-engine test at that install; without
+it the test skips.
 
 ## Setup (your PES2012 install)
 
