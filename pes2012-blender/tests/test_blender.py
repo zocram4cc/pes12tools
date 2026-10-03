@@ -199,6 +199,47 @@ def test_slot_unedited_no_overrides():
     print('blender: slot %d: %d entries, %d packets, %d textures; unedited export writes nothing'
           % (SLOT, len(subs), n, len(imgs)), flush=True)
 
+SLOT_ROOT = os.environ.get('PES12_TEST_SLOT_ROOT')  # afs2fs root of a pes12_stadium.py install
+
+
+def test_slot_converter_override_round_trip():
+    """A slot installed by the converter, imported with its override root and
+    exported untouched: every model entry keeps every packet's vertices and
+    indices byte for byte and no packet gains or loses a vertex. The entry
+    bytes themselves may still move (the add-on pads each buffer to 16, the
+    converter lays them back to back), so the packets are the invariant."""
+    import shutil
+    import stadium
+    if not SLOT_ROOT or not os.path.isdir(SLOT_ROOT):
+        print('blender: slot override root: skipped (PES12_TEST_SLOT_ROOT)')
+        return
+    _fresh()
+    col, _n = P.import_slot(bpy.context, corpus.GAME, SLOT, SLOT_ROOT)
+    root = os.path.join(OUT, 'override_root')
+    shutil.rmtree(root, ignore_errors=True)
+    n = 0
+    for p in P.export_slot(col, root):
+        e = int(os.path.basename(p)[5:-4])
+        src = stadium.override_path(SLOT_ROOT, e)
+        if not os.path.exists(src):
+            continue
+        a = container.read(open(src, 'rb').read())
+        b = container.read(open(p, 'rb').read())
+        assert len(a.blocks) == len(b.blocks), (e, len(a.blocks), len(b.blocks))
+        for k, (x, y) in enumerate(zip(a.blocks, b.blocks)):
+            if x.kind != 'ktmdl':
+                continue
+            for i in range(len(model.read(x.data).parsed['packets'])):
+                av, ai, ast = W.packet_mesh(x.data, i)
+                bv, bi, bst = W.packet_mesh(y.data, i)
+                assert len(av) // ast == len(bv) // bst and av == bv and ai == bi, (
+                    e, k, i, 'verts %d vs %d' % (len(av) // ast, len(bv) // bst))
+                n += 1
+    assert n, 'no packet compared'
+    print('blender: slot %d converter override: %d packets keep their vertices and indices'
+          % (SLOT, n), flush=True)
+
+
 
 def test_slot_edits_write_their_entries():
     """Move a vertex of the geometry and paint a stand texture: exactly those
@@ -240,6 +281,7 @@ if __name__ == '__main__':
         test_textures_on_import()
         test_texture_edit_exports()
         test_slot_unedited_no_overrides()
+        test_slot_converter_override_round_trip()
         test_slot_edits_write_their_entries()
     test_pgb2_flags()
     print('BLENDER TESTS PASS', flush=True)

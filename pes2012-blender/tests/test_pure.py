@@ -227,6 +227,27 @@ def test_export_edited():
     print('export: edited packet re-reads with the edit, other packets stock')
 
 
+def test_export_survives_dropped_custom_normals():
+    """Blender drops a custom normal on a few corners of a mesh
+    (normals_split_custom_set, 03-10: slot 30's geometry dt07 #2693 blocks
+    10 and 21 lose two each). A zero corner normal carries no edit, so the
+    packet still exports byte for byte instead of duplicating the vertex."""
+    import model
+    import ktmdl_write as W
+    for name, k, data in _class_blocks():
+        m = model.read(data)
+        rows = []
+        for i, p in enumerate(m.parsed['packets']):
+            corners, tris = _blender_corners(p)
+            for c in corners[:2]:
+                c['nrm'] = (0.0, 0.0, -0.0)      # what Blender leaves behind
+            rows.append(model.export_packet(data, i, corners, tris))
+        out = W.build(data, rows)
+        assert out == data, (name, k, len(out), len(data))
+    print('export: a dropped custom normal is not an edit, blocks stay byte-exact')
+
+
+
 
 def test_export_corpus_byte_exact():
     """EVERY entry of the game: each KTMDL block exported unedited from
@@ -326,6 +347,7 @@ TESTS = [test_corpus_found, test_container_unedited_exact, test_container_block_
          test_model_corpus_parses, test_model_stream_tables_are_record_relative,
          test_skeleton_per_block,
          test_export_unedited_byte_exact, test_export_edited,
+         test_export_survives_dropped_custom_normals,
          test_textures_decode_every_block, test_textures_reencode_each_format, test_textures_edit_lands,
          test_export_corpus_byte_exact]
 

@@ -83,13 +83,12 @@ def _same(corner, view):
     if a is not None and not corner.get('flat'):
         la = sum(x * x for x in a) ** 0.5
         lb = sum(x * x for x in b) ** 0.5
-        if not lb:
-            # stock stadium parts carry zero normals: import sets no custom
-            # normals there, so Blender shows computed ones and there is
-            # nothing to compare against
+        if not lb or not la:
+            # a zero normal carries no information either way: stock stadium
+            # parts have none (import sets no custom normals, Blender shows
+            # computed ones), and Blender drops the custom normal it was
+            # given on a few corners (03-10: slot 30 geometry #2693 b10/b21)
             pass
-        elif not la:
-            return False
         elif sum(x * y for x, y in zip(a, b)) / (la * lb) < NORMAL_DOT_MIN:
             return False
     cw, vw = corner.get('w', {}), view['w']
