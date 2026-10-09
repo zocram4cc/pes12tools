@@ -242,9 +242,14 @@ def game_running():
     if os.name == 'nt':
         out = subprocess.run(['tasklist', '/FI', 'IMAGENAME eq ' + GAME_EXE], capture_output=True, text=True).stdout
         return GAME_EXE in out.lower()
+    # Only a process whose own executable is the game counts: a `wine start
+    # /exec ... pes2012.exe` launcher carries the game's path in its
+    # arguments and can outlive the game (09-10: an orphaned start.exe from
+    # four days earlier blocked every import).
     for p in os.listdir('/proc'):
         try:
-            if p.isdigit() and GAME_EXE.encode() in open('/proc/%s/cmdline' % p, 'rb').read().lower():
+            argv0 = open('/proc/%s/cmdline' % p, 'rb').read().split(b'\0')[0] if p.isdigit() else b''
+            if argv0.replace(b'\\', b'/').lower().endswith(GAME_EXE.encode()):
                 return True
         except OSError:
             continue

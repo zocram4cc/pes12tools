@@ -133,6 +133,28 @@ KEEP_BOOTS = keep_mask('boots')                                  # a figure stop
 # above it stands in PES's boots (Stallman: y 0.07.., real boots id 1; Terry:
 # y -0.17.., boots id 55 = none).
 OWN_FEET_Y = 0.05
+# A head export, whatever the export's own hide-body word says: its parts
+# ride the head (face parts) and whatever is skinned to the body is a neck
+# piece. Measured 09-10 on the installed bodies: the lowest body-skinned
+# vertex of every head export is at 1.35-1.38 m (/an/'s 17 animal heads, the
+# /vm/ glove models); the figures go down to 0.07-0.60 m (Stallman 0.07,
+# /an/'s bear and pitbull -0.05). The 03-10 rule could not tell them apart:
+# it looked at the lowest vertex of face parts and body together.
+NECK_BAND_BOTTOM_M = 1.2
+
+
+def default_keep(body_ys, has_face, whole):
+    """Stock pieces a model keeps when the caller gives none. body_ys:
+    heights of its body-skinned vertices (not face parts, not hand-rig
+    copies); has_face: it has face parts; whole: the export claims a whole
+    figure (it hides PES's body). A head export keeps the stock body and its
+    kit, and only the stock head goes."""
+    if has_face and all(y >= NECK_BAND_BOTTOM_M for y in body_ys):
+        return KEEP_BUT_HEAD
+    if whole:
+        return KEEP_NONE if min(body_ys or [0.0]) < OWN_FEET_Y else KEEP_BOOTS
+    return KEEP_BUT_HEAD
+
 SUB_ALPHATEST, SUB_BLEND, SUB_TWOSIDED, SUB_NOZWRITE, SUB_KIT, SUB_OUTLINE, SUB_FACE = 1, 2, 4, 8, 16, 32, 64
 SUB_SHADELESS, SUB_TOON = 1 << 16, 1 << 17   # drawlogic's own pixel shaders (custom_ps.hlsl)
 # Frame-grid animation (PES2019+ fox3d*_uvstep; tools/uvstep.py, the USTP
@@ -901,19 +923,17 @@ def build(sources, out_dir, keep=None, hide_body=None):
     subs = compact
     # (UVStep entries are collected per emitted sub below, in mesh_subs.)
 
-    # extents in body space. Face-part vertices are head-local, so they are
-    # measured against the head joint; the hand-rig copies are hand-local, so
-    # they are left out entirely - counting their wrist-relative origin would
-    # put a model that stands on the floor below OWN_FEET_Y.
+    # Body-space heights decide the stock pieces kept (default_keep): only
+    # body-skinned vertices count - face parts are head-local and ride the
+    # head, the hand-rig copies are hand-local (their wrist-relative origin
+    # would put a model that stands on the floor below OWN_FEET_Y).
     body_idx = {i for s in subs if not s[3] & (SUB_FACE | SUB_HAND_RIG)
                 for i in idx[s[0]:s[0] + s[1]]}
-    face_idx = {i for s in subs if s[3] & SUB_FACE for i in idx[s[0]:s[0] + s[1]]}
-    ys = [struct.unpack_from('<3f', verts[i])[1] for i in body_idx]
-    ys += [struct.unpack_from('<3f', verts[i])[1] + p12[FOX_TO_PES12[HEAD_BONE]][1] for i in face_idx]
-    ys = ys or [0.0]
+    has_face = any(s[3] & SUB_FACE and s[1] for s in subs)
+    body_ys = [struct.unpack_from('<3f', verts[i])[1] for i in body_idx]
     whole = any(s.get('whole') for s in sources) if hide_body is None else hide_body
     if keep is None:
-        keep = (KEEP_NONE if min(ys) < OWN_FEET_Y else KEEP_BOOTS) if whole else KEEP_BUT_HEAD
+        keep = default_keep(body_ys, has_face, whole)
     if any(s.get('gloves') for s in sources):
         keep &= ~keep_mask('hands', 'gloves')
     os.makedirs(out_dir, exist_ok=True)

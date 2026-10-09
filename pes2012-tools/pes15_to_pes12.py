@@ -1087,14 +1087,15 @@ def convert(folder, kit_dds, out_dir, hide_body=None):
     for f in os.listdir(out_dir):
         if f.startswith('body'):
             os.remove(os.path.join(out_dir, f))
-    # extents in body space: face-part vertices are head-local
+    # body-space heights decide the stock pieces kept (F.default_keep):
+    # face parts are head-local and ride the head, hand-rig copies hand-local
     body_idx = {i for s in subs if not s[3] & (SUB_FACE | SUB_HAND_RIG) for i in idx[s[0]:s[0] + s[1]]}
-    face_idx = {i for s in subs if s[3] & SUB_FACE for i in idx[s[0]:s[0] + s[1]]}
-    ys = [struct.unpack_from('<3f', verts[i])[1] for i in body_idx]
-    ys += [struct.unpack_from('<3f', verts[i])[1] + head_p12[1] for i in face_idx]
-    ys = ys or [0]
+    has_face = any(s[3] & SUB_FACE and s[1] for s in subs)
+    body_ys = [struct.unpack_from('<3f', verts[i])[1] for i in body_idx]
     whole = geometry_whole if hide_body is None else hide_body
-    keep = (KEEP_NONE if min(ys) < OWN_FEET_Y else KEEP_BOOTS) if whole else KEEP_BUT_HEAD
+    keep = F.default_keep(body_ys, has_face, whole)
+    ys = body_ys + [struct.unpack_from('<3f', verts[i])[1] + head_p12[1]
+                    for s in subs if s[3] & SUB_FACE for i in idx[s[0]:s[0] + s[1]]] or [0.0]
     if any(t in GLOVE_TYPES for t in types.values()):
         keep &= ~keep_mask('hands', 'gloves')
     with open(os.path.join(out_dir, 'body.bin'), 'wb') as o:
