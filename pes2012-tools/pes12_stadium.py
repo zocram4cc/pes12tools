@@ -1097,10 +1097,8 @@ ASSETS = SLOT_ASSETS + tuple(SHARED_PARTS)
 
 def _crowd_hidden(crowd):
     """Stock no-crowd layout of a crowd block (see CROWD_BLOCK)."""
-    table = struct.unpack_from("<I", crowd)[0]
-    n = (table - 4) // 4 + 1
-    stubs = [table + CROWD_SECTION_HEADER * (k + 1) for k in range(n - 1)]
-    return struct.pack("<%dI" % n, table, *stubs) + bytes(CROWD_SECTION_HEADER * n)
+    import pes12_crowd as C
+    return C.hide(crowd)
 
 
 def _set_crowd(K, slot, root, on):
@@ -1111,6 +1109,115 @@ def _set_crowd(K, slot, root, on):
                            else _crowd_hidden(blocks[CROWD_BLOCK]))
     write_entry(root, e, tag, join_bin(blocks))
 
+
+def _crowd_block(slot, root=None):
+    """The slot's crowd block as the game loads it (override or stock)."""
+    return split_bin(read_entry(slot.geometry + SLOT_STRIDE, root=root)[1])[CROWD_BLOCK]
+
+
+def _write_crowd(slot, root, crowd, log=print):
+    """Crowd block bytes -> the slot's g+32 entry; structural problems refuse
+    before anything is written. The block always keeps the slot's stock
+    section count, unused ones as empty stubs (as hide writes): a 3-section
+    block (Final PEStination's pack pockets) crashed the match load with
+    the CRT's invalid-parameter abort (09-10, pes2012.exe+c545b); every
+    stock slot has 20."""
+    import pes12_crowd as C
+    sections = C.split(crowd)
+    stock_n = len(C.split(_crowd_block(slot)))
+    if len(sections) > stock_n:
+        raise ValueError("slot %d: %d crowd sections, the game reads %d" % (slot.number, len(sections), stock_n))
+    if len(sections) < stock_n:
+        empty = ([], (0.0, 0.0, 0.0), (0.0, 0.0, 0.0), 0)
+        crowd = C.join(sections + [empty] * (stock_n - len(sections)))
+    problems = C.check(crowd, sections=stock_n)
+    if problems:
+        raise ValueError("slot %d: refusing structurally invalid crowd block: %s" % (slot.number, problems))
+    e = slot.geometry + SLOT_STRIDE
+    tag, body = read_entry(e, root=root)
+    blocks = split_bin(body)
+    blocks[CROWD_BLOCK] = crowd
+    write_entry(root, e, tag, join_bin(blocks))
+    log("slot %d: crowd block written (%d bytes, %s)" % (slot.number, len(crowd), e))
+
+
+def _crowd_template(slot):
+    """One stock row of the slot to carry header/uv for authored rows: the
+    first row of its fullest section (crowd pattern fields are copied, the
+    quad is replaced; see pes12_crowd)."""
+    import pes12_crowd as C
+    sections = C.split(_crowd_block(slot))
+    full = max(sections, key=lambda s: len(s[0]))
+    if not full[0]:
+        raise ValueError("slot %d: no stock crowd rows to template from (show crowd first)" % slot.number)
+    return full[0][0]
+
+def set_crowd_spec(slot, root, spec, log=print):
+    """Authored crowd description (JSON path or dict: {"sections": [[row]],
+    row = {"corners": [P0..P3], "header": [8 ints] optional, "facing": [3]
+    optional, "uv": [8 floats] optional}) -> the slot's crowd block, boxes
+    recomputed. Missing header/facing/uv come from the slot's template row
+    (its fullest section's first)."""
+    import json
+    import pes12_crowd as C
+    if isinstance(spec, str):
+        with open(spec) as f:
+            spec = json.load(f)
+    template = _crowd_template(slot)
+    sections = []
+    for rows in spec["sections"]:
+        recs = []
+        for r in rows:
+            corners = tuple(tuple(c) for c in r["corners"])
+            if "header" in r or "uv" in r or "facing" in r:
+                header = bytes(r["header"]) if "header" in r else template[0]
+                uv = tuple(r["uv"]) if "uv" in r else template[3]
+                facing = tuple(r["facing"]) if "facing" in r else C.facing_for(corners)
+                recs.append((header, facing, corners, uv))
+            else:
+                recs.append(C.row_from_template(template, corners))
+        sections.append(tuple([recs]) + C.bbox(recs))
+    _write_crowd(slot, root, C.join([s + (0,) for s in sections]), log=log)
+
+
+def set_crowd_audi(slot, root, path, log=print):
+    """PES15/17 audiarea.bin (or its stadium folder/dp: */audi/area/stNNN)
+    -> the slot's crowd block: one section per pack patch, boxes
+    recomputed, header/uv from the slot's template row."""
+    import pes12_crowd as C
+    if os.path.isdir(path):
+        inner = os.path.join(path, "data", "audiarea.bin")
+        if not os.path.exists(inner):
+            raise ValueError("%s: no audi/area/stNNN layout (looked for data/audiarea.bin)" % path)
+        path = inner
+    audi = C.read_audiarea(path)
+    if not audi:
+        raise ValueError("%s: no crowd patches found" % path)
+    template = _crowd_template(slot)
+    sections = [tuple([C.audi_to_rows([(box, quads)], template)]) + C.bbox(C.audi_to_rows([(box, quads)], template))
+                for box, quads in audi]
+    _write_crowd(slot, root, C.join([s + (0,) for s in sections]), log=log)
+    log("slot %d: %d pack patches -> %d sections" % (slot.number, len(audi), len(sections)))
+
+def _crowd_command(slot, root, arg):
+    """`crowd` command: off = hide, stock = restore, a spec JSON file, else
+    an audiarea.bin / audi-area folder (told apart by content)."""
+    if arg == "off":
+        return set_asset("crowd", [slot], root, on=False)
+    if arg == "stock":
+        return set_asset("crowd", [slot], root, on=True)
+    if os.path.isdir(arg):
+        if os.path.exists(os.path.join(arg, "data", "audiarea.bin")):
+            return set_crowd_audi(slot, root, arg)
+        return set_crowd_spec(slot, root, arg)
+    try:
+        with open(arg, "rb") as f:
+            head = f.read(4).strip()[:1]
+        if head == b"{":
+            return set_crowd_spec(slot, root, arg)
+    except OSError:
+        pass
+    return set_crowd_audi(slot, root, arg)
 
 def _set_pitch(K, slot, root, on):
     """Stock pitch base packets (per slot) back to stock, or emptied."""
@@ -1740,15 +1847,44 @@ def pick_slots(spec, slots):
     return got
 
 
+def _install_crowd(src, slot, root, arg=None):
+    """Install-time crowd (see --crowd): off hides, stock keeps the host
+    crowd, pack/None takes the source's audiarea.bin pockets when the
+    source ships one (its sibling bg/audi/area/stNNN), FILE is a crowd
+    JSON spec. Default (None): pack pockets if present, else host stock."""
+    if arg == "stock":
+        return
+    if arg is not None and arg != "pack" and os.path.isfile(arg):
+        return set_crowd_spec(slot, root, arg)
+    if arg == "off":
+        return set_asset("crowd", [slot], root, on=False)
+    # <...>/bg/stadium/stNNN -> <...>/bg/audi/area/stNNN/data/audiarea.bin
+    audi = os.path.join(os.path.dirname(os.path.dirname(os.path.normpath(src))),
+                        "audi", "area", os.path.basename(os.path.normpath(src)),
+                        "data", "audiarea.bin")
+    if os.path.exists(audi) and (arg == "pack" or arg is None):
+        return set_crowd_audi(slot, root, audi)
+    if arg == "pack":
+        print("slot %d: source ships no audiarea.bin, host crowd stays" % slot.number)
+
+
 USAGE = """usage:
   pes12_stadium.py list                                    slots (geometry, pitch art, props)
   pes12_stadium.py names                                   stadium name ids and names
-  pes12_stadium.py install <source> <slots> <root> [--textures=<dir>] [--retexture=<material>:<image>,...]
-      <source>: a PES15/17 stadium folder, or <archive.cpk>:<stNNN> (extracted to a temp folder)
+  pes12_stadium.py install <source> <slots> <root> [--textures=<dir>] [--retexture=<material>:<image>,...] [--crowd=<off|stock|pack|FILE>]
+      <source>: a PES15/17 stadium folder, or <archive.cpk>:<stNNN> (extracted to a temp folder);
+      --crowd: pack = the pack's audiarea.bin pockets (default when the source ships one,
+      else the host slot's stock crowd stays), stock = keep the host crowd, off = hide, FILE = a
+      crowd JSON spec (see `crowd spec`); a <cpk>:<stNNN> source finds its audiarea.bin itself
   pes12_stadium.py hide|show <slots> <root> <asset,...>     assets: %s
   pes12_stadium.py pitch <slots> <root> <image|GF stadium dir|stock>
   pes12_stadium.py thumb <ids> <root> <image|stock>
   pes12_stadium.py name <ids> <"NAME"|stock>
+  pes12_stadium.py crowd <slots> <root> <off|stock|spec.json|audiarea.bin|audi-area-dir>
+      replace a slot's crowd: off = hide, stock = restore, spec.json = authored rows
+      ({"sections": [[{"corners": [P0..P3], "header": [8], "uv": [8]}]]}, header/uv
+      default to the slot's template row), audiarea.bin (or its audi/area/stNNN
+      folder) = a PES15/17 pack's crowd pockets
 <slots>: 'all' or comma-separated slot numbers; <ids>: comma-separated name
 ids (`names`); <root>: the afs2fs root. Slot <-> name id is known only for
 Allianz (slot 30 = id 61); find others with tools/afs_readlog.py while the
@@ -1760,7 +1896,7 @@ def main(argv):
     args = [a for a in argv if not a.startswith("--")]
     cmd, rest = (args[0], args[1:]) if args else (None, [])
     need = {"list": 0, "names": 0, "install": 3, "hide": 3, "show": 3,
-            "pitch": 3, "thumb": 3, "name": 2}
+            "pitch": 3, "thumb": 3, "name": 2, "crowd": 3}
     if need.get(cmd) != len(rest):
         sys.exit(USAGE)
     if cmd == "list":
@@ -1778,7 +1914,6 @@ def main(argv):
     if cmd == "thumb":
         return set_thumbnail([int(i) for i in rest[0].split(",")], rest[1], rest[2])
     if cmd in ("hide", "show"):
-        slots, root = pick_slots(rest[0], read_slots()), rest[1]
         assets = rest[2].split(",")
         bad = set(assets) - set(ASSETS)
         if bad:
@@ -1789,6 +1924,14 @@ def main(argv):
     if cmd == "pitch":
         set_pitch_art(pick_slots(rest[0], read_slots()), rest[1], rest[2])
         return
+    if cmd == "crowd":
+        for s in pick_slots(rest[0], read_slots()):
+            _crowd_command(s, rest[1], rest[2])
+        return
+    # --crowd=<off|stock|pack|FILE>: what install leaves in the slot (pack =
+    # the source's audiarea.bin pockets; the default when the source ships
+    # one, else the host slot's stock crowd stays). A <cpk>:<stNNN> source
+    # is extracted below; its audi folder rides along in tmp.
     if ".cpk:" in rest[0].lower():       # <archive.cpk>:<stNNN>: one command from the pack
         import cpk
         archive, st = rest[0].rsplit(":", 1)
@@ -1815,6 +1958,7 @@ def main(argv):
         len(meshes), sum(len(m.tris) for m in meshes), "%d meshes" % len(sky) if sky else "none"))
     for s in pick_slots(rest[1], read_slots()):
         install(meshes, s, rest[2], sky)
+        _install_crowd(rest[0], s, rest[2], opts.get("crowd"))
 
 
 if __name__ == "__main__":

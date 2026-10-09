@@ -365,6 +365,83 @@ def test_textures_edit_lands():
     print('textures: edit lands (%s #%d)' % (img, i))
 
 
+def _crowd_block(slot_number):
+    """The slot's g+32 crowd block (block 2) as the game loads it."""
+    import stadium
+    slots = {s.number: s for s in stadium.slots(corpus.GAME)}
+    entry = slots[slot_number].geometry + stadium.SLOT_STRIDE
+    raw = stadium.read_raw(corpus.GAME, entry)
+    return container.read(raw).blocks[2].data
+
+
+def test_crowd_roundtrip():
+    """Every stock slot: split -> join is byte-identical; the validator is
+    quiet except the known loose boxes (slots 2, 3: rows 25/35 cm out)."""
+    import stadium
+    import crowd
+    allowed = {2: 8, 3: 8}
+    slots = stadium.slots(corpus.GAME)
+    for s in slots:
+        block = _crowd_block(s.number)
+        assert crowd.join(crowd.split(block)) == block, 'slot %d round trip' % s.number
+        rest = [p for p in crowd.check(block) if not p.startswith('section')]
+        assert not rest, (s.number, rest)
+        loose = [p for p in crowd.check(block) if p.startswith('section')]
+        assert len(loose) == allowed.get(s.number, 0), (s.number, loose)
+    print('crowd: split/join byte-identical on all %d slots' % len(slots))
+
+
+def test_crowd_hide_is_slot0():
+    """hide() of any slot's crowd == slot 0's stock crowd block."""
+    import stadium
+    import crowd
+    stock0 = _crowd_block(0)
+    for s in stadium.slots(corpus.GAME):
+        if s.number:
+            assert crowd.hide(_crowd_block(s.number)) == stock0, 'slot %d hide' % s.number
+    print('crowd: hide == slot-0 layout on every slot')
+
+
+def test_crowd_authored_valid():
+    """Authored rows (moved quads, template header/uv) join into a block the
+    validator accepts - with the slot's own section count, empty ones as
+    stubs. A block with fewer sections is refused: the game crashed loading
+    one (09-10)."""
+    import crowd
+    stock = crowd.split(_crowd_block(1))
+    recs, _centre, _extent, off = stock[0]
+    template = recs[0]
+    moved = [crowd.row_from_template(template, [(x + 200.0, y, z) for x, y, z in corners])
+             for _h, _f, corners, _u in recs[:4]]
+    short = crowd.join([(moved,) + crowd.bbox(moved) + (off,)])
+    assert crowd.check(short, sections=len(stock)), 'a 1-section block passed for a %d-section slot' % len(stock)
+    empty = ([], (0.0, 0.0, 0.0), (0.0, 0.0, 0.0), 0)
+    block = crowd.join([(moved,) + crowd.bbox(moved) + (off,)] + [empty] * (len(stock) - 1))
+    assert crowd.check(block, sections=len(stock)) == [], crowd.check(block, sections=len(stock))
+    print('crowd: authored block validates at the slot\'s %d sections; fewer refused' % len(stock))
+
+
+def test_textures_replaced_other_size():
+    """A picture of another size (Blender Image > Replace) encodes into the
+    block at the block's own size, its content intact."""
+    import textures
+    img, i, b = next(t for t in _texture_blocks()
+                     if textures._dds(t[2]) and textures._dds(t[2])[3] == b'DXT1' and textures._dds(t[2])[0] >= 64)
+    w, h, _ = textures.decode(b)
+    big = np.zeros((h * 4, w * 4, 4), np.uint8)
+    big[..., 3] = 255
+    big[:, : w * 2, 0] = 255             # left half red, right half blue
+    big[:, w * 2:, 2] = 255
+    out = textures.encode(b, big)
+    assert len(out) == len(b)
+    w2, h2, back = textures.decode(out)
+    assert (w2, h2) == (w, h)
+    q = w // 4
+    assert back[:, :q, 0].mean() > 200 and back[:, :q, 2].mean() < 50, 'left quarter not red'
+    assert back[:, -q:, 2].mean() > 200 and back[:, -q:, 0].mean() < 50, 'right quarter not blue'
+    print('textures: a 4x picture lands resampled (%s #%d, %dx%d)' % (img, i, w, h))
+
+
 TESTS = [test_corpus_found, test_container_unedited_exact, test_container_block_offsets,
          test_container_every_ktmdl_located, test_container_edited_rewrite,
          test_model_corpus_parses, test_model_stream_tables_are_record_relative,
@@ -373,6 +450,8 @@ TESTS = [test_corpus_found, test_container_unedited_exact, test_container_block_
          test_export_survives_dropped_custom_normals,
          test_textures_raw24_roundtrip,
          test_textures_decode_every_block, test_textures_reencode_each_format, test_textures_edit_lands,
+         test_textures_replaced_other_size,
+         test_crowd_roundtrip, test_crowd_hide_is_slot0, test_crowd_authored_valid,
          test_export_corpus_byte_exact]
 
 if __name__ == '__main__':

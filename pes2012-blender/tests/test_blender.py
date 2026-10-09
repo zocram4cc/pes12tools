@@ -271,8 +271,13 @@ def test_slot_pitch_and_sky_are_editable():
         imgs[e].pixels.foreach_set((np.flipud(px).astype(np.float32) / 255.0).ravel())
     out = {int(os.path.basename(f)[5:-4]) for f in P.export_slot(col, root)}
     # the model entries come out too: this root starts empty and their source
-    # bytes are the converter's overrides, which differ from stock
-    assert out == {roles['pitch'][0], roles['sky'][0]} | models, (out, models)
+    # bytes are the converter's overrides, which differ from stock; so does
+    # the slot's crowd entry (g+32) when the source root overrides it
+    slot = {x.number: x for x in stadium.slots(corpus.GAME)}[SLOT]
+    crowd_entry = slot.geometry + stadium.SLOT_STRIDE
+    crowd_override = os.path.exists(stadium.override_path(SLOT_ROOT, crowd_entry))
+    want = {roles['pitch'][0], roles['sky'][0]} | models | ({crowd_entry} if crowd_override else set())
+    assert out == want, (out, want)
     for e in (roles['pitch'][0], roles['sky'][0]):
         c = container.read(open(stadium.override_path(root, e), 'rb').read())
         _, _, back = textures.decode(c.blocks[int(imgs[e][blender_io.TEX_BLOCK_PROP])].data)

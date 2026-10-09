@@ -287,12 +287,32 @@ def decode(block):
     raise ValueError('WE00 texture %d: kind %d not supported' % (texture_id(block), bpp))
 
 
+def fit(rgba, w, h):
+    """HxWx4 uint8 -> h x w: halved by 2x2 averaging while at least twice
+    the size, then bilinear. A picture swapped into an imported image
+    (Blender Image > Replace) rarely has the block's own size."""
+    img = np.ascontiguousarray(rgba, np.uint8)
+    while img.shape[0] >= 2 * h and img.shape[1] >= 2 * w:
+        img = _downsample(img)
+    sh, sw = img.shape[:2]
+    if (sh, sw) == (h, w):
+        return img
+    ys = np.clip((np.arange(h) + 0.5) * sh / h - 0.5, 0, sh - 1)
+    xs = np.clip((np.arange(w) + 0.5) * sw / w - 0.5, 0, sw - 1)
+    y0, x0 = np.floor(ys).astype(int), np.floor(xs).astype(int)
+    y1, x1 = np.minimum(y0 + 1, sh - 1), np.minimum(x0 + 1, sw - 1)
+    fy, fx = (ys - y0)[:, None, None], (xs - x0)[None, :, None]
+    f = img.astype(np.float32)
+    top = f[y0][:, x0] * (1 - fx) + f[y0][:, x1] * fx
+    bot = f[y1][:, x0] * (1 - fx) + f[y1][:, x1] * fx
+    return np.clip(np.rint(top * (1 - fy) + bot * fy), 0, 255).astype(np.uint8)
+
+
 def encode(block, rgba):
-    """Replace a WE00 block's pixels (HxWx4 uint8, the block's own size)."""
+    """Replace a WE00 block's pixels (HxWx4 uint8; another size is resampled
+    to the block's own, see fit)."""
     w, h, _ = decode(block)
-    rgba = np.ascontiguousarray(rgba, np.uint8)
-    if rgba.shape != (h, w, 4):
-        raise ValueError('texture %d is %dx%d, image is %dx%d' % (texture_id(block), w, h, rgba.shape[1], rgba.shape[0]))
+    rgba = fit(rgba, w, h)
     dds = _dds(block)
     if dds:
         _, _, mips, four = dds

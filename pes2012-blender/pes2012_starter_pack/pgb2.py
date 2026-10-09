@@ -39,7 +39,16 @@ SUB_SHADELESS, SUB_TOON, SUB_HAIR = 1 << 16, 1 << 17, 1 << 18
 # stock hand's 12-slot palette (tools/pes12_rig.py hand_rig), drawn at the
 # stock hand draw
 SUB_HAND_L, SUB_HAND_R, SUB_HAND_RIG = 1 << 19, 1 << 20, 1 << 21
+# frame-grid animation (PES2019+ fox3d*_uvstep; tools/uvstep.py, USTP trailer):
+# bit 22 flags it, 23 picks the lit variant (else constant)
+SUB_UVSTEP, SUB_UVSTEP_LIT = 1 << 22, 1 << 23
 SUB_REF_SHIFT = 8  # bits 8-15: alpha-test ref (pass alpha > ref)
+
+# USTP trailer section (tools/uvstep.py): magic + count + per-sub entries
+USTP_MAGIC = b'USTP'
+USTP_ENTRY_FMT = '<BBBB3fBBBB'
+USTP_ENTRY_BYTES = 20
+USTP_NO_TIMING_TEX = 0xFF   # timing_tex: uniform mode, no timing texture
 
 MAX_INFLUENCES = 4
 MIN_WEIGHT = 1.5 / 255  # one 8-bit step is 4cc authoring noise (tools/fmdl_to_pes12.py)
@@ -141,7 +150,52 @@ def build(keep, verts, idx, subs, trailer=b''):
     return bytes(out) + trailer
 
 
-def pack_body(tris_by_mat, vert_data, mat_flags, mat_tex, mat_face, keep, trailer=b''):
+def pack_ustep(entries):
+    """{sub_index: dict(tile_u, tile_v, tiles_used, use_timing, sec_cycle,
+    sec_u, sec_v, timing_tex, scale)} -> USTP trailer bytes ({} -> b'')."""
+    if not entries:
+        return b''
+    out = bytearray(struct.pack('<4sI', USTP_MAGIC, len(entries)))
+    for sub in sorted(entries):
+        p = entries[sub]
+        out += struct.pack('<I', sub) + struct.pack(
+            USTP_ENTRY_FMT, p['tile_u'], p['tile_v'], p['tiles_used'],
+            1 if p['use_timing'] else 0, p['sec_cycle'], p['sec_u'],
+            p['sec_v'], p['timing_tex'], 1 if p['scale'] else 0, 0, 0)
+    return bytes(out)
+
+
+def parse_ustep(trailer):
+    """Raw trailer bytes -> {sub_index: params} ({} when no USTP section;
+    HRIG-agnostic: the section scans by magic)."""
+    off = (trailer or b'').find(USTP_MAGIC)
+    if off < 0:
+        return {}
+    (count,) = struct.unpack_from('<I', trailer, off + 4)
+    out = {}
+    for k in range(count):
+        base = off + 8 + k * (4 + USTP_ENTRY_BYTES)
+        (sub,) = struct.unpack_from('<I', trailer, base)
+        tu, tv, used, mode, cyc, su, sv, ttex, sc, _r1, _r2 = struct.unpack_from(
+            USTP_ENTRY_FMT, trailer, base + 4)
+        out[sub] = dict(tile_u=tu, tile_v=tv, tiles_used=used,
+                        use_timing=bool(mode), sec_cycle=cyc, sec_u=su,
+                        sec_v=sv, timing_tex=ttex, scale=bool(sc))
+    return out
+
+
+def strip_ustep(trailer):
+    """Raw trailer bytes with any USTP section removed (HRIG kept)."""
+    off = (trailer or b'').find(USTP_MAGIC)
+    if off < 0:
+        return trailer or b''
+    (count,) = struct.unpack_from('<I', trailer, off + 4)
+    end = off + 8 + count * (4 + USTP_ENTRY_BYTES)
+    return (trailer or b'')[:off] + (trailer or b'')[end:]
+
+
+def pack_body(tris_by_mat, vert_data, mat_flags, mat_tex, mat_face, keep, trailer=b'',
+              mat_ustep=None):
     """Pure assembly: per-vert data + triangle soup -> PGB2 bytes.
     Blender's export_body is a thin adapter reading mesh state into these
     plain dicts; tests/ drives this directly against p272101.
@@ -155,11 +209,13 @@ def pack_body(tris_by_mat, vert_data, mat_flags, mat_tex, mat_face, keep, traile
     head-local (minus HEAD_POS) and weights on the face palette;
     SUB_HAND_RIG submeshes (by their flags): hand-local positions, weights on
     the hand palette.
+    mat_ustep: {material_index: uvstep params} (parse_ustep dicts): submeshes
+    with SUB_UVSTEP get a USTP trailer entry (their own index, post-sort).
     """
     order = sorted(tris_by_mat,
                    key=lambda mi: bool(mat_flags.get(mi, 0) & SUB_BLEND))
-    verts, idx, subs = [], [], []
-    for mi in order:
+    verts, idx, subs, ustep = [], [], [], {}
+    for si, mi in enumerate(order):
         flags = mat_flags.get(mi, 0)
         face = mat_face.get(mi, bool(flags & SUB_FACE))
         first = len(idx)
@@ -179,7 +235,9 @@ def pack_body(tris_by_mat, vert_data, mat_flags, mat_tex, mat_face, keep, traile
                 idx.append(len(verts) - 1)
         subs.append(dict(first=first, count=len(idx) - first,
                          tex=mat_tex.get(mi, 0), flags=flags))
-    return build(keep, verts, idx, subs, trailer)
+        if mat_ustep and mat_ustep.get(mi) and flags & SUB_UVSTEP:
+            ustep[si] = mat_ustep[mi]
+    return build(keep, verts, idx, subs, trailer + pack_ustep(ustep))
 
 
 def round_trip(data):

@@ -18,8 +18,8 @@ files, and nothing PES- or 4cc-derived ships.
 | `pes12edit.py`, `pes12crypt.py` | the game's `save/EDIT.bin` (squads, names, stats) |
 | `pes15_kits.py` | kit textures -> PES2012 kitserver kits + the pack's own PES14+ sheet |
 | `pes12_rig.py` | **extract rig tables from your game** (run first) |
-| `pes12_ball.py` | ball mesh + texture -> dt0b ball BIN |
-| `pes12_stadium.py` | PES15/PES21 stadium -> dt07/dt08 overrides of one slot |
+| `pes12_ball.py` | ball mesh + texture -> dt0b ball BIN, its menu name and its menu preview |
+| `pes12_stadium.py` (+ `pes12_crowd.py`: crowd decode/build/validate, `audiarea.bin` import) | PES15/PES21 stadium -> dt07/dt08 overrides of one slot |
 | `ktmdl_write.py` | KTMDL geometry replacer (balls, stadiums) |
 | `pes12_4cc_dlc.py` (+ `pes12db`, `pes12emblem`, `pes12strings`, `cpk`, `afs`, `ktmdl`) | 4cc DLC builder |
 | `mark_face.py` | stamp the custom-body marker (player id, u24) into a face.bin |
@@ -44,10 +44,22 @@ Writes the same `PGB2` custom body the PES2015 converter does, from one shared
 writer, so the two engines' paths cannot drift: 32-bit indices, one submesh
 per mesh, the keep mask, `dsk_*` helper splits across their joint, seam
 offsets, kit-slot UVs, curled fingers on the stock hand rig, and face parts.
+`fox3dfw_constant_srgb_ndr_uvstep` / `fox3ddf_blin_uvstep` materials map to
+flag bits 22/23 with their params (`Tile_Count_U/V`, `Tiles_Used`,
+`Seconds_Per_Animation_Cycle`, `Seconds_Per_Timing_U/V_Cycle`,
+`Scale_UVs_To_Tiles`), the `Timing_Tex_LIN` role and the second UV channel
+in a `USTP` trailer section; drawlogic plays them in the colour pass
+(base texture on s0, timing texture on s2). Frame grids and timing strips
+are authored with `uvstep.py`:
+
+```sh
+python3 uvstep.py grid <out.png> <frame...> [--tiles-u N] [--tiles-v N]
+python3 uvstep.py timing <out.png> <frame:seconds,...> [--width N] [--height N]
+python3 test_uvstep.py               # trailer round trip + frame math
+python3 render_uvstep.py <body dir> <out.png> [t0,t1,...]   # offline check
+```
+
 Models come out of a PES2021 install's `dt*.cpk` archives
-(`python3 cpk.py <cpk> <dest> --filter=<substring>`); the full-figure kit
-models under `Asset/model/character/face/real/<id>/#Win/` cover most of the
-body bones.
 
 `PES21_DATA=<install>` points the cross-engine test at that install; without
 it the test skips.
@@ -119,7 +131,7 @@ match. Needs the `lod.ref.*` pins below.
 ## Balls, stadiums, adboards
 
 ```sh
-python3 pes12_ball.py ...      # see its docstring
+python3 pes12_ball.py install ball.model 11 <4cc-dlc root> "--name=My Ball" --texture=ball_c.dds   # BIN + balls.txt + menu preview
 python3 pes12_stadium.py ...   # see its docstring; install takes a stadium folder or <pack.cpk>:<stNNN>
 python3 pes12_adboards.py <game> ad1.png [ad2.png ...]   # pitch-side ads; --off = stock
 ```

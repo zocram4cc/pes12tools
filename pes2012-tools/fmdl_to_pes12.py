@@ -109,12 +109,248 @@ def main_bone(name, fmdl_bind):
     return pes
 
 
+# ---- the PGB2 pipeline, shared with tools/pes15_to_pes12.py ----
+#
+# Both engines' models go through this one writer; only the reader differs
+# (FmdlFile here, ModelFile + face.xml there). What follows is about the
+# geometry, the palette and the submesh table, none of which knows which
+# container the vertices came out of.
+BODY2_MAGIC = 0x32424750        # 'PGB2'
+
+# The stock pieces a custom model can keep drawn: drawlogic PIECE_NAMES, same
+# order (the kit run's part classes, then the skin draw and the bare hands).
+PIECES = ('shorts', 'shirt', 'sleeves', 'socks', 'neck', 'gloves', 'head', 'boots', 'other', 'skin', 'hands')
+
+
+def keep_mask(*names):
+    return sum(1 << PIECES.index(n) for n in names)
+
+
+KEEP_NONE = 0                                                    # a whole figure
+KEEP_BUT_HEAD = keep_mask(*(n for n in PIECES if n != 'head'))   # a face-slot player
+KEEP_BOOTS = keep_mask('boots')                                  # a figure stopping at the ankle
+# A hidden-body model reaching the floor brings its own feet; one stopping
+# above it stands in PES's boots (Stallman: y 0.07.., real boots id 1; Terry:
+# y -0.17.., boots id 55 = none).
+OWN_FEET_Y = 0.05
+SUB_ALPHATEST, SUB_BLEND, SUB_TWOSIDED, SUB_NOZWRITE, SUB_KIT, SUB_OUTLINE, SUB_FACE = 1, 2, 4, 8, 16, 32, 64
+SUB_SHADELESS, SUB_TOON = 1 << 16, 1 << 17   # drawlogic's own pixel shaders (custom_ps.hlsl)
+# Frame-grid animation (PES2019+ fox3d*_uvstep; tools/uvstep.py, the USTP
+# trailer): the base texture holds the frames left-to-right, top-to-bottom,
+# a timing texture's R picks the frame (alpha 0 draws nothing). Bits 22/23
+# were free (the alpha ref is bits 8-15, shaders/hands are 16-21).
+SUB_UVSTEP, SUB_UVSTEP_LIT = 1 << 22, 1 << 23   # +lit variant (toon lighting); else constant
+SUB_REF_SHIFT = 8
+# PES material shaders drawn unlit / cel-shaded instead of with PES2012's lit
+# kit shader (739 Shadeless, 177 Constant, 382 Pony materials in the packs).
+SHADELESS_SHADERS = ('Shadeless', 'Constant')
+TOON_SHADERS = ('Pony',)
+# toon outline shells (inverted hulls) by material name: drawlogic pushes them
+# back in depth so they only show past the silhouette
+OUTLINE_MATERIAL = re.compile(r'outline', re.I)
+# PES15's Hair shader does not take opacity from the diffuse alpha (hair_col
+# alpha: median 0, 90th percentile 39 on DEVELOPERS, 27-09): drawn with its
+# alphablend state the hair vanished. Drawn opaque and two-sided instead.
+OPAQUE_SHADERS = ('Hair',)
+# ... but its soft strand edges exist (hair_col partial alpha 11-38 % on
+# Stallman, Rossmann, No Time For Love): drawlogic draws a SUB_HAIR sub opaque
+# and adds a blended fringe pass from its alpha (30-09: matte hair).
+SUB_HAIR = 1 << 18
+# A one-hand part: SUB_HAND_<side> on its rigid body copy (drawn unless its
+# rigged copy was), plus SUB_HAND_RIG on the hand-local copy drawn at the stock
+# hand draw on the stock hand's palette (HAND_RIG_BONE, drawlogic SUB_HAND_*).
+SUB_HAND_L, SUB_HAND_R, SUB_HAND_RIG = 1 << 19, 1 << 20, 1 << 21
+SUB_HAND_SIDE = {'l': SUB_HAND_L, 'r': SUB_HAND_R}
+HEAD_BONE = 'sk_head'
+# A Hair texture whose alpha is mostly empty is not an opacity map (DEVELOPERS'
+# hair_col: 87 % zero, drawn by alpha the hair vanished, 27-09); one with this
+# share of solid texels is (Stallman 55 %, No Time For Love 56 %).
+HAIR_MIN_SOLID = 0.25
+HAIR_SOLID_ALPHA = 250
+SHADER_KEY = '_shader'              # parse_mtl stores the material's shader among its states
+
+
+def hair_has_opacity(tex):
+    """True when a hair texture's alpha channel is a real opacity map."""
+    try:
+        import numpy as np
+        from PIL import Image
+        a = np.asarray(Image.open(tex).convert('RGBA'))[..., 3]
+    except Exception:
+        return False
+    return (a >= HAIR_SOLID_ALPHA).mean() >= HAIR_MIN_SOLID
+
+
+def sub_flags(states):
+    """PES15 material states -> drawlogic submesh flags."""
+    shader = states.get(SHADER_KEY)
+    f = SUB_SHADELESS if shader in SHADELESS_SHADERS else SUB_TOON if shader in TOON_SHADERS else 0
+    if shader in OPAQUE_SHADERS:
+        return SUB_TWOSIDED | SUB_HAIR
+    if states.get('alphatest') == '1':
+        f |= SUB_ALPHATEST | (int(states.get('alpharef') or 0) << SUB_REF_SHIFT)
+    if states.get('alphablend') == '1':
+        f |= SUB_BLEND
+    if states.get('twosided') in ('1', '2'):
+        f |= SUB_TWOSIDED
+    if states.get('zwrite') == '0':
+        f |= SUB_NOZWRITE
+    return f
+
+
+
+# PES's deform helpers (dsk_*) turn part of the way between the two bones of
+# a joint; PES2012's skeleton has no such bones. Glued onto one neighbour
+# (main_bone) a knee helper swings wholly with the shin and the knee pinches
+# when the leg bends (/u/, 29-09 replay), skirt hems shatter. Split its weight
+# between the joint's two bones instead: a vertex weighted half to each follows
+# the joint at about half its angle, as a half-rotation helper does.
+# Provisional: PES's per-helper ratios are not read, 0.5 is the half-angle
+# convention. dsk_forearm_t is not a joint helper: it carries the hand's roll
+# along the forearm, and split into sk_hand it bent half the forearm with every
+# wrist flex (cuffs pulled off the hands, Kurisu 30-09); it stays on the
+# forearm (main_bone).
+HELPER_SHARE = 0.5
+HELPER_JOINTS = (   # helper pattern -> (bone above, bone below); \1 = side
+    (re.compile(r'dsk_knee_([lr])$'), ('sk_thigh_\\1', 'sk_leg_\\1')),
+    (re.compile(r'dsk_elbow_([lr])$'), ('sk_upperarm_\\1', 'sk_forearm_\\1')),
+    (re.compile(r'dsk_wrist_([lr])$'), ('sk_forearm_\\1', 'sk_hand_\\1')),
+    (re.compile(r'dsk_hem_([lr])$'), ('dsk_hip', 'sk_thigh_\\1')),
+)
+
+
+def helper_split(name):
+    """Deform helper -> [(bone, share), ...] across its joint, else None."""
+    for pat, (above, below) in HELPER_JOINTS:
+        m = pat.match(name)
+        if m:
+            return [(m.expand(above), 1.0 - HELPER_SHARE), (m.expand(below), HELPER_SHARE)]
+    return None
+
+
+# PES2012's in-match body has one bone per hand (its fingers live on the
+# separate stock hand rig, HAND_RIG_BONE in pes15_to_pes12); its own hands are
+# modelled curled. A 4cc hand is authored flat, so it is bent into PES's
+# relaxed hand: baked onto the hand bone for the rigid body copy, and as the
+# bind of the hand-rig copy - the flexion of PES's normal.gani (GameplayFootball
+# AGENTS.md: mcp 15, pip 32, dip 20 degrees). The thumb is left as authored.
+FINGER_CURL_DEG = {'mcp': 15.0, 'pip': 32.0, 'dip': 20.0}
+FINGER_CHAIN = ('dip', 'pip', 'mcp')    # distal first, each about its own joint
+# the curl's bone pattern. slot_key's FINGER_BONE above only asks "is this a
+# finger bone of this hand", which this answers too but less precisely.
+FINGER_JOINT_BONE = re.compile(r'skh_(index|middle|ring|pinky)_(mcp|pip|dip)_([lr])$')
+
+
+def _rot_axis(v, axis, deg):
+    """Rodrigues: v rotated deg about the unit axis."""
+    c, s = math.cos(math.radians(deg)), math.sin(math.radians(deg))
+    dot = sum(a * b for a, b in zip(axis, v))
+    cr = (axis[1] * v[2] - axis[2] * v[1], axis[2] * v[0] - axis[0] * v[2], axis[0] * v[1] - axis[1] * v[0])
+    return tuple(v[k] * c + cr[k] * s + axis[k] * dot * (1 - c) for k in range(3))
+
+
+def curl_fingers(p, n, raw, joints):
+    """(p, n) in 4cc space with each finger influence bent about its joints.
+    Flexion axis = the anim-pose Z (fingers +-X, back of hand +Y after
+    retarget.PES_ALIGN) taken back into the render pose; the left hand bends
+    by -angle about it, the right by +angle, so both close palm-down."""
+    tw = sum(w for _, w in raw)
+    if not tw or not any(FINGER_JOINT_BONE.match(name) for name, _ in raw):
+        return p, n
+    op, on = [0.0] * 3, [0.0] * 3
+    for name, w in raw:
+        q, qn = p, n
+        m = FINGER_JOINT_BONE.match(name)
+        if m:
+            finger, joint_name, side = m.groups()
+            hq = retarget.PES_ALIGN.get('sk_hand_' + side, (0.0, 0.0, 0.0, 1.0))
+            axis = retarget._q_rot((-hq[0], -hq[1], -hq[2], hq[3]), (0.0, 0.0, 1.0))
+            sign = -1.0 if side == 'l' else 1.0
+            for j in FINGER_CHAIN[FINGER_CHAIN.index(joint_name):]:
+                jp = joints.get('skh_%s_%s_%s' % (finger, j, side))
+                if jp is None:
+                    continue
+                d = _rot_axis(tuple(a - b for a, b in zip(q, jp)), axis, sign * FINGER_CURL_DEG[j])
+                q = tuple(a + b for a, b in zip(jp, d))
+                qn = _rot_axis(qn, axis, sign * FINGER_CURL_DEG[j])
+        for k in range(3):
+            op[k] += w / tw * q[k]
+            on[k] += w / tw * qn[k]
+    return tuple(op), tuple(on)
+
+
+# Joint seams. Each bone carries its geometry rigidly from PES's render bind
+# onto PES2012's bone (PES_ALIGN rotation about its own head), but the two
+# skeletons' proportions differ, so the joint a parent's piece reaches is
+# not where PES2012 puts the child: chest->shoulder 10 cm, shoulder->upper
+# arm 8, knee 7, hip 6.5, wrist 5, neck 4 (30-09). Every limb then tore or
+# creased at its joints. The parent's piece is warped instead: a vertex moves
+# by each child joint's error, scaled by how far along that child's segment
+# it sits (0 at the parent's own head, 1 at the joint) and shared between
+# children by inverse distance, so the piece meets every child exactly and
+# is untouched at its own head. Only toward children the model has geometry
+# on: with no child piece there is no seam, and the clamped warp bends flat
+# faces (XXX20 - Handcrafting: a block character all on sk_belly, whose face
+# decal the belly->chest warp tilted 2.6 cm into the head, 30-09).
+SEAM_EPS_M2 = 1e-4     # keeps the inverse-distance share finite at a joint (1 cm squared)
+
+
+def _place(bone, p, p12):
+    a = retarget.PES_RENDER_BIND[bone][0]
+    q = retarget.PES_ALIGN.get(bone, (0.0, 0.0, 0.0, 1.0))
+    r = retarget._q_rot(q, tuple(pi - ai for pi, ai in zip(p, a)))
+    t = p12[FOX_TO_PES12[bone]]
+    return [t[k] + r[k] for k in range(3)]
+
+
+def seam_table(p12, used):
+    parent = {b: retarget.PES_RENDER_BIND[b][1] for b in FOX_TO_PES12 if b in retarget.PES_RENDER_BIND}
+    out = {}
+    for bone in parent:
+        head = retarget.PES_RENDER_BIND[bone][0]
+        kids = []
+        for child, par in parent.items():
+            if par != bone or child not in FOX_TO_PES12 or child not in used:
+                continue
+            j = retarget.PES_RENDER_BIND[child][0]
+            placed = _place(bone, j, p12)
+            err = [a - b for a, b in zip(p12[FOX_TO_PES12[child]], placed)]
+            seg = [a - b for a, b in zip(j, head)]
+            ln2 = sum(c * c for c in seg)
+            if ln2 > 0 and any(abs(c) > 0 for c in err):
+                kids.append((j, seg, ln2, err))
+        if kids:
+            out[bone] = (head, kids)
+    return out
+
+
+def seam_offset(bone, p, seams):
+    """PES2012-space displacement of source point p carried by `bone`."""
+    got = seams.get(bone)
+    if got is None:
+        return (0.0, 0.0, 0.0)
+    head, kids = got
+    d = [pi - hi for pi, hi in zip(p, head)]
+    acc, wsum = [0.0, 0.0, 0.0], 0.0
+    for j, seg, ln2, err in kids:
+        t = min(1.0, max(0.0, sum(a * b for a, b in zip(d, seg)) / ln2))
+        dist2 = sum((pi - ji) ** 2 for pi, ji in zip(p, j)) + SEAM_EPS_M2
+        w = 1.0 / dist2
+        for k in range(3):
+            acc[k] += w * t * err[k]
+        wsum += w
+    return tuple(c / wsum for c in acc)
+
+
 TEX_MAGIC = 0x31544750      # 'PGT1'
 
 
 def write_tex(src, dst):
+    """-> PGT1 (u32 magic, w, h, mips, then BGRA8 mips largest first).
+    src None: the grey stand-in for a material whose texture the pack does not
+    ship - an engine texture, a source-image .tga."""
     from PIL import Image
-    im = Image.open(src).convert('RGBA')
+    im = Image.open(src).convert('RGBA') if src else Image.new('RGBA', (4, 4), (128, 128, 128, 255))
     mips = []
     w, h = im.size
     while True:
@@ -128,81 +364,749 @@ def write_tex(src, dst):
         for m in mips:
             o.write(m)
 
+# ---- the shared writer ----
+#
+# A source model is everything the writer needs and nothing about where it came
+# from: its bone bind, and its meshes with their material, texture, submesh
+# flags, per-vertex (position, normal, tangent, UVs, [(bone name, weight)])
+# and triangles. fmdl_to_pes12 builds them from FmdlFile, pes15_to_pes12 from
+# ModelFile + face.xml; both hand the list to build() below.
+#
+#   'bind'    {bone name: render-bind joint}
+#   'wind'    triangle vertex order (0,1,2) or (0,2,1) - see WINDING below
+#   'whole'   the model replaces the whole body (else it is a face-slot player)
+#   'gloves'  the model brings its own hands
+#   'head_world'  head-local -> render-pose world, for head pieces authored
+#                 in the head bone's own space (None when the model has none)
+#   mesh 'tex'      the texture source (a path, None for a grey stand-in)
+#   mesh 'kit'      paint the kit sheet the player is wearing
+#   mesh 'flags'    drawlogic SUB_* bits from the material
+#
+# Winding: PES15 and PES21 store the same geometry with opposite triangle
+# order, so each reader passes its own. The target is the same either way -
+# the order drawlogic culls for - so neither reader may assume the other's.
 
-def convert(fmdl_path, dds_path, out_dir):
+
+
+# ---- the hand rig and the face part ----
+#
+# A 4cc hand on its finger rig (skh_<finger>_<mata|mcp|pip|dip>_<side>) is
+# also drawn on the stock hand's own 12-bone rig (pes12_rig.hand_rig,
+# dt0d #589), so its fingers follow the game's hand animation
+# (SUB_HAND_RIG); the body keeps a rigid copy on the hand bone for when
+# no stock hand is drawn (far LODs). Same for the face: an skf_*-weighted
+# part is drawn a second time on the stock face palette at the game's face
+# draw, so the jaw, lips, eyelids and brows animate.
+
+# A 4cc hand on PES15's finger rig (skh_<finger>_<mata|mcp|pip|dip>_<side>)
+# is also drawn on the stock hand's own 12-bone rig (pes12_rig.hand_rig,
+# dt0d #589), so its fingers follow the game's hand animation
+# (SUB_HAND_RIG); the body keeps a rigid copy on the hand bone for when no
+# stock hand is drawn (far LODs). PES15 bone (side stripped) -> stock rig
+# bone: the metacarpals - the thumb's too - ride the wrist root, so the
+# vertices it shares with the wrist (dsk_wrist / dsk_forearm + metacarpal)
+# move alike in both copies; then the thumb 6 -> 11, each finger's proximal
+# phalanx its root (index 2, middle 3, ring 4, pinky 5, thumb side first: the
+# stock right hand's roots sit at z +0.027, 0, -0.018, -0.039) and its middle
+# and distal phalanges the second segment (7-10).
+HAND_RIG_BONE = {'sk_hand': 0, 'skh_index_mata': 0, 'skh_middle_mata': 0, 'skh_ring_mata': 0, 'skh_pinky_mata': 0,
+                 'skh_thumb_mata': 0, 'skh_thumb_mcp': 6, 'skh_thumb_pip': 11, 'skh_thumb_dip': 11,
+                 'skh_index_mcp': 2, 'skh_index_pip': 7, 'skh_index_dip': 7,
+                 'skh_middle_mcp': 3, 'skh_middle_pip': 8, 'skh_middle_dip': 8,
+                 'skh_ring_mcp': 4, 'skh_ring_pip': 9, 'skh_ring_dip': 9,
+                 'skh_pinky_mcp': 5, 'skh_pinky_pip': 10, 'skh_pinky_dip': 10}
+# the PES15 joint at each stock rig bone's base: drawlogic turns the bone
+# about it (the model's own joint, not the stock one - the stock palm is
+# cupped, Green Is My Pepper's flat: ring and pinky joints 2-4 cm apart)
+HAND_RIG_JOINT = {0: 'sk_hand', 1: 'skh_thumb_mata', 6: 'skh_thumb_mcp', 11: 'skh_thumb_pip',
+                  2: 'skh_index_mcp', 7: 'skh_index_pip', 3: 'skh_middle_mcp', 8: 'skh_middle_pip',
+                  4: 'skh_ring_mcp', 9: 'skh_ring_pip', 5: 'skh_pinky_mcp', 10: 'skh_pinky_pip'}
+HAND_RIG_PARENT = {'pip': 'mcp', 'dip': 'pip'}   # a finger joint rides its parent bone through the curl
+# body.bin trailer after the indices: 'HRIG', then per side (l, r) the stock
+# palette (12 u8: slot -> rig bone), the rig parents (12 i8) and the model's
+# joints in hand-local space (12 x 3 f32, by rig bone; zeros: side absent)
+HRIG_MAGIC = b'HRIG'
+
+
+def hand_side(raw):
+    """'l' / 'r' when every influence is one hand's (HAND_RIG_BONE), else None."""
+    sides = {name[-1] for name, w in raw if w > 0 and name[-2:] in ('_l', '_r') and name[:-2] in HAND_RIG_BONE}
+    if len(sides) != 1 or any(w > 0 and name[:-2] not in HAND_RIG_BONE for name, w in raw):
+        return None
+    return sides.pop()
+
+
+def hand_joints(bind, side, to_body, wrist):
+    """This model's 12 rig-bone joints in hand-local space (body bind minus the
+    wrist: the hand bone binds unrotated), curled with the fingers
+    (curl_fingers) and placed as the rigid copy places them (to_body), or None
+    without a full finger rig."""
+    names = {b: '%s_%s' % (n, side) for b, n in HAND_RIG_JOINT.items()}
+    if any(n not in bind for n in names.values()):
+        return None
+    tb = {k: tuple(v) for k, v in bind.items()}
+
+    def curled(name):
+        finger, _, joint_name = name[:-2].rpartition('_')
+        if joint_name not in HAND_RIG_PARENT:
+            return tb[name]
+        parent = '%s_%s_%s' % (finger, HAND_RIG_PARENT[joint_name], side)
+        return curl_fingers(tb[name], (0.0, 1.0, 0.0), [(parent, 1.0)], tb)[0]
+    return [tuple(a - w for a, w in zip(to_body(curled(names[b])), wrist)) for b in range(len(HAND_RIG_JOINT))]
+
+
+def pack_hand_vertex(pos, raw, palette, wrist, rest):
+    """The hand-local copy of a one-hand vertex: its rigid copy's position
+    minus the wrist (rest = that copy's normal/binormal/tangent/uv tail, the
+    frame being the same), weights on the stock hand palette."""
+    w = {}
+    for name, x in raw:
+        if x > 0:
+            b = HAND_RIG_BONE[name[:-2]]
+            w[b] = w.get(b, 0.0) + x
+    top = sorted(w.items(), key=lambda kv: -kv[1])[:MAX_INFLUENCES]
+    tw = sum(x for _, x in top) or 1.0
+    ws, slots = skin_pack([(palette.index(b), x / tw) for b, x in top])
+    return struct.pack('<3f3f4B', *[a - b for a, b in zip(pos, wrist)], *ws[:3], *slots) + rest
+
+
+def hrig_trailer(hand_rig, joints):
+    """HRIG_MAGIC trailer for the sides with a rig copy (joints: side -> 12 joints)."""
+    out = HRIG_MAGIC
+    for side in ('l', 'r'):
+        rig = hand_rig[side]
+        out += bytes(rig['palette']) + struct.pack('<12b', *rig['parents'])
+        out += struct.pack('<36f', *[c for j in joints.get(side, [(0.0, 0.0, 0.0)] * 12) for c in j])
+    return out
+
+
+# Face part. PES2012's face rig (pes12_rig.face_rig): joints in head-local
+# space, bone 0 = skull (moves exactly with the body head bone), 25-28 the
+# eye/neck controllers (left alone: our eyes are not split per eyeball).
+FACE_SKULL_BONE = 0
+FACE_CONTROLLER_BONES = (25, 26, 27, 28)
+FACE_BONE = re.compile(r'skf_')
+FACE_SIDE_EPS_M = 0.005     # |x| below this is the centre line
+FACE_MATCH_MAX_M = 0.03     # a PES15 face bone farther than this from every PES2012 one rides the skull
+# PES15 face bone -> PES2012 face rig bone, by role. Nearest-joint alone sent
+# upper and lower lip (and both eyelids) to one bone, so mouths could not open
+# and lids blinked as one, and missed the brows/cheeks entirely (PES2012 pivots
+# them deep in the head): janky faces on /sci/ Feynman and every PES-template
+# face (30-09). Roles read off the rig's joint tree (dt0c #132, head-local,
+# pes12_rig.face_rig; every stock face shares it): 1 jaw pivot -> 2 lower
+# mouth -> 3/4 lower lip L/R; 7 upper mouth -> 8/9 upper lip L/R; 22/23 mouth
+# corners L/R; 12/13 upper eyelids L/R, 14/15 lower; 16/17 inner brows L/R,
+# 18/19 outer; 10/11 cheeks L/R; 20/21 nostrils L/R. L = +x (PES15 '_l').
+JAW_BONE = 'skf_jaw'
+THROAT_BONES = ('sk_neck', 'dsk_scm', 'sk_chest')
+JAW_THROAT_NECK_SHARE = 0.5   # provisional: the chin underside half follows the neck
+FACE_ROLES = {
+    'skf_jaw': 1, 'skf_doublechin': 2, 'skf_lip_b_c': 2, 'skf_lip_t_c': 7, 'skf_lip_volume': 7,
+    'skf_lip_b_l': 3, 'skf_lip_b_r': 4, 'skf_lip_t_l': 8, 'skf_lip_t_r': 9,
+    'skf_lip_s_l': 22, 'skf_lip_s_r': 23,
+    'skf_eyelid_t_l': 12, 'skf_eyelid_t_r': 13, 'skf_eyelid_b_l': 14, 'skf_eyelid_b_r': 15,
+    'skf_orbicularisoculi_b_l': 14, 'skf_orbicularisoculi_b_r': 15,
+    'skf_brow_i_l': 16, 'skf_brow_i_r': 17, 'skf_brow_o_l': 18, 'skf_brow_o_r': 19,
+    'skf_cheek_l': 10, 'skf_cheek_r': 11, 'skf_nosewing_l': 20, 'skf_nosewing_r': 21,
+}
+
+
+def face_slots(bind, rig):
+    """{PES15 skf_* bone: PES2012 face palette slot}: by role (FACE_ROLES),
+    else the nearest joint on the same side of the face; head-local = render bind minus sk_head (the head's
+    PES_ALIGN is identity)."""
+    head = bind.get(HEAD_BONE)
+    if head is None:
+        return {}
+    pal = rig['palette']
+    cands = [(pal.index(b), rig['joints'][b]) for b in pal if b not in FACE_CONTROLLER_BONES and b != FACE_SKULL_BONE]
+    side = lambda x: 0 if abs(x) < FACE_SIDE_EPS_M else (1 if x > 0 else -1)
+    out = {}
+    for name, j in bind.items():
+        if not FACE_BONE.match(name):
+            continue
+        loc = [a - b for a, b in zip(j, head)]
+        best = min(((sum((a - c) ** 2 for a, c in zip(loc, cj)), sl) for sl, cj in cands if side(cj[0]) == side(loc[0])),
+                   default=(1e9, None))
+        out[name] = best[1] if best[0] <= FACE_MATCH_MAX_M ** 2 else pal.index(FACE_SKULL_BONE)
+        if FACE_ROLES.get(name) in pal:
+            out[name] = pal.index(FACE_ROLES[name])
+    return out
+
+
+# Face weights come from PES2012's own face, not from mapping bones. PES
+# pivots its lip/jaw bones differently from PES2012's (PES2012's lower lip
+# joints sit 2 cm from where their vertices are, and move 20 mm when the jaw
+# opens), so every bone-to-bone mapping tore Feynman's mouth open (30-09).
+# Instead each custom face vertex takes the rig weights of the stock face
+# (pes12_rig face_rig 'verts', head-local) blended from its nearest
+# FACE_TRANSFER_K stock vertices, scaled by how much PES's own rig moves it
+# (its non-sk_head share); the rest rides the skull.
+FACE_TRANSFER_K = 4
+FACE_TRANSFER_EPS_M = 0.002     # inverse-distance floor
+FACE_TRANSFER_MAX_M = 0.02      # farther from the stock face than this: skull only (helmets, hair)
+_face_tree = {}
+
+
+# The custom face is laid onto the stock one before the lookup: each axis is
+# mapped piecewise-linearly through landmarks both rigs name (PES bone on the
+# custom face -> centroid of the stock vertices weighted to the matching rig
+# bones, measured on dt0c #132 30-09). Feynman's mouth sits 1.3 cm lower and
+# 1.7 cm further forward than the stock mouth; unaligned, his lips read the
+# stock chin.
+FACE_LANDMARKS = (          # (PES15 bone, stock landmark head-local x, y, z)
+    ('skf_lip_s_l', (0.019, -0.021, 0.100)), ('skf_lip_s_r', (-0.019, -0.021, 0.100)),
+    ('skf_lip_t_c', (0.0, -0.017, 0.106)), ('skf_lip_b_c', (0.0, -0.023, 0.106)),
+    ('skf_eyelid_t_l', (0.031, 0.054, 0.097)), ('skf_eyelid_t_r', (-0.031, 0.054, 0.097)),
+)
+
+
+def face_align(bind):
+    """PES head-local -> stock-face head-local, per axis piecewise linear."""
+    head = bind.get(HEAD_BONE)
+    pairs = [([a - b for a, b in zip(bind[n], head)], t) for n, t in FACE_LANDMARKS if n in bind and head]
+    if len(pairs) < 3:
+        return None
+    axes = []
+    for k in range(3):
+        pts = sorted({round(src[k], 4): tgt[k] for src, tgt in pairs}.items())
+        axes.append(([a for a, _ in pts], [b for _, b in pts]))
+
+    def f(p):
+        import numpy as np
+        return [float(np.interp(p[k], *axes[k])) + (p[k] - axes[k][0][0] if p[k] < axes[k][0][0] else
+                (p[k] - axes[k][0][-1] if p[k] > axes[k][0][-1] else 0.0)) if len(axes[k][0]) > 1 else
+                p[k] + axes[k][1][0] - axes[k][0][0] for k in range(3)]
+    return f
+
+
+def stock_face_weights(rig, loc):
+    """Head-local point (on the stock face) -> {rig bone: weight} blended from
+    its stock vertices; the neck/eye controllers are left out (they move the
+    stock face relative to its own skull, which our face copy rides)."""
+    key = id(rig)
+    if key not in _face_tree:
+        from scipy.spatial import cKDTree
+        pts = [v[0] for v in rig['verts']]
+        _face_tree[key] = (cKDTree(pts), [{int(b): w for b, w in v[1].items() if int(b) not in FACE_CONTROLLER_BONES}
+                                          for v in rig['verts']])
+    tree, ws = _face_tree[key]
+    d, ii = tree.query(loc, k=FACE_TRANSFER_K)
+    if d[0] > FACE_TRANSFER_MAX_M:
+        return None
+    out, tot = {}, 0.0
+    for dist, i in zip(d, ii):
+        f = 1.0 / max(dist, FACE_TRANSFER_EPS_M)
+        tot += f
+        for b, w in ws[i].items():
+            out[b] = out.get(b, 0.0) + f * w
+    tot = sum(out.values()) or 1.0
+    return {b: w / tot for b, w in out.items()}
+
+
+def face_bone_dist(m, bind, align, rig):
+    """{PES15 skf_* bone: {face palette slot: share}}: what the stock face does
+    where this bone moves the custom face. Every vertex the bone weights looks
+    up the stock face at its aligned position; the bone's share of those
+    stock weights, summed over its vertices, is the bone's recipe. Per BONE,
+    not per vertex: a per-vertex lookup copied the stock face's seams onto
+    the custom one (inner mouth folded into spikes, 30-09), while this keeps
+    the pack's own smooth weights and only swaps what each bone drives."""
+    head = bind.get(HEAD_BONE)
+    if not rig or 'verts' not in rig or head is None:
+        return {}
+    pal = rig['palette']
+    acc = {}
+    for mesh in m.meshes:
+        bones = mesh.boneGroup.bones if mesh.boneGroup else []
+        for v in mesh.vertices:
+            skf = [(bones[k].name, w) for k, w in (v.boneMapping or {}).items()
+                   if k < len(bones) and FACE_BONE.match(bones[k].name)]
+            if not skf:
+                continue
+            loc = [a - b for a, b in zip((v.position.x, v.position.y, v.position.z), head)]
+            stock = stock_face_weights(rig, align(loc) if align else loc)
+            if stock is None:
+                continue
+            for name, w in skf:
+                d = acc.setdefault(name, {})
+                for b, x in stock.items():
+                    if b in pal:
+                        d[pal.index(b)] = d.get(pal.index(b), 0.0) + w * x
+    out = {}
+    for name, d in acc.items():
+        tot = sum(d.values()) or 1.0
+        out[name] = {sl: x / tot for sl, x in d.items() if x / tot >= FACE_DIST_MIN_SHARE}
+    return out
+
+
+FACE_DIST_MIN_SHARE = 0.05      # drop a bone's minor stock influences (keeps 4 per vertex usable)
+
+
+
+def pack_face_vertex(pos, head_pos, raw, fslots, skull_slot, rest, dist=None):
+    """The face-local copy of a head-only vertex: position minus the PES2012
+    head joint, weights on face palette slots (packed by skin_pack). rest =
+    the packed normal/binormal/tangent/uv tail of the body vertex. With the
+    bone's recipe (face_bone_dist), its weight spreads as the stock face
+    spreads it; else the role/nearest slot (face_slots)."""
+    w = {}
+    for name, wt in raw:
+        recipe = (dist or {}).get(name)
+        if recipe:
+            tot = sum(recipe.values())
+            for sl, x in recipe.items():
+                w[sl] = w.get(sl, 0.0) + wt * x / tot
+        else:
+            sl = fslots.get(name, skull_slot)
+            w[sl] = w.get(sl, 0.0) + wt
+    if not w:
+        w = {skull_slot: 1.0}
+    top = sorted(w.items(), key=lambda kv: -kv[1])[:MAX_INFLUENCES]
+    tw = sum(x for _, x in top) or 1.0
+    ws, slots = skin_pack([(sl, x / tw) for sl, x in top])
+    return struct.pack('<3f3f4B', *[a - b for a, b in zip(pos, head_pos)], *ws, *slots) + rest
+
+
+def build(sources, out_dir, keep=None, hide_body=None):
+    """sources -> <out_dir>/body.bin. -> (nv, ni, nsub, keep mask, textures)."""
     table = json.load(open(BONES_JSON))
     slot_of = {b['bone']: b['slot'] for b in table['bones']}
     p12 = {b['bone']: b['pos'] for b in table['bones']}
+    # only bones some mesh actually carries weight on have a seam
+    used = set()
+    for src in sources:
+        for mesh in src['meshes']:
+            for v in mesh['verts']:
+                for name, _w in v['infl']:
+                    try:
+                        used.update(b for b, _ in (helper_split(name) or [(main_bone(name, src['bind']), 1.0)]))
+                    except KeyError:
+                        pass
+    seams = seam_table(p12, used)
 
+    verts, idx, subs, textures, tex_index = [], [], [], [], {}
+    mesh_uvstep = []       # (pre-sort sub index, uvstep params) for the USTP trailer
+    hand_joints_of = {}      # side -> the joints of the model its rig copy came from
+    for src in sources:
+        bind = src['bind']
+        hand_rig = src.get('hand_rig') or {}
+        # per model: the face palette slots, the per-bone face recipes and the
+        # hand-rig joints of any side whose finger rig is complete
+        rig = src.get('face_rig')
+        fslots, fdist, skull_slot = src.get('fslots', {}), src.get('fdist', {}), src.get('skull_slot')
+        hand_at = {}
+        for side in SUB_HAND_SIDE:
+            fox = 'sk_hand_' + side
+            wrist = p12[FOX_TO_PES12[fox]]
+            a_, q_ = retarget.PES_RENDER_BIND[fox][0], retarget.PES_ALIGN.get(fox, (0.0, 0.0, 0.0, 1.0))
+
+            def to_body(c, fox=fox, wrist=wrist, a_=a_, q_=q_):   # the rigid copy's placement, on the hand bone
+                r = retarget._q_rot(q_, tuple(ci - ai for ci, ai in zip(c, a_)))
+                return [w + rk + sk for w, rk, sk in zip(wrist, r, seam_offset(fox, c, seams))]
+            j = hand_joints(bind, side, to_body, wrist)
+            if j is not None:
+                hand_at[side] = (wrist, j)
+        for mesh in src['meshes']:
+            tex = mesh['tex']
+            # textures are pooled by identity: the readers hand over file
+            # paths, engine texture names or PIL images, and two calls with the
+            # same name must land on the same slot
+            tkey = tex if isinstance(tex, (str, type(None))) else ('<image>', id(tex))
+            if tkey not in tex_index:
+                tex_index[tkey] = len(textures)
+                textures.append(tex)
+            # a UVStep timing texture rides its own slot (tools/uvstep.py):
+            # the sub's trailer entry names it by index below
+            ttex = mesh.get('timing_tex')
+            if ttex is None:
+                ttkey = None
+            elif isinstance(ttex, (str, type(None))):
+                ttkey = ttex
+            else:
+                ttkey = ('<image>', id(ttex))
+            if ttkey is not None and ttkey not in tex_index:
+                tex_index[ttkey] = len(textures)
+                textures.append(ttex)
+            base = len(verts)
+            faces = []
+            face_of, hand_of, face_src = {}, {}, {}
+            for v in mesh['verts']:
+                p, n, tg, uv0 = v['p'], v['n'], v['t'], v['uv']
+                uv1src = v.get('uv1')   # mesh['uvstep']: the second UV map (timing UVs); else the main map
+                infl, raw = {}, []
+                throat = {n for n, _w in v['infl'] if n in THROAT_BONES}
+                for name, w in v['infl']:
+                    try:
+                        shares = helper_split(name) or [(main_bone(name, bind), 1.0)]
+                    except KeyError:
+                        continue
+                    # The jaw opens only in the face draw; a vertex it shares
+                    # with the neck/chest is drawn by the body, where the jaw
+                    # share would pin it to the skull and crease the throat
+                    # (Feynman, 30-09). There the share hangs halfway, split
+                    # between head and neck, like PES's own chin blend.
+                    if name == JAW_BONE and throat:
+                        shares = [(HEAD_BONE, 1.0 - JAW_THROAT_NECK_SHARE), ('sk_neck', JAW_THROAT_NECK_SHARE)]
+                    for fox, share in shares:
+                        key = slot_key(name, fox)
+                        infl[key] = infl.get(key, 0.0) + w * share
+                    raw.append((name, w))
+                if not infl and src.get('head_world'):
+                    # a head piece authored in the head bone's own space and
+                    # carrying no weights rides the head bone
+                    infl = {('sk_head', False): 1.0}
+                if not infl:  # static geometry rides the nearest main joint
+                    infl = {(min(FOX_TO_PES12, key=lambda b: sum((a - c) ** 2 for a, c in zip(p, retarget.PES_RENDER_BIND[b][0]))
+                                 if b in retarget.PES_RENDER_BIND else 1e9), False): 1.0}
+                # 4cc exports list bones at weight 0.0 (Caulifla's knee verts
+                # carry sk_upperarm_l at 0.0); kept, they take an index slot
+                # and the implicit remainder lands on them - a fin from knee
+                # to shoulder.
+                infl = {b: w for b, w in infl.items() if w >= MIN_WEIGHT} or infl
+                top = sorted(infl.items(), key=lambda kv: -kv[1])[:MAX_INFLUENCES]
+                tw = sum(w for _, w in top) or 1.0
+                top = [(b, w / tw) for b, w in top]
+                hw = src.get('head_world')
+                if hw is not None and not raw:
+                    o = hw((0.0, 0.0, 0.0))
+                    p = hw(p)
+                    n = tuple(a - b for a, b in zip(hw(n), o))   # rotation only
+                p, n = curl_fingers(p, n, raw, bind)
+                pos, nrm, tan = [0.0, 0.0, 0.0], [0.0, 0.0, 0.0], [0.0, 0.0, 0.0]
+                for (fox, _), w in top:
+                    a = retarget.PES_RENDER_BIND[fox][0]
+                    q = retarget.PES_ALIGN.get(fox, (0.0, 0.0, 0.0, 1.0))
+                    r = retarget._q_rot(q, tuple(pi - ai for pi, ai in zip(p, a)))
+                    t = p12[FOX_TO_PES12[fox]]
+                    t = [tk + sk for tk, sk in zip(t, seam_offset(fox, p, seams))]
+                    rn, rt = retarget._q_rot(q, n), retarget._q_rot(q, tg)
+                    for k in range(3):
+                        pos[k] += w * (t[k] + r[k])
+                        nrm[k] += w * rn[k]
+                        tan[k] += w * rt[k]
+                ln = math.sqrt(sum(c * c for c in nrm)) or 1.0
+                nrm = [c / ln for c in nrm]
+                lt = math.sqrt(sum(c * c for c in tan)) or 1.0
+                tan = [c / lt for c in tan]
+                bin_ = [nrm[1] * tan[2] - nrm[2] * tan[1], nrm[2] * tan[0] - nrm[0] * tan[2],
+                        nrm[0] * tan[1] - nrm[1] * tan[0]]
+                ws, slots = skin_pack([(key_slot(b, slot_of), w) for b, w in top])
+                u, vv = uv0
+                if not (math.isfinite(u) and math.isfinite(vv)):
+                    u, vv = 0.0, 0.0   # some 4cc exports ship NaN UVs; sampling NaN is undefined
+                # kit slot: TEXCOORD0 keeps the pack's own UVs (drawlogic draws
+                # it with the full-resolution source sheet), TEXCOORD1 carries
+                # them re-mapped onto PES2012's sheet (the game's bound kit).
+                # A UVStep timing texture instead takes the second UV map there
+                # (drawlogic samples it through TEXCOORD1, c179 = SET0).
+                u2, v2 = uv1src if uv1src is not None else kit_uv(u, vv) if mesh.get('kit') else (u, vv)
+                if not (math.isfinite(u2) and math.isfinite(v2)):
+                    u2, v2 = 0.0, 0.0
+                packed = struct.pack('<3f3f4B3f3f3f2f2f', *pos, *ws[:3], *slots,
+                                     *nrm, *bin_, *tan, u, vv, u2, v2)
+                vi = len(verts)
+                verts.append(packed)
+                # a vertex on the face palette gets its head-local copy drawn at
+                # the game's face draw; a one-hand vertex gets a hand-local copy
+                # drawn on the stock hand rig. Both reuse the packed tail.
+                if skull_slot is not None and all(fox == HEAD_BONE for (fox, _) in infl):
+                    face_of[vi] = pack_face_vertex(pos, p12[FOX_TO_PES12[HEAD_BONE]], raw,
+                                                   fslots, skull_slot, packed[FACE_REST_OFF:], fdist)
+                    face_src[vi] = (pos, packed[FACE_REST_OFF:])
+                hside = hand_side(raw)
+                if hside in hand_at:
+                    hand_of[vi] = (hside, pack_hand_vertex(pos, raw, hand_rig[hside]['palette'],
+                                                           hand_at[hside][0], packed[FACE_REST_OFF:]))
+                    hand_joints_of.setdefault(hside, hand_at[hside][1])
+            wind = src['wind']
+            for tri in mesh['tris']:
+                faces.append(tuple(base + tri[k] for k in wind))
+            # Partition: a triangle goes to the body sub, to one hand's two
+            # copies, or to the face copy - never to two of them, or the part
+            # would be drawn twice at the same place.
+            hand_tris = {side: [tri for tri in faces
+                                if all(t in hand_of and hand_of[t][0] == side for t in tri)]
+                         for side in SUB_HAND_SIDE}
+            in_hand = {tri for v in hand_tris.values() for tri in v}
+            face_tris = [tri for tri in faces if all(t in face_of for t in tri)]
+            body_tris = [tri for tri in faces if tri not in in_hand and tri not in face_tris]
+            # A vertex on the face/body border has a face copy (facial bones)
+            # and a body copy (the head bone): as the jaw opened they parted
+            # and holes showed the back of the head (Feynman's cheeks, 30-09).
+            # Its face copy rides the skull, which moves exactly with the head
+            # bone, so the border stays welded and the face stretches to it.
+            border = ({t for tri in body_tris for t in tri if t in face_of}
+                      & {t for tri in face_tris for t in tri})
+            for t in border:
+                face_of[t] = pack_face_vertex(face_src[t][0], p12[FOX_TO_PES12[HEAD_BONE]], [],
+                                              fslots, skull_slot, face_src[t][1])
+            flags = mesh['flags'] | (SUB_KIT if mesh.get('kit') else 0)
+            # a UVStep mesh's trailer entry (tools/uvstep.py): the timing
+            # texture slot (its own pooled texture) or none for uniform mode
+            uvp = dict(mesh['uvstep']) if mesh.get('uvstep') else None
+            if uvp is not None:
+                import uvstep as _U
+                uvp['timing_tex'] = tex_index[ttkey] if ttkey is not None else _U.NO_TIMING_TEX
+            mesh_subs = []   # sub indices (pre-sort) this mesh emitted, for the UVStep trailer
+            if body_tris:
+                mesh_subs.append(len(subs))
+                subs.append((len(idx), 3 * len(body_tris), tex_index[tkey], flags))
+                idx.extend(t for tri in body_tris for t in tri)
+            # one-hand triangles: a rigid body copy (SUB_HAND_<side>) and the
+            # hand-local copy on the stock hand's palette (SUB_HAND_RIG)
+            for side, bit in SUB_HAND_SIDE.items():
+                tris = hand_tris[side]
+                if not tris:
+                    continue
+                mesh_subs.append(len(subs))
+                subs.append((len(idx), 3 * len(tris), tex_index[tkey], flags | bit))
+                idx.extend(t for tri in tris for t in tri)
+                remap = {}
+                for tri in tris:
+                    for t in tri:
+                        if t not in remap:
+                            remap[t] = len(verts)
+                            verts.append(hand_of[t][1])
+                mesh_subs.append(len(subs))
+                subs.append((len(idx), 3 * len(tris), tex_index[tkey], flags | bit | SUB_HAND_RIG))
+                idx.extend(remap[t] for tri in tris for t in tri)
+            if face_tris:
+                remap = {}
+                for tri in face_tris:
+                    for t in tri:
+                        if t not in remap:
+                            remap[t] = len(verts)
+                            verts.append(face_of[t])
+                mesh_subs.append(len(subs))
+                subs.append((len(idx), 3 * len(face_tris), tex_index[tkey], flags | SUB_FACE))
+                idx.extend(remap[t] for tri in face_tris for t in tri)
+            if uvp is not None:
+                for si in mesh_subs:
+                    mesh_uvstep.append((si, uvp))
+    # blended subs draw last: remap the trailer entries through the same order
+    order = sorted(range(len(subs)), key=lambda k: bool(subs[k][3] & SUB_BLEND))
+    ustep = {order.index(si): uvp for si, uvp in mesh_uvstep}
+    subs = [subs[k] for k in order]
+    # vertices no submesh reaches (skipped faces leave theirs behind) blow up
+    # the preview framing; compact them away.
+    keep_idx = sorted({i for s in subs for i in idx[s[0]:s[0] + s[1]]})
+    remap = {old: new for new, old in enumerate(keep_idx)}
+    verts = [verts[old] for old in keep_idx]
+    at, compact = 0, []
+    for first, count, tex, flags in subs:
+        compact.append((at, count, tex, flags))
+        at += count
+    idx = [remap[i] for s in subs for i in idx[s[0]:s[0] + s[1]]]
+    subs = compact
+    # (UVStep entries are collected per emitted sub below, in mesh_subs.)
+
+    # extents in body space. Face-part vertices are head-local, so they are
+    # measured against the head joint; the hand-rig copies are hand-local, so
+    # they are left out entirely - counting their wrist-relative origin would
+    # put a model that stands on the floor below OWN_FEET_Y.
+    body_idx = {i for s in subs if not s[3] & (SUB_FACE | SUB_HAND_RIG)
+                for i in idx[s[0]:s[0] + s[1]]}
+    face_idx = {i for s in subs if s[3] & SUB_FACE for i in idx[s[0]:s[0] + s[1]]}
+    ys = [struct.unpack_from('<3f', verts[i])[1] for i in body_idx]
+    ys += [struct.unpack_from('<3f', verts[i])[1] + p12[FOX_TO_PES12[HEAD_BONE]][1] for i in face_idx]
+    ys = ys or [0.0]
+    whole = any(s.get('whole') for s in sources) if hide_body is None else hide_body
+    if keep is None:
+        keep = (KEEP_NONE if min(ys) < OWN_FEET_Y else KEEP_BOOTS) if whole else KEEP_BUT_HEAD
+    if any(s.get('gloves') for s in sources):
+        keep &= ~keep_mask('hands', 'gloves')
+    os.makedirs(out_dir, exist_ok=True)
+    for fn in os.listdir(out_dir):
+        if fn.startswith('body'):
+            os.remove(os.path.join(out_dir, fn))
+    with open(os.path.join(out_dir, 'body.bin'), 'wb') as o:
+        o.write(struct.pack('<6I', BODY2_MAGIC, len(verts), len(idx), VERTEX_STRIDE, len(subs), keep))
+        for s in subs:
+            o.write(struct.pack('<4I', *s))
+        o.write(b''.join(verts))
+        o.write(struct.pack('<%dI' % len(idx), *idx))
+        if any(sf & SUB_HAND_RIG for _f, _c, _t, sf in subs):
+            o.write(hrig_trailer(hand_rig_of(sources), hand_joints_of))
+        if ustep:
+            import uvstep as _U2
+            o.write(_U2.build_trailer(ustep))
+
+
+def hand_rig_of(sources):
+    """The stock hand palettes/parents, from whichever source carries them."""
+    for src in sources:
+        if src.get('hand_rig'):
+            return src['hand_rig']
+    raise ValueError('no source carries the stock hand rig')
+
+
+_rigs_cache = None
+
+
+def _rigs():
+    """(stock hand rig, stock face rig) from the user's game, once."""
+    global _rigs_cache
+    if _rigs_cache is None:
+        import pes12_rig
+        _rigs_cache = (pes12_rig.load_hand_rig(), pes12_rig.load_face_rig())
+    return _rigs_cache
+
+
+def kit_uv(u, v):
+    """PES14+ kit-sheet UV -> PES2012 kit-sheet UV (nearest texel of the inverse
+    table pes15_kits builds; UVs wrap like the sampler)."""
+    import numpy as np
+    import pes15_kits as K
+    inv = np.load(os.path.join(K.CACHE, 'kitmap.npz'))['inv']
+    g = inv.shape[0]
+    x, y = int((u % 1.0) * g) % g, int((v % 1.0) * g) % g
+    return float(inv[y, x, 0]), float(inv[y, x, 1])
+
+
+def convert(fmdl_path, dds_path, out_dir, hint=None):
+    """A PES21 .fmdl -> the custom body. dds_path overrides the model's own
+    texture (an empty string keeps each material's own, or the kit sheet).
+    hint: 'hide' / 'keep' to force the stock-piece mask, as on the PES15 path."""
     f = FmdlFile.FmdlFile()
     f.readFile(fmdl_path)
-    fmdl_bind = {}
-    for b in f.bones:
-        # bone.globalPosition is the render-bind joint (Fox coords)
-        gp = b.globalPosition
-        fmdl_bind[b.name] = (gp.x, gp.y, gp.z)
+    bind = {b.name: (b.globalPosition.x, b.globalPosition.y, b.globalPosition.z) for b in f.bones}
+    meshes = []
+    for m in f.meshes:
+        # "antiblur" duplicates and degenerate stubs are not drawn
+        if not m.materialInstance or len(m.faces) < 1:
+            continue
+        if 'antiblur' in m.materialInstance.name.lower():
+            continue
+        mi = m.materialInstance
+        # the samplers name the map by role: Base_Tex_SRGB is the one painted on
+        # the model, the rest are normal/specular/mask maps drawlogic ignores
+        diffuse = next((t.filename for name, t in mi.textures
+                        if name.split('_')[0] in ('Base', 'Pattern', 'Layer')), None)
+        kit = diffuse is not None and diffuse.lower().startswith('uni_pattern')
+        # An fmdl names its maps as engine source-image paths
+        # (/Assets/pes16/.../JerseyTops_bsm.tga) that the cpk does not ship -
+        # the packs carry runtime maps, not the art source. The caller's texture
+        # wins where given; a material without one becomes drawlogic's grey
+        # stand-in. Geometry, palette and flags are what has to be right here.
+        tex = dds_path or None
+        uvp = uvstep_params(mi)
+        meshes.append(dict(
+            tex=tex, kit=kit, flags=fmdl_flags(mi, m),
+            uvstep=uvp, timing_tex=None,   # the packs do not ship maps under art-source names; see below
+            verts=[dict(p=(v.position.x, v.position.y, v.position.z),
+                        n=(v.normal.x, v.normal.y, v.normal.z) if v.normal else (0.0, 1.0, 0.0),
+                        t=(v.tangent.x, v.tangent.y, v.tangent.z) if v.tangent else (1.0, 0.0, 0.0),
+                        uv=(v.uv[0].u, v.uv[0].v) if v.uv else (0.0, 0.0),
+                        uv1=(v.uv[1].u, v.uv[1].v) if len(v.uv) > 1 else None,
+                        infl=[(b.name, w) for b, w in (v.boneMapping or {}).items()])
+                    for v in m.vertices],
+            tris=_tris(m)))
+    hand_rig, face_rig = _rigs()
+    on_face = HEAD_BONE in bind and any(FACE_BONE.match(b.name) for b in f.bones)
+    src = dict(bind=bind, meshes=meshes, wind=(0, 1, 2),
+               whole=_whole(f), gloves=False, head_world=None,
+               hand_rig=hand_rig,
+               fslots=face_slots(bind, face_rig) if on_face else {},
+               # the face palette only means anything for a model that carries
+               # face bones; everything else gets no face submesh at all
+               skull_slot=face_rig['palette'].index(FACE_SKULL_BONE) if on_face else None)
+    nv, ni, nsub, keep, textures, y0, y1 = build(
+        [src], out_dir, hide_body=None if hint is None else hint == 'hide')
+    for k, tex in enumerate(textures):
+        write_tex(tex, os.path.join(out_dir, 'body_%d.tex' % k))
+    print('%s: %d verts, %d tris, %d submeshes, %d textures, keeps %s, y %.2f..%.2f' % (
+        os.path.basename(fmdl_path), nv, ni // 3, nsub, len(textures),
+        ' '.join(n for i, n in enumerate(PIECES) if keep >> i & 1) or 'nothing', y0, y1))
 
-    # the drawable mesh: skip "antiblur" duplicates and degenerate stubs
-    meshes = [m for m in f.meshes if 'antiblur' not in m.materialInstance.name
-              and len(m.faces) > 1]
-    verts, idx = [], []
-    for m in meshes:
-        base = len(verts)
-        index_of = {id(v): k for k, v in enumerate(m.vertices)}
-        for v in m.vertices:
-            infl = {}
-            for bone, w in v.boneMapping.items():
-                key = slot_key(bone.name, main_bone(bone.name, fmdl_bind))
-                infl[key] = infl.get(key, 0.0) + w
-            # 4cc exports list bones at weight 0.0 (Caulifla's knee verts carry
-            # sk_upperarm_l at 0.0); kept, they take an index slot and the
-            # implicit remainder lands on them - a fin from knee to shoulder.
-            infl = {b: w for b, w in infl.items() if w >= MIN_WEIGHT}
-            top = sorted(infl.items(), key=lambda kv: -kv[1])[:MAX_INFLUENCES]
-            tw = sum(w for _, w in top) or 1.0
-            top = [(b, w / tw) for b, w in top]
-            p = (v.position.x, v.position.y, v.position.z)
-            n = (v.normal.x, v.normal.y, v.normal.z)
-            tg = (v.tangent.x, v.tangent.y, v.tangent.z) if v.tangent else (1.0, 0.0, 0.0)
-            pos = [0.0, 0.0, 0.0]
-            nrm = [0.0, 0.0, 0.0]
-            tan = [0.0, 0.0, 0.0]
-            for (fox, _), w in top:
-                a = retarget.PES_RENDER_BIND[fox][0]
-                q = retarget.PES_ALIGN.get(fox, (0.0, 0.0, 0.0, 1.0))
-                r = retarget._q_rot(q, tuple(pi - ai for pi, ai in zip(p, a)))
-                t = p12[FOX_TO_PES12[fox]]
-                rn = retarget._q_rot(q, n)
-                rt = retarget._q_rot(q, tg)
-                for k in range(3):
-                    pos[k] += w * (t[k] + r[k])
-                    nrm[k] += w * rn[k]
-                    tan[k] += w * rt[k]
-            ln = math.sqrt(sum(c * c for c in nrm)) or 1.0
-            nrm = [c / ln for c in nrm]
-            lt = math.sqrt(sum(c * c for c in tan)) or 1.0
-            tan = [c / lt for c in tan]
-            bin_ = [nrm[1] * tan[2] - nrm[2] * tan[1], nrm[2] * tan[0] - nrm[0] * tan[2],
-                    nrm[0] * tan[1] - nrm[1] * tan[0]]
-            slot_w = [(key_slot(b, slot_of), w) for b, w in top]
-            ws, slots = skin_pack(slot_w)
-            uv = v.uv[0] if v.uv else None
-            u, vv = (uv.u, uv.v) if uv is not None else (0.0, 0.0)
-            verts.append(struct.pack('<3f3f4B3f3f3f2f2f', *pos, *ws[:3], *slots, *nrm, *bin_, *tan, u, vv, u, vv))
-        for face in m.faces:
-            idx.extend(base + index_of[id(face.vertices[k])] for k in (0, 1, 2))
-    if len(verts) > U16_MAX_VERTS:
-        raise ValueError('%d vertices exceed 16-bit indices' % len(verts))
 
-    os.makedirs(out_dir, exist_ok=True)
-    with open(os.path.join(out_dir, 'body.bin'), 'wb') as o:
-        o.write(struct.pack('<4I', BODY_MAGIC, len(verts), len(idx), VERTEX_STRIDE))
-        o.write(b''.join(verts))
-        o.write(struct.pack('<%dH' % len(idx), *idx))
-    write_tex(dds_path, os.path.join(out_dir, 'body.tex'))
-    ys = [struct.unpack_from('<3f', v)[1] for v in verts]
-    print('wrote %d verts, %d tris, y %.2f..%.2f' % (len(verts), len(idx) // 3, min(ys), max(ys)))
+def _tris(m):
+    """The mesh's triangles as vertex indices (one index map for the mesh)."""
+    index_of = {id(v): k for k, v in enumerate(m.vertices)}
+    return [tuple(index_of[id(fa.vertices[k])] for k in range(3)) for fa in m.faces]
+
+
+# fmdl material state -> drawlogic submesh flags. The .mtl states the PES15
+# reader keys off do not exist in an fmdl; the shader name and alphaFlags
+# carry what the flags need.
+GREY = None                # no texture: write_tex paints the grey stand-in
+# alphaFlags as measured over the packs: 0 opaque, 16 unlit 2D, 32 cloth,
+# 80 translucent (skin_dirt, the d2_* constant UI), 112/160 constant colour
+ALPHA_BLEND = 0x50          # bit set on the translucent meshes
+FMDL_TRANSLUCENT = re.compile(r'translucent|cloth_color|skin_dirt', re.I)
+
+
+def fmdl_flags(mi, m):
+    """drawlogic SUB_* bits for one fmdl mesh."""
+    flags = 0
+    shader = (mi.shader or '').lower()
+    if UVSTEP_CONSTANT_SHADER in shader:
+        flags |= SUB_SHADELESS | SUB_UVSTEP
+    elif UVSTEP_LIT_SHADER in shader:
+        flags |= SUB_UVSTEP | SUB_UVSTEP_LIT
+    elif 'constant' in shader or shader.endswith('_color'):
+        flags |= SUB_SHADELESS
+    # PES's cloth and skin are alpha-cutout geometry (the shirt's number, the
+    # sock's line) but the fmdl mesh carries no per-material alpha state, so
+    # the translucent shaders are the only tell.
+    if 'translucent' in shader or FMDL_TRANSLUCENT.search(mi.name or ''):
+        flags |= SUB_ALPHATEST | (0x80 << SUB_REF_SHIFT)
+    if m.alphaFlags & ALPHA_BLEND == ALPHA_BLEND:
+        flags |= SUB_BLEND
+    if OUTLINE_MATERIAL.search(mi.name or ''):
+        flags |= SUB_OUTLINE
+    return flags
+
+
+# PES2019+ frame-grid shaders (owner wiki): the base texture holds the
+# animation frames left-to-right, top-to-bottom; Timing_Tex_LIN's R picks
+# the frame, a transparent texel draws nothing. The params ride mi.parameters
+# (4-float tuples) and the timing UVs ride the mesh's second UV channel.
+UVSTEP_CONSTANT_SHADER = 'fox3dfw_constant_srgb_ndr_uvstep'
+UVSTEP_LIT_SHADER = 'fox3ddf_blin_uvstep'
+UVSTEP_BASE_TEX = 'Base_Tex_SRGB'          # the frame grid
+UVSTEP_TIMING_TEX = 'Timing_Tex_LIN'       # the per-part schedule (optional)
+UVSTEP_DEFAULT_CYCLE_S = 1.0               # uniform mode with no Seconds_Per_Animation_Cycle: visible motion
+
+
+def _uvstep_num(params, name, default=0.0):
+    """First float of an fmdl material param (params are 4-float tuples)."""
+    for pname, values in params or ():
+        if pname == name:
+            try:
+                return float(values[0])
+            except (TypeError, ValueError, IndexError):
+                return default
+    return default
+
+
+def uvstep_params(mi):
+    """fmdl material instance -> uvstep.make_params dict, or None when the
+    material is not a uvstep shader or its grid is degenerate."""
+    shader = (mi.shader or '').lower()
+    if UVSTEP_CONSTANT_SHADER not in shader and UVSTEP_LIT_SHADER not in shader:
+        return None
+    import uvstep
+    tu = max(1, int(round(_uvstep_num(mi.parameters, 'Tile_Count_U', 1))))
+    tv = max(1, int(round(_uvstep_num(mi.parameters, 'Tile_Count_V', 1))))
+    used = max(1, min(tu * tv, int(round(_uvstep_num(mi.parameters, 'Tiles_Used', tu * tv)))))
+    use_timing = any(name == UVSTEP_TIMING_TEX for name, _t in mi.textures or ())
+    return uvstep.make_params(
+        tile_u=tu, tile_v=tv, tiles_used=used, use_timing=use_timing,
+        sec_cycle=_uvstep_num(mi.parameters, 'Seconds_Per_Animation_Cycle',
+                              0.0 if use_timing else UVSTEP_DEFAULT_CYCLE_S),
+        sec_u=_uvstep_num(mi.parameters, 'Seconds_Per_Timing_U_Cycle'),
+        sec_v=_uvstep_num(mi.parameters, 'Seconds_Per_Timing_V_Cycle'),
+        scale=bool(round(_uvstep_num(mi.parameters, 'Scale_UVs_To_Tiles'))))
+
+
+def _whole(f):
+    """The model replaces the whole body: it carries a leg down to the foot
+    (naked_body alone does not; a jersey or a suit does)."""
+    names = {b.name for b in f.bones}
+    return {'sk_thigh_l', 'sk_leg_l', 'sk_foot_l'} <= names
 
 
 if __name__ == '__main__':
-    convert(*sys.argv[1:4])
+    # fmdl_to_pes12.py <body.fmdl> <texture.dds|""> <out_dir> [hide|keep]
+    convert(*sys.argv[1:4], hint=sys.argv[4] if len(sys.argv) > 4 else None)

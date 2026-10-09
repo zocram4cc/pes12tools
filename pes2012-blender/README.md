@@ -72,10 +72,11 @@ of their block's armature.
 Every texture the BIN itself carries (WE00 blocks: DXT1/3/5, the one
 uncompressed DDS, the two raw ball textures) is imported as a packed image,
 each on the packets whose colour map it is, through `UV0`. Paint it in
-Texture Paint, or replace its pixels, and export: changed images are
-re-encoded into their own block (same size, format and mip count, mips
+Texture Paint, or swap in your own picture (**Image > Replace**, any size),
+and export: changed images are re-encoded into their own block at the
+block's size, format and mip count (another size is resampled; mips are
 rebuilt), unchanged ones keep their bytes (DXT is lossy, so they are never
-re-encoded). The image must keep its size.
+re-encoded).
 
 Which block a model row means is decided from the BIN itself, by three
 rules each checked on every stock entry: a block whose id equals the row
@@ -106,13 +107,29 @@ props entry. Every packet is textured from the slot's texture entries
 (stand textures, lightmaps, sky, pitch art, then the shared pitch-side and
 adboard entries), resolved by texture id as the game does.
 
-Edit geometry and paint textures as for a single BIN, then **File > Export >
+Edit geometry and paint textures as for a single BIN. To add geometry,
+add a mesh with a `UV0` UV map and give it the material of the
+packet whose texture it should show (or any material using one of the
+imported images); on export it is merged into that packet, so it draws
+with that texture wherever you put it. Duplicates of imported packet
+objects stay with their packet. Meshes hidden from render are left out
+(keep reference geometry that way); any other mesh with no packet to join
+stops the export with its name instead of being dropped. Then **File > Export >
 PES2012 stadium slot (afs2fs)** with the afs2fs root: every model entry and
 every texture entry you changed is written as
 `<root>/img/dt07.img/dt07_<entry>.bin`; an entry equal to stock leaves no
-file (an existing override for it is removed). Stock `.img` files are never
+file (an existing override for it is removed), and an entry you did not
+touch is written back byte for byte. Stock `.img` files are never
 written. The slot table is read from your own `pes2012.exe`, with the same
 rules as pes2012-tools `pes12_stadium.py`.
+
+The import also brings a `CROWD` sub-collection: one object per non-empty
+crowd section, one quad per row (headers and uv rects ride on face
+attributes). Move quads or build new sections (`crowd.generate_stand`
+from a stand polyline: row spacing, tilt), then export: the crowd block
+goes out with the model entries (a stock crowd leaves no override).
+`pes12_crowd_mode` on the collection toggles `stock`/`off`/`custom`;
+`crowd.write_spec` saves sections to the JSON spec the tool reads.
 
 ## PGB2 custom bodies
 
@@ -145,6 +162,14 @@ ticked = a whole figure): `shorts`, `shirt`, `sleeves`, `socks`, `neck`,
 | `pgb2_hair` | 18 | hair: opaque core plus alpha fringe pass |
 | `pgb2_hand_l` / `pgb2_hand_r` | 19 / 20 | a one-hand part (its rigid body copy) |
 | `pgb2_hand_rig` | 21 | that part's hand-local copy, weights on `hand_l_00..11` / `hand_r_00..11` (the stock hand palette); the body's `HRIG` hand joints ride the object as `pgb2_trailer` |
+| `pgb2_uvstep` / `pgb2_uvstep_lit` | 22 / 23 | frame-grid animation: the texture holds the frames left-to-right, top-to-bottom; lit = toon lighting, else constant |
+| `pgb2_uvstep_tiles_u` / `_tiles_v` (int) | - | tiles across / down the grid (`Tile_Count_U/V`) |
+| `pgb2_uvstep_used` (int) | - | frames played (`Tiles_Used`, <= U*V) |
+| `pgb2_uvstep_cycle` | - | uniform mode: whole-cycle seconds (0 = stay on frame 0) |
+| `pgb2_uvstep_sec_u` / `_sec_v` | - | timing mode: seconds to scroll the timing texture left-to-right / top-to-bottom (0 = no motion) |
+| `pgb2_uvstep_tex` (int) | - | timing texture slot `body_<k>` (255 = uniform mode, no timing texture; its R picks the frame, alpha 0 draws nothing) |
+| `pgb2_uvstep_uv` | - | timing UV map, carried on UV1 (UV0 stays the main UVs) |
+| `pgb2_uvstep_scale` | - | main UVs span the whole texture and shrink into one tile (else they sit in the top-left tile) |
 | `pgb2_tex` (int) | - | texture slot `body_<k>` |
 
 Body slots, in order: `sk_thigh_r sk_leg_r dsk_hip sk_thigh_l sk_leg_l

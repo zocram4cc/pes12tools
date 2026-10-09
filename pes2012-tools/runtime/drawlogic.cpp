@@ -292,6 +292,10 @@ static const DWORD SUB_ALPHATEST = 1, SUB_BLEND = 2, SUB_TWOSIDED = 4, SUB_NOZWR
 // replace the game's lit kit shader for those submeshes in the colour pass.
 static const DWORD SUB_SHADELESS = 1u << 16, SUB_TOON = 1u << 17;
 static const DWORD SUB_HAIR = 1u << 18;   // PES Hair shader: opaque, plus the alpha fringe pass
+// Frame-grid animation (PES2019+ fox3d*_uvstep; tools/uvstep.py, USTP trailer):
+// the sub's base texture holds the frames left-to-right, top-to-bottom. Bit 22
+// flags it; bit 23 picks the lit variant (toon lighting), else constant.
+static const DWORD SUB_UVSTEP = 1u << 22, SUB_UVSTEP_LIT = 1u << 23;
 // One-hand parts (tools/pes15_to_pes12.py HAND_RIG_BONE): SUB_HAND_L/R on the
 // rigid body copy, plus SUB_HAND_RIG on the hand-local copy weighted to the
 // stock hand's 12-bone palette, drawn at the stock hand draw instead of it
@@ -307,7 +311,16 @@ static const UINT HAND_RIG_BONES = 12;        // dt0d #589's hand rig (pes12_rig
 static const UINT HRIG_SIDE_BYTES = HAND_RIG_BONES * (1 + 1 + 3 * sizeof(float));
 // which submeshes a drawCustom call draws
 enum { DRAW_BODY, DRAW_FACE, DRAW_HAND_L, DRAW_HAND_R };
-static IDirect3DPixelShader9 *g_psShadeless = NULL, *g_psToon = NULL;
+// UVStep frame grids (tools/uvstep.py USTP trailer; custom_ps.hlsl uvstep/uvstep_lit).
+static const DWORD USTEP_MAGIC = 0x50545355;   // 'USTP'
+static const UINT USTEP_ENTRY_BYTES = 20;      // u8 tileU, tileV, used, mode; f32 cycle, secU, secV; u8 tex, scale, 0, 0
+static const UINT USTEP_MAX_ENTRIES = 64;      // one per submesh at most
+static const DWORD USTEP_NO_TIMING_TEX = 0xFF; // entry.timing_tex: uniform mode, no timing texture
+static const DWORD USTEP_TIMING_STAGE = 2;     // s2: free in every dumped game PS (s0/s1/s4/s7-s10 taken)
+static const UINT USTEP_PS_TILES = 29;         // c29 (tileU, tileV, tilesUsed, scale)
+static const UINT USTEP_PS_TIMING = 30;        // c30 (useTiming, secCycle, secTimingU, secTimingV)
+static const UINT USTEP_PS_TIME = 31;          // c31 (timeSeconds, 0, 0, 0)
+static IDirect3DPixelShader9 *g_psShadeless = NULL, *g_psToon = NULL, *g_psUvstep = NULL, *g_psUvstepLit = NULL;
 // Is vs the game's colour-pass kit shader (it outputs the UVs in TEXCOORD4;
 // the depth and shadow passes' shaders do not)? Parsed from its dcl tokens.
 static const DWORD D3DSIO_DCL_OP = 0x1F, USAGE_TEXCOORD = 5, UV_OUT_INDEX = 4, REG_OUTPUT = 6;   // vs_3_0 outputs are register type 6 (D3DSPR_TEXCRDOUT)
@@ -348,12 +361,14 @@ static bool g_kitPatchOff = false;                  // flags\\nokitpatch: no she
 static const DWORD SUB_REF_SHIFT = 8, SUB_REF_MASK = 0xFF;
 static LONG g_cuLo = -1, g_cuHi = -1;           // body occurrences drawn as custom
 struct CustomSub { UINT first, count, tex, flags; };
+struct UstepEntry { BYTE tileU, tileV, used, mode; float cycle, secU, secV; BYTE timing, scale, rsv0, rsv1; };
 static const int MAX_SUBS = 64, MAX_TEXS = 64;
 struct CustomModel {
     char name[32];
     IDirect3DVertexBuffer9* vb; IDirect3DIndexBuffer9* ib;
     IDirect3DTexture9* tex[MAX_TEXS]; UINT ntex;
     CustomSub sub[MAX_SUBS]; UINT nsub;
+    UstepEntry ustep[MAX_SUBS]; UINT nustep;   // USTP trailer, by final sub index (nustep 0: none)
     UINT nv, ni, stride; DWORD keep; bool tried;   // keep: stock pieces drawn (PIECE_NAMES bits)
     bool handRig[2];                             // has SUB_HAND_RIG subs and their HRIG joints, per side (L, R)
     BYTE hrigBone[2][HAND_RIG_BONES];            // HRIG trailer: palette slot -> rig bone
@@ -766,9 +781,32 @@ static bool loadModel(IDirect3DDevice9* d, CustomModel& M, const wchar_t* dir) {
         memcpy(M.hrigJoint[h], q + 2 * HAND_RIG_BONES, sizeof(M.hrigJoint[h]));
         for (UINT i = 0; i < M.nsub; i++) if ((M.sub[i].flags & SUB_HAND_RIG) && (M.sub[i].flags & SUB_HAND_SIDE[h])) M.handRig[h] = true;
     }
+    // UVStep params (tools/uvstep.py USTP section): trailer sections scan by
+    // magic, so HRIG-first and USTP-first files both load; old DLLs stop at
+    // the indices and ignore the section, old files have none.
+    M.nustep = 0;
+    memset(M.ustep, 0, sizeof(M.ustep));
+    if (v2) {
+        const BYTE* sec = tr + (hrig ? sizeof(DWORD) + 2 * HRIG_SIDE_BYTES : 0);
+        if (sec + 2 * sizeof(DWORD) <= b + n && *(const DWORD*)sec == USTEP_MAGIC) {
+            DWORD cnt = *(const DWORD*)(sec + sizeof(DWORD));
+            if (cnt > USTEP_MAX_ENTRIES) cnt = USTEP_MAX_ENTRIES;
+            const BYTE* e = sec + 2 * sizeof(DWORD);
+            for (DWORD k = 0; k < cnt && e + sizeof(DWORD) + USTEP_ENTRY_BYTES <= b + n; k++) {
+                DWORD sub = *(const DWORD*)e;
+                if (sub < M.nsub) memcpy(&M.ustep[sub], e + sizeof(DWORD), USTEP_ENTRY_BYTES);
+                e += sizeof(DWORD) + USTEP_ENTRY_BYTES;
+                M.nustep++;
+            }
+        }
+    }
     HeapFree(GetProcessHeap(), 0, b);
     M.ntex = 0;
     for (UINT i = 0; i < M.nsub; i++) if (M.sub[i].tex + 1 > M.ntex) M.ntex = M.sub[i].tex + 1;
+    // timing textures are referenced only by the USTP trailer (09-10: the test
+    // model logged texs=1 and its timing cube sampled no texture)
+    for (UINT i = 0; i < M.nsub; i++)
+        if (M.ustep[i].timing != USTEP_NO_TIMING_TEX && M.ustep[i].timing + 1u > M.ntex) M.ntex = M.ustep[i].timing + 1u;
     if (M.ntex > (UINT)MAX_TEXS) M.ntex = MAX_TEXS;
     for (UINT k = 0; k < M.ntex; k++) {
         lstrcpyW(path, dir);
@@ -1230,10 +1268,21 @@ static HRESULT drawCustom(IDirect3DDevice9* d, int part) {
     HRESULT hr = D3D_OK;
     if (!g_psShadeless) d->CreatePixelShader(PS_SHADELESS, &g_psShadeless);
     if (!g_psToon) d->CreatePixelShader(PS_TOON, &g_psToon);
+    if (!g_psUvstep) d->CreatePixelShader(PS_UVSTEP, &g_psUvstep);
+    if (!g_psUvstepLit) d->CreatePixelShader(PS_UVSTEP_LIT, &g_psUvstepLit);
     IDirect3DVertexShader9* curVS = NULL; d->GetVertexShader(&curVS);
     bool colour = isColourVS(curVS); if (curVS) curVS->Release();
     IDirect3DPixelShader9* gamePS = NULL; d->GetPixelShader(&gamePS);
     float uvSel[4]; memcpy(uvSel, g_vsc[UV_SELECT_REG], sizeof(uvSel));   // the game's, for non-kit subs
+    // UVStep state saved once: the timing stage, its sampler wrap, the three
+    // PS registers and the second UV selector (c179). Restored at the end.
+    IDirect3DBaseTexture9* keepTiming = NULL; d->GetTexture(USTEP_TIMING_STAGE, &keepTiming);
+    DWORD tau = 0, tav = 0;
+    d->GetSamplerState(USTEP_TIMING_STAGE, D3DSAMP_ADDRESSU, &tau);
+    d->GetSamplerState(USTEP_TIMING_STAGE, D3DSAMP_ADDRESSV, &tav);
+    float keepPSC[3][4];
+    memcpy(keepPSC[0], g_psc[USTEP_PS_TILES], sizeof(keepPSC));
+    float uvSel2[4]; memcpy(uvSel2, g_vsc[UV_SELECT_REG + 3], sizeof(uvSel2));
     const int NNS = sizeof(NORMAL_MAP_STAGES) / sizeof(NORMAL_MAP_STAGES[0]);
     IDirect3DBaseTexture9* keepNrm[NNS];
     for (int k = 0; k < NNS; k++) { keepNrm[k] = NULL; d->GetTexture(NORMAL_MAP_STAGES[k], &keepNrm[k]); if (!g_keepNormalMaps && flatNormal(d)) g_orgSTEX(d, NORMAL_MAP_STAGES[k], g_flatNormal); }
@@ -1255,12 +1304,16 @@ static HRESULT drawCustom(IDirect3DDevice9* d, int part) {
         // and shadow passes' VS read c176 as something else, and the kit subs
         // wrote far-plane depth into the depth pre-pass (02-10 rtdump: red and
         // white noise on the shirt and shorts; DoF blurred them, the sun flare
-        // shone through them), so other passes keep the game's c176.
+        // shone through them), so other passes keep the game's c176. Non-kit
+        // subs never inherit the colour pass's c176 either: the game leaves
+        // per-draw values there, not a pure selector (06-10, PES2013: (0.0787, 0)
+        // at BOILING WATER's run squeezed his 2048 sheet into its red top-left
+        // corner); their own UVs are TEXCOORD0.
         if ((S.flags & SUB_KIT) && g_runKitTex) {
             IDirect3DTexture9* hi = g_runKitOk && !g_kitForceOff ? hiKit(d, g_runTid, g_runSlot) : NULL;
             g_orgSTEX(d, 0, hi ? (IDirect3DBaseTexture9*)hi : g_runKitTex);
             g_orgSVSCF(d, UV_SELECT_REG, !colour ? uvSel : hi ? UV_SELECT_SET0 : UV_SELECT_SET1, 1);
-        } else g_orgSVSCF(d, UV_SELECT_REG, uvSel, 1);
+        } else g_orgSVSCF(d, UV_SELECT_REG, colour ? UV_SELECT_SET0 : uvSel, 1);
         // the material's own states (PES15 .mtl), never the kit draw's leftovers
         bool atest = (S.flags & SUB_ALPHATEST) != 0, blend = (S.flags & SUB_BLEND) != 0;
         bool hairCore = (S.flags & SUB_HAIR) && !g_noHairFringe;   // opaque core only, the fringe follows
@@ -1274,7 +1327,36 @@ static HRESULT drawCustom(IDirect3DDevice9* d, int part) {
         bool outline = (S.flags & SUB_OUTLINE) != 0;
         float bias = outline ? OUTLINE_DEPTH_BIAS : 0.0f, slope = outline ? OUTLINE_SLOPE_BIAS : 0.0f;
         g_orgRS(d, D3DRS_DEPTHBIAS, *(DWORD*)&bias); g_orgRS(d, D3DRS_SLOPESCALEDEPTHBIAS, *(DWORD*)&slope);
-        IDirect3DPixelShader9* ps = !colour ? gamePS : (S.flags & SUB_SHADELESS) && g_psShadeless ? g_psShadeless
+        // UVStep subs (colour pass only): the frame grid on s0, the timing
+        // texture on s2, the main UVs through TEXCOORD0 and the timing UVs
+        // through TEXCOORD1 (c176 = SET0, c179 = SET0 on .zw), the trailer
+        // params in c29/c30 and the real time in c31.
+        bool uvstep = colour && (S.flags & SUB_UVSTEP) && g_psUvstep
+                      && i < M.nustep && M.ustep[i].tileU && M.ustep[i].tileV && M.ustep[i].used;
+        if (uvstep) {
+            const UstepEntry& U = M.ustep[i];
+            static const float SET0_ZW[4] = { 0, 0, 1, 0 };   // o6.zw = TEXCOORD1 (c179.x * TC0 + c179.y * TC1)
+            g_orgSVSCF(d, UV_SELECT_REG + 3, SET0_ZW, 1);
+            d->SetSamplerState(USTEP_TIMING_STAGE, D3DSAMP_ADDRESSU, D3DTADDRESS_WRAP);
+            d->SetSamplerState(USTEP_TIMING_STAGE, D3DSAMP_ADDRESSV, D3DTADDRESS_WRAP);
+            g_orgSTEX(d, USTEP_TIMING_STAGE, U.timing < M.ntex ? M.tex[U.timing] : NULL);
+            float tiles[4] = { (float)U.tileU, (float)U.tileV, (float)U.used, (float)U.scale };
+            float timing[4] = { U.mode ? 1.0f : 0.0f, U.cycle, U.secU, U.secV };
+            // real time in seconds, not frames, reduced per period in double:
+            // seconds since boot (1e5+) as float32 step in ~0.01-0.03 s units
+            LARGE_INTEGER fr, now;
+            double secs = 0.0;
+            if (QueryPerformanceFrequency(&fr) && fr.QuadPart && QueryPerformanceCounter(&now))
+                secs = (double)now.QuadPart / (double)fr.QuadPart;
+            float time[4] = { U.cycle > 0 ? (float)fmod(secs, U.cycle) : 0.0f,
+                              U.secU > 0 ? (float)fmod(secs, U.secU) : 0.0f,
+                              U.secV > 0 ? (float)fmod(secs, U.secV) : 0.0f, 0.0f };
+            g_orgSPSCF(d, USTEP_PS_TILES, tiles, 1);
+            g_orgSPSCF(d, USTEP_PS_TIMING, timing, 1);
+            g_orgSPSCF(d, USTEP_PS_TIME, time, 1);
+        }
+        IDirect3DPixelShader9* ps = !colour ? gamePS : uvstep ? (S.flags & SUB_UVSTEP_LIT) && g_psUvstepLit ? g_psUvstepLit : g_psUvstep
+                                  : (S.flags & SUB_SHADELESS) && g_psShadeless ? g_psShadeless
                                   : (S.flags & SUB_TOON) && g_psToon ? g_psToon : gamePS;
         d->SetPixelShader(ps);
         hr = g_orgDIP(d, D3DPT_TRIANGLELIST, 0, 0, M.nv, S.first, S.count / 3);
@@ -1291,6 +1373,11 @@ static HRESULT drawCustom(IDirect3DDevice9* d, int part) {
     }
     d->SetPixelShader(gamePS); if (gamePS) gamePS->Release();
     for (int k = 0; k < NNS; k++) { g_orgSTEX(d, NORMAL_MAP_STAGES[k], keepNrm[k]); if (keepNrm[k]) keepNrm[k]->Release(); }
+    g_orgSPSCF(d, USTEP_PS_TILES, keepPSC[0], 3); memcpy(g_psc[USTEP_PS_TILES], keepPSC[0], sizeof(keepPSC));
+    g_orgSTEX(d, USTEP_TIMING_STAGE, keepTiming); if (keepTiming) keepTiming->Release();
+    d->SetSamplerState(USTEP_TIMING_STAGE, D3DSAMP_ADDRESSU, tau);
+    d->SetSamplerState(USTEP_TIMING_STAGE, D3DSAMP_ADDRESSV, tav);
+    g_orgSVSCF(d, UV_SELECT_REG + 3, uvSel2, 1);
     g_orgSVSCF(d, UV_SELECT_REG, uvSel, 1);
     g_orgRS(d, D3DRS_ALPHABLENDENABLE, ab); g_orgRS(d, D3DRS_SRCBLEND, sb); g_orgRS(d, D3DRS_DESTBLEND, db);
     g_orgRS(d, D3DRS_ZWRITEENABLE, zw);

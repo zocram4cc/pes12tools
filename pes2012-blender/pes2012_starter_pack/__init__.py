@@ -30,7 +30,7 @@ import sys
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import bpy  # noqa: E402
-from bpy.props import BoolProperty, EnumProperty, IntProperty, StringProperty  # noqa: E402
+from bpy.props import BoolProperty, EnumProperty, FloatProperty, IntProperty, StringProperty  # noqa: E402
 from bpy_extras.io_utils import ExportHelper, ImportHelper  # noqa: E402
 
 from . import blender_io, container, ktmdl_write, model, pgb2, skeleton, stadium, textures  # noqa: E402
@@ -138,26 +138,69 @@ def import_bin(context, filepath):
 
 def _export_container(c, objs, imgs, entry):
     """Apply Blender edits to container c: the packets of objs ({block:
-    {packet: obj}}) and the changed images among imgs that live in this
-    entry (TEX_ENTRY_PROP)."""
+    {packet: [obj]}}, every object of a packet merged into it) and the
+    changed images among imgs that live in this entry (TEX_ENTRY_PROP)."""
     for k, packets in objs.items():
         b = c.blocks[k]
         m = model.read(b.data)
         sk = skeleton.build_one('b%d' % k, m.parsed)
-        rows = [model.export_packet(b.data, i, *blender_io.read_corners(o, sk))
-                for i, o in sorted(packets.items())]
-        b.data = ktmdl_write.build(b.data, rows)
+        rows = []
+        for i, group in sorted(packets.items()):
+            corners, tris = [], []
+            for o in group:
+                cs, ts = blender_io.read_corners(o, sk)
+                tris += [tuple(x + len(corners) for x in t) for t in ts]
+                corners += cs
+            rows.append(model.export_packet(b.data, i, corners, tris))
+        new = ktmdl_write.build(b.data, rows)
+        # a block whose packets all carry their old vertices and indices keeps
+        # its bytes: build() re-lays-out blocks the CLI installer wrote (09-10,
+        # Final PEStination: 19 of 32 untouched blocks came back 16-32 B longer)
+        if any(ktmdl_write.packet_mesh(new, i) != ktmdl_write.packet_mesh(b.data, i)
+               for i in range(len(m.parsed['packets']))):
+            b.data = new
     for img in imgs:
         if int(img.get(TEX_ENTRY_PROP, -1)) == entry and blender_io.image_changed(img):
             k = int(img[blender_io.TEX_BLOCK_PROP])
             c.blocks[k].data = textures.encode(c.blocks[k].data, blender_io.image_rgba(img))
 
 
+def _object_images(o):
+    """The images o's materials show (image texture nodes)."""
+    out = []
+    for slot in getattr(o, 'material_slots', ()):
+        nt = slot.material.node_tree if slot.material and slot.material.use_nodes else None
+        out += [n.image for n in (nt.nodes if nt else ()) if getattr(n, 'image', None) is not None]
+    return out
+
+
 def _packet_objects(col):
-    objs = {}
+    """{block: {packet: [objects]}}. Imported packet objects (and copies of
+    them, which carry the same tags) go to their packet; a new mesh object
+    joins the packet whose texture its material shows, sampling that texture
+    through its own UV0. Objects hidden from render are left out (reference
+    meshes); any other object with no packet to join is an error, never
+    silently dropped."""
+    objs, extras = {}, []
     for o in col.all_objects:
-        if o.type == 'MESH' and BLOCK_PROP in o and PACKET_PROP in o:
-            objs.setdefault(int(o[BLOCK_PROP]), {})[int(o[PACKET_PROP])] = o
+        if o.type != 'MESH' or o.hide_render:
+            continue
+        if BLOCK_PROP in o and PACKET_PROP in o:
+            objs.setdefault(int(o[BLOCK_PROP]), {}).setdefault(int(o[PACKET_PROP]), []).append(o)
+        else:
+            extras.append(o)
+    by_image = {}
+    for k, packets in sorted(objs.items()):
+        for i, group in sorted(packets.items()):
+            for img in _object_images(group[0]):
+                by_image.setdefault(img.name, (k, i))
+    for o in extras:
+        hit = next((by_image[img.name] for img in _object_images(o) if img.name in by_image), None)
+        if hit is None:
+            raise ValueError('%s: a new object joins the packet whose texture it shows; give its material '
+                             'one of the imported images (Image > Replace swaps in your own picture), '
+                             'or hide it from render to leave it out' % o.name)
+        objs[hit[0]][hit[1]].append(o)
     return objs
 
 
@@ -183,9 +226,10 @@ def _collection_images(col):
 def export_bin(col, filepath):
     """Collection from import_bin -> BIN at filepath, byte-exact where the
     user changed nothing. A packet whose mesh object was deleted keeps its
-    stock data; extra objects are ignored (one object per packet). Images
-    painted since import go back into their blocks; untouched ones keep
-    their bytes (DXT re-encoding is lossy)."""
+    stock data; new objects join the packet whose texture they show
+    (_packet_objects). Images painted or replaced since import go back into
+    their blocks, resampled to the block's size; untouched ones keep their
+    bytes (DXT re-encoding is lossy)."""
     src = col.get(SOURCE_PROP)
     if not src or not os.path.exists(src):
         raise ValueError('collection %s was not imported from a PES2012 BIN' % col.name)
@@ -257,8 +301,9 @@ def import_slot(context, game, number, root=None):
                     free.append(img.name)
     if free:
         col[TEX_IMAGES_PROP] = free
+    from . import crowd
+    crowd.import_slot(context, col, stadium.read_raw(game, s.geometry + stadium.SLOT_STRIDE, root))
     return col, n
-
 
 def export_slot(col, root):
     """Slot collection -> afs2fs overrides in root (kitserver/4cc-dlc) for
@@ -284,6 +329,10 @@ def export_slot(col, root):
         p = stadium.write_raw(game, root, e, container.write(c))
         if p:
             out.append(p)
+    from . import crowd
+    p = crowd.export_slot(col, game, root, src_root)
+    if p:
+        out.append(p)
     return out
 
 
@@ -355,6 +404,20 @@ FLAG_PROPS = (
     ('pgb2_hand_l', pgb2.SUB_HAND_L, 'Left-hand part (bit 19)'),
     ('pgb2_hand_r', pgb2.SUB_HAND_R, 'Right-hand part (bit 20)'),
     ('pgb2_hand_rig', pgb2.SUB_HAND_RIG, 'Hand-rig copy: hand-local verts on hand_<side>_XX (bit 21)'),
+    ('pgb2_uvstep', pgb2.SUB_UVSTEP, 'UVStep frame-grid animation (bit 22)'),
+    ('pgb2_uvstep_lit', pgb2.SUB_UVSTEP_LIT, 'UVStep lit variant, toon lighting (bit 23)'),
+)
+# material property -> (default, min, max, description): the UVStep trailer
+# entry (tools/uvstep.py). pgb2_uvstep_tex is the timing texture slot
+# (body_<k>, 255 = uniform mode with no timing texture); pgb2_uvstep_uv is
+# the timing UV map (UV1 carries it; UV0 stays the main UVs).
+UVSTEP_PROPS = (
+    ('pgb2_uvstep_tiles_u', 1, 1, 255, 'Tiles across the frame grid (Tile_Count_U)'),
+    ('pgb2_uvstep_tiles_v', 1, 1, 255, 'Tiles down the frame grid (Tile_Count_V)'),
+    ('pgb2_uvstep_used', 1, 1, 65025, 'Frames played (Tiles_Used, <= U*V)'),
+    ('pgb2_uvstep_cycle', 1.0, 0.0, 3600.0, 'Uniform mode: whole-cycle seconds (0 = stay on frame 0)'),
+    ('pgb2_uvstep_sec_u', 0.0, 0.0, 3600.0, 'Timing mode: seconds to scroll the timing texture left to right (0 = no motion)'),
+    ('pgb2_uvstep_sec_v', 0.0, 0.0, 3600.0, 'Timing mode: seconds to scroll the timing texture top to bottom (0 = no motion)'),
 )
 
 
@@ -370,6 +433,40 @@ def _ensure_props():
     for name, bit, desc in FLAG_PROPS:
         if not hasattr(bpy.types.Material, name):
             setattr(bpy.types.Material, name, BoolProperty(name=name, default=False, description=desc))
+    for name, default, vmin, vmax, desc in UVSTEP_PROPS:
+        if not hasattr(bpy.types.Material, name):
+            prop = IntProperty if isinstance(default, int) else FloatProperty
+            setattr(bpy.types.Material, name, prop(
+                name=name, default=default, min=vmin, max=vmax, description=desc))
+    if not hasattr(bpy.types.Material, 'pgb2_uvstep_tex'):
+        bpy.types.Material.pgb2_uvstep_tex = IntProperty(
+            name='Timing texture slot', default=255, min=0, max=255,
+            description='Timing texture body_<k> (255 = uniform mode, no timing texture)')
+    if not hasattr(bpy.types.Material, 'pgb2_uvstep_uv'):
+        bpy.types.Material.pgb2_uvstep_uv = StringProperty(
+            name='Timing UV map', default='UV1',
+            description='UV map carried on UV1 as the timing UVs (UV0 stays the main UVs)')
+    if not hasattr(bpy.types.Material, 'pgb2_uvstep_scale'):
+        bpy.types.Material.pgb2_uvstep_scale = BoolProperty(
+            name='Scale UVs to tiles', default=False,
+            description='Main UVs span the whole texture and shrink into one tile (else they sit in the top-left tile)')
+
+
+def _mat_ustep(mat, mi, subs):
+    """Material UVStep props -> pgb2 trailer params, or None (not a UVStep
+    sub, or the grid is degenerate). Timing mode = a slot below 255."""
+    if not getattr(mat, 'pgb2_uvstep', False):
+        return None
+    tu = max(1, int(getattr(mat, 'pgb2_uvstep_tiles_u', 1)))
+    tv = max(1, int(getattr(mat, 'pgb2_uvstep_tiles_v', 1)))
+    used = max(1, min(tu * tv, int(getattr(mat, 'pgb2_uvstep_used', 1))))
+    ttex = int(getattr(mat, 'pgb2_uvstep_tex', 255))
+    return dict(tile_u=tu, tile_v=tv, tiles_used=used,
+                use_timing=ttex != pgb2.USTP_NO_TIMING_TEX,
+                sec_cycle=float(getattr(mat, 'pgb2_uvstep_cycle', 0.0)),
+                sec_u=float(getattr(mat, 'pgb2_uvstep_sec_u', 0.0)),
+                sec_v=float(getattr(mat, 'pgb2_uvstep_sec_v', 0.0)),
+                timing_tex=ttex, scale=bool(getattr(mat, 'pgb2_uvstep_scale', False)))
 
 
 def _mat_flags(mat):
@@ -435,7 +532,8 @@ def import_body(context, filepath):
             obj.vertex_groups[name].add([vi], w, 'REPLACE')
     obj.pgb2_keep = {n for i, n in enumerate(pgb2.PIECES) if parsed['keep'] >> i & 1}
     obj['pgb2_source'] = os.path.abspath(filepath)
-    obj['pgb2_trailer'] = parsed['trailer'].hex()   # the HRIG hand joints, written back on export
+    obj['pgb2_trailer'] = pgb2.strip_ustep(parsed['trailer']).hex()   # the HRIG hand joints, written back on export
+    ustep = pgb2.parse_ustep(parsed['trailer'])
     for mi, s in enumerate(parsed['subs']):
         mat = bpy.data.materials.new('%s_sub%d' % (stem, mi))
         obj.data.materials.append(mat)
@@ -443,6 +541,16 @@ def import_body(context, filepath):
             setattr(mat, key, bool(s['flags'] & bit))
         mat.pgb2_alpha_ref = (s['flags'] >> pgb2.SUB_REF_SHIFT) & 0xFF
         mat['pgb2_tex'] = s['tex']
+        if mi in ustep:
+            p = ustep[mi]
+            mat.pgb2_uvstep_tiles_u = p['tile_u']
+            mat.pgb2_uvstep_tiles_v = p['tile_v']
+            mat.pgb2_uvstep_used = p['tiles_used']
+            mat.pgb2_uvstep_cycle = p['sec_cycle']
+            mat.pgb2_uvstep_sec_u = p['sec_u']
+            mat.pgb2_uvstep_sec_v = p['sec_v']
+            mat.pgb2_uvstep_tex = p['timing_tex']
+            mat.pgb2_uvstep_scale = p['scale']
     # polygon k belongs to the submesh whose index range holds it
     tri_no = 0
     for mi, s in enumerate(parsed['subs']):
@@ -519,17 +627,19 @@ def export_body(filepath, obj):
             corners.append(key)
         tri_by_mat.setdefault(t.material_index, []).append(tuple(corners))
     mats = list(obj.data.materials)
-    mat_flags, mat_tex, mat_face = {}, {}, {}
+    mat_flags, mat_tex, mat_face, mat_ustep = {}, {}, {}, {}
     for mi, mat in enumerate(mats):
         if mat is None:
             continue
         mat_flags[mi] = _mat_flags(mat)
         mat_tex[mi] = int(mat['pgb2_tex']) if 'pgb2_tex' in mat else 0
         mat_face[mi] = bool(mat.pgb2_face)
+        mat_ustep[mi] = _mat_ustep(mat, mi, None)
     keep = sum(1 << pgb2.PIECES.index(n) for n in obj.pgb2_keep)
     open(filepath, 'wb').write(pgb2.pack_body(
         {mi: tris for mi, tris in tri_by_mat.items() if tris},
-        vert_data, mat_flags, mat_tex, mat_face, keep, bytes.fromhex(obj.get('pgb2_trailer', ''))))
+        vert_data, mat_flags, mat_tex, mat_face, keep, bytes.fromhex(obj.get('pgb2_trailer', '')),
+        mat_ustep))
     return sum(len(t) for t in tri_by_mat.values())
 
 
