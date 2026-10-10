@@ -1738,18 +1738,21 @@ static HRESULT drawCustom(IDirect3DDevice9* d, int part) {
     g_orgSSS(d, 0, keepVB, keepOff, keepSt);
     return hr;
 }
-// The caster VS samples no texture alpha, so an alpha-tested or blended card
-// would shadow as its whole quad (Coscom p271109: every sub alpha-tested;
-// Derpy Hooves p273601: wings are blended cards, a bar across the shoulders).
-static const DWORD CASTER_SKIP_SUBS = SUB_ALPHATEST | SUB_BLEND;
-static void casterSubs(IDirect3DDevice9* d, const CustomModel& M, int part) {
+// The caster VS samples no texture alpha, so a blended card shadows as its
+// whole quad (Derpy Hooves p273601: blended wings, a bar across the
+// shoulders): blended subs are left out when the body has other subs to cast;
+// a body blended throughout (all of /vt/) casts everything. Alpha-tested subs
+// always cast: converted PES materials flag nearly every body part
+// alpha-tested, and leaving them out sent every full-body player of /cgl/
+// and /his/ back to the stock shadow (10-10, owner).
+static void casterSubs(IDirect3DDevice9* d, const CustomModel& M, int part, DWORD skip) {
     for (UINT i = 0; i < M.nsub; i++)
-        if (subInPart(M, M.sub[i], part) && M.sub[i].count && !(M.sub[i].flags & CASTER_SKIP_SUBS))
+        if (subInPart(M, M.sub[i], part) && M.sub[i].count && !(M.sub[i].flags & skip))
             g_orgDIP(d, D3DPT_TRIANGLELIST, 0, 0, M.nv, M.sub[i].first, M.sub[i].count / 3);
 }
-static bool casterOpaqueBody(const CustomModel& M, int part) {
+static bool hasUnblendedBody(const CustomModel& M) {
     for (UINT i = 0; i < M.nsub; i++)
-        if (subInPart(M, M.sub[i], part) && M.sub[i].count && !(M.sub[i].flags & CASTER_SKIP_SUBS)) return true;
+        if (subInPart(M, M.sub[i], DRAW_BODY) && M.sub[i].count && !(M.sub[i].flags & SUB_BLEND)) return true;
     return false;
 }
 static bool casterCustom(IDirect3DDevice9* d) {
@@ -1766,10 +1769,7 @@ static bool casterCustom(IDirect3DDevice9* d) {
     casterBones(*M, c);
     IDirect3DVertexDeclaration9* cdec = casterDecl();
     if (!M->blob || !M->ib || !M->nsub || !cdec) return false;
-    // A fully cutout body has no opaque sub to pose: leave the stock caster
-    // to draw (humanoid shadow) instead of consuming its draw here. Returning
-    // false before touching device state keeps the stock fallthrough intact.
-    if (!casterOpaqueBody(*M, DRAW_BODY)) return false;
+    const DWORD skip = hasUnblendedBody(*M) ? SUB_BLEND : 0;
     float keep[FACE_SLOTS * BONE_REGS][4];
     memcpy(keep, g_vsc[BONE_REG0], sizeof(keep));
     IDirect3DVertexBuffer9* keepVB = g_vb; UINT keepOff = g_vbOff, keepSt = g_stride;
@@ -1777,18 +1777,18 @@ static bool casterCustom(IDirect3DDevice9* d) {
     IDirect3DVertexDeclaration9* keepDecl = NULL; d->GetVertexDeclaration(&keepDecl);
     g_orgSSS(d, 0, M->blob, 0, CASTER_STRIDE); g_orgSI(d, M->ib); g_orgSVD(d, cdec);
     g_orgSVSCF(d, BONE_REG0, &c[0][0], CU_SLOTS * BONE_REGS);
-    casterSubs(d, *M, DRAW_BODY);
+    casterSubs(d, *M, DRAW_BODY, skip);
     for (int s = 0; s < 2; s++) {
         if (!handPosed(*M, s)) continue;
         float pal[HAND_RIG_BONES * BONE_REGS][4];
         handPalette(*M, s, &c[(s ? SLOT_HAND_R : SLOT_HAND_L) * BONE_REGS], pal);
         g_orgSVSCF(d, BONE_REG0, &pal[0][0], HAND_RIG_BONES * BONE_REGS);
-        casterSubs(d, *M, DRAW_HAND_L + s);
+        casterSubs(d, *M, DRAW_HAND_L + s, skip);
     }
     float f[FACE_SLOTS * BONE_REGS][4];
     faceRigidPalette(c, f);
     g_orgSVSCF(d, BONE_REG0, &f[0][0], FACE_SLOTS * BONE_REGS);
-    casterSubs(d, *M, DRAW_FACE);
+    casterSubs(d, *M, DRAW_FACE, skip);
     g_orgSVSCF(d, BONE_REG0, &keep[0][0], FACE_SLOTS * BONE_REGS);
     g_orgSSS(d, 0, keepVB, keepOff, keepSt); g_orgSI(d, keepIB);
     g_orgSVD(d, keepDecl); if (keepDecl) keepDecl->Release();
