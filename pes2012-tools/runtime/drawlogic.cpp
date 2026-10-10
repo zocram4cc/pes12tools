@@ -83,7 +83,11 @@ static const UINT KIT_MAIN_NV = 696, KIT_MAIN_NP = 1929, KIT_MAIN_STRIDE = 72;
 // stock detail hands/boots, drawn apart from the kit run (30-09 grab)
 static const UINT DETAIL_HANDS_NV = 466, DETAIL_HANDS_NP = 565;        // both hands, stride 68
 static const UINT DETAIL_BOOTS_NV = 930, DETAIL_BOOTS_NP = 1907;       // both feet, stride 64
-static const UINT DETAIL_BOOT_NV = 228, DETAIL_BOOT_L_NP = 579, DETAIL_BOOT_R_NP = 573;   // one foot each, stride 68
+// keeper gloves, one per hand, stride 68: hand-local like the bare hands
+// (10-10 replay, /mlp/ keeper Derpy Hooves: x 0.002..0.172 m left, mirrored
+// right, y -0.07..0.02) - drawn only in keepers' runs. Classed as boots until
+// 10-10, they were matched against feet and stayed stock on every keeper.
+static const UINT DETAIL_GK_GLOVE_STRIDE = 68, DETAIL_GK_GLOVE_NV = 228, DETAIL_GK_GLOVE_L_NP = 579, DETAIL_GK_GLOVE_R_NP = 573;
 // The bare hands and keeper gloves (dt0d.img #589 blocks 2-5, 02-10: bytes =
 // the in-game draw), one per hand, each on its own 12-bone hand rig (wrist
 // root, 3-bone thumb, 2 bones per finger); they draw beside the boots, before
@@ -94,9 +98,19 @@ static const UINT DETAIL_GLOVE_STRIDE = 72, DETAIL_GLOVE_NV = 293, DETAIL_GLOVE_
 // any of its first palette slots (#589: slot 0 for the right hand, slot 2
 // for the left), so ownership takes the nearest of them.
 static const UINT DETAIL_RIG_BONES = 12;
-// owner match: 30-09 replay, hidden players' boots sat 0.17-0.33 m from their
-// projected feet, every other player's 3 m or more
-static const float DETAIL_OWNER_MAX_M = 0.5f;
+// after removing c16/c17 focal scale: 0.073 m max own / 0.172 m min other
+// (30-09 captures, sx 4.5..17.4); midpoint keeps both classes separate
+static const float DETAIL_OWNER_MAX_M = 0.15f;
+// the same player's record from last frame, same projection: one frame of his
+// motion away (10-10 broadcast, /his/ v /mlp/: 0-225 mm, sprinters past the
+// 150 mm above - Tiktaalik's stock boots showing, stock-bodied players losing
+// theirs). Taken only when no other player's record is within
+// CASTER_UNIQUE_RATIO of it. Provisional: re-measure with faster play.
+static const float DETAIL_PREV_FRAME_M = 0.35f;
+// second tier: records from another camera position, where view-space metres
+// carry the camera's motion between frames; still tighter than the 3 m that
+// separates players on the pitch
+static const float DETAIL_OWNER_LOOSE_M = 1.0f;
 static const UINT BONE_REG0 = 20;
 // Adboards: the board faces sample the DoubleFusion ad sheet (1024x512
 // A8R8G8B8, a 4x8 grid of 256x64 ads, built at runtime; no file in the game
@@ -309,6 +323,40 @@ static const DWORD SUB_HAND_SIDE[2] = { SUB_HAND_L, SUB_HAND_R };
 static const DWORD HRIG_MAGIC = 0x47495248;   // 'HRIG'
 static const UINT HAND_RIG_BONES = 12;        // dt0d #589's hand rig (pes12_rig.hand_rig)
 static const UINT HRIG_SIDE_BYTES = HAND_RIG_BONES * (1 + 1 + 3 * sizeof(float));
+// The stock hand's idle pose: each rig bone's rotation relative to the rig
+// root (handRel) in the game's canonical resting hand, by rig bone. The most
+// frequent pose of 40 live captures (09-10: /g/ 272106 and 272109, both
+// sides; left and right mirror to 0.0002). A model's rig copy is authored
+// relaxed, so it is drawn as authored at this pose and turned by the stock
+// bones' change from it (handPalette). Owner's choice, 09-10: copying the
+// stock angles outright (tried) made long-fingered hands into lumpy fists
+// with the thumb out; the stock change from its BIND (the original) twisted
+// them, the authored rest being 10-30 deg off that bind.
+static const float STOCK_HAND_IDLE[2][HAND_RIG_BONES][3][3] = {
+    { { {1.00000f, -0.00000f, -0.00000f}, {0.00000f, 1.00000f, -0.00000f}, {-0.00000f, -0.00000f, 1.00000f} },
+      { {0.98327f, -0.12194f, 0.13534f}, {0.13729f, 0.98435f, -0.11052f}, {-0.11975f, 0.12725f, 0.98462f} },
+      { {0.95795f, 0.27965f, 0.06426f}, {-0.27881f, 0.96010f, -0.02183f}, {-0.06780f, 0.00300f, 0.99769f} },
+      { {0.99669f, 0.00554f, 0.08106f}, {-0.01375f, 0.99478f, 0.10108f}, {-0.08008f, -0.10186f, 0.99157f} },
+      { {0.95810f, 0.25978f, 0.12070f}, {-0.28200f, 0.92939f, 0.23813f}, {-0.05032f, -0.26218f, 0.96370f} },
+      { {0.98221f, 0.13415f, 0.13140f}, {-0.17042f, 0.93065f, 0.32380f}, {-0.07885f, -0.34043f, 0.93696f} },
+      { {0.91790f, -0.29436f, 0.26609f}, {0.22268f, 0.93716f, 0.26859f}, {-0.32843f, -0.18729f, 0.92577f} },
+      { {0.87640f, 0.48156f, 0.00540f}, {-0.48124f, 0.87529f, 0.04764f}, {0.01821f, -0.04435f, 0.99885f} },
+      { {0.87406f, 0.47925f, 0.07960f}, {-0.48545f, 0.86793f, 0.10503f}, {-0.01875f, -0.13044f, 0.99128f} },
+      { {0.89223f, 0.42395f, 0.15556f}, {-0.44655f, 0.87959f, 0.16409f}, {-0.06726f, -0.21587f, 0.97410f} },
+      { {0.92362f, 0.32323f, 0.20600f}, {-0.35543f, 0.92344f, 0.14465f}, {-0.14348f, -0.20682f, 0.96780f} },
+      { {0.78723f, -0.20532f, 0.58147f}, {0.11042f, 0.97464f, 0.19465f}, {-0.60669f, -0.08902f, 0.78994f} } },
+    { { {1.00000f, 0.00000f, -0.00000f}, {-0.00000f, 1.00000f, -0.00000f}, {0.00000f, -0.00000f, 1.00000f} },
+      { {0.98328f, 0.12189f, -0.13531f}, {-0.13723f, 0.98435f, -0.11054f}, {0.11972f, 0.12726f, 0.98462f} },
+      { {0.95793f, -0.27970f, -0.06425f}, {0.27887f, 0.96008f, -0.02173f}, {0.06776f, 0.00290f, 0.99770f} },
+      { {0.99669f, -0.00554f, -0.08110f}, {0.01375f, 0.99479f, 0.10104f}, {0.08012f, -0.10182f, 0.99157f} },
+      { {0.95808f, -0.25983f, -0.12070f}, {0.28205f, 0.92938f, 0.23810f}, {0.05031f, -0.26217f, 0.96371f} },
+      { {0.98220f, -0.13411f, -0.13150f}, {0.17043f, 0.93063f, 0.32386f}, {0.07894f, -0.34051f, 0.93692f} },
+      { {0.91790f, 0.29431f, -0.26615f}, {-0.22264f, 0.93719f, 0.26853f}, {0.32846f, -0.18723f, 0.92577f} },
+      { {0.87639f, -0.48157f, -0.00542f}, {0.48125f, 0.87528f, 0.04779f}, {-0.01827f, -0.04449f, 0.99884f} },
+      { {0.87402f, -0.47932f, -0.07965f}, {0.48552f, 0.86789f, 0.10503f}, {0.01879f, -0.13047f, 0.99127f} },
+      { {0.89220f, -0.42401f, -0.15553f}, {0.44660f, 0.87955f, 0.16414f}, {0.06720f, -0.21590f, 0.97410f} },
+      { {0.92362f, -0.32317f, -0.20613f}, {0.35542f, 0.92343f, 0.14476f}, {0.14357f, -0.20696f, 0.96776f} },
+      { {0.78717f, 0.20522f, -0.58160f}, {-0.11036f, 0.97466f, 0.19455f}, {0.60679f, -0.08896f, 0.78987f} } } };
 // which submeshes a drawCustom call draws
 enum { DRAW_BODY, DRAW_FACE, DRAW_HAND_L, DRAW_HAND_R };
 // UVStep frame grids (tools/uvstep.py USTP trailer; custom_ps.hlsl uvstep/uvstep_lit).
@@ -363,6 +411,7 @@ static LONG g_cuLo = -1, g_cuHi = -1;           // body occurrences drawn as cus
 struct CustomSub { UINT first, count, tex, flags; };
 struct UstepEntry { BYTE tileU, tileV, used, mode; float cycle, secU, secV; BYTE timing, scale, rsv0, rsv1; };
 static const int MAX_SUBS = 64, MAX_TEXS = 64;
+static const int PASS_BONES_N = 4;   // passes that draw players in a frame (runlog 09-10)
 struct CustomModel {
     char name[32];
     IDirect3DVertexBuffer9* vb; IDirect3DIndexBuffer9* ib;
@@ -374,11 +423,22 @@ struct CustomModel {
     BYTE hrigBone[2][HAND_RIG_BONES];            // HRIG trailer: palette slot -> rig bone
     signed char hrigParent[2][HAND_RIG_BONES];   // rig bone -> parent (-1: the wrist root)
     float hrigJoint[2][HAND_RIG_BONES][3];       // the model's joints, hand-local, by rig bone
-    bool handCaught[2];                          // its stock hand drew this frame: handRel holds the pose
+    LONG handFrame[2];                           // frame its stock hand last drew: handRel holds that pose
     float handRel[2][HAND_RIG_BONES * BONE_REGS][4];   // each palette slot relative to the rig root
     LONG pid, lastUsed;                          // resident-cache key, frame of last use
+    IDirect3DVertexBuffer9* blob;                 // our vertices in the shadow caster's format (09-10)
+    // the 21-slot block of his last draws, one per pass (pass = the kit VS):
+    // the shadow caster draws him on the one in its own space (casterBones)
+    struct PassBones { DWORD pass; LONG frame; float c[CU_SLOTS * BONE_REGS][4]; } passBones[PASS_BONES_N];
     float minY;                                  // lowest vertex (m): does it stand on its own
 };
+// A rig hand is posed while its stock hand drew this frame or the last. The
+// depth and shadow passes draw the body without a stock hand of their own:
+// counting only the pass's own capture drew the rigid fallback (PES21's
+// relaxed hand, thumb out) there, a shadow unlike its hand (09-10).
+static const LONG HAND_POSE_MAX_AGE_FRAMES = 1;
+static const LONG HAND_POSE_NEVER = -0x40000000;
+static bool handPosed(const CustomModel& M, int side) { return g_frame - M.handFrame[side] <= HAND_POSE_MAX_AGE_FRAMES; }
 // Bodies are keyed by player id (the face marker IS the pid, tools/mark_face.py)
 // and hot-loaded from custom\p<pid>\ on first draw; the cache holds this many
 // and evicts the least recently drawn. Two teams' starters (22) plus menu and
@@ -696,31 +756,206 @@ static IDirect3DTexture9* hiKit(IDirect3DDevice9* d, int tid, const wchar_t* slo
     return t;
 }
 
-// ---- identity outside the colour pass. A frame draws every player four
-// times (26-09 grab): depth pre-pass (cutscene depth of field reads it),
-// two shadow passes, colour pass last. Only the colour pass's skin draw
-// samples the per-player face atlas carrying the marker, so without this the
-// depth pass drew every custom player as the stock body and the DoF focused
-// on the stock head (box heads blurred round a sharp head-sized disk). The
-// depth and colour passes upload identical bone matrices, so a player's key
-// is his palette slot 0 translation at the skin draw: the colour pass records
-// key -> model, the next frame's depth pass looks it up.
-static const int MAX_KEYS = 64;
+// ---- identity outside the colour pass. A frame draws every player in
+// several passes: a light-view shadow pass, a per-player shadow pass (its
+// projection c16-c19 is refitted for every player), on some stadiums a depth
+// pre-pass (cutscene depth of field reads it), colour pass last. Only the
+// colour pass's skin draw samples the per-player face atlas carrying the
+// marker; without this the other passes drew the stock body (box heads
+// blurred round a stock head; the stock player's shadow under custom models,
+// owner 09-10). Each pass uploads its bones in its OWN space (09-10 runlog,
+// Karasuno: colour keys z -59..-30, light-view keys y 80..105, per-player
+// keys x -62..-33), so keys only compare within one pass - a pass being its
+// vertex shader. A player's pose does not depend on the space: the distances
+// between his own bones are the same in every pass of a frame. So at frame
+// end every non-colour skin draw takes the model of the colour skin draw with
+// the same pose signature, and the next frame looks its key up among the
+// same pass's labelled keys.
+static const int MAX_OBS = 160;                  // skin draws per frame: ~23 players x up to 4 passes, plus officials
 static const float KEY_MATCH_DIST = 0.25f;      // metres moved per frame, well above a sprint (~0.15)
-struct PlayerKey { float p[3]; LONG model; };   // model = pid
-static PlayerKey g_keyCur[MAX_KEYS], g_keyPrev[MAX_KEYS]; static int g_nKeyCur = 0, g_nKeyPrev = 0;
+static const float POSE_MATCH_DIST = 0.01f;     // same frame, same skeleton: equal up to float rounding (model units, metres)
+static const UINT SIG_HAND_SLOT_A = 9, SIG_HAND_SLOT_B = 17;   // the skin palette's hands (02-10 grab, see skinWithoutHands)
+// The pose signature: both hands' translations in the root bone's frame,
+// inv(B0) * Bk. A pass maps every bone by one affine M (Bk' = M Bk), which
+// cancels here; distances between bones did not survive the per-player
+// shadow pass, whose space is non-uniformly scaled (09-10 runlog).
+static const int SIG_N = 6;
+struct SkinObs { DWORD pass; float key[3], sig[SIG_N], alt[2][3], foot[2][3]; LONG model; bool marked, anchored; };
+static SkinObs g_obsCur[MAX_OBS], g_obsPrev[MAX_OBS]; static int g_nObsCur = 0, g_nObsPrev = 0;
 static void runKey(float out[3]) { for (int c = 0; c < 3; c++) out[c] = g_vsc[BONE_REG0 + c][3]; }
-static LONG modelForKey(const float k[3]) {
-    int best = -1; float bd = KEY_MATCH_DIST * KEY_MATCH_DIST;
-    for (int i = 0; i < g_nKeyPrev; i++) {
-        float d = 0; for (int c = 0; c < 3; c++) { float e = g_keyPrev[i].p[c] - k[c]; d += e * e; }
-        if (d < bd) { bd = d; best = g_keyPrev[i].model; }
+static void affMul(const float (*A)[4], const float (*B)[4], float (*O)[4]);
+static void affInv(const float (*M)[4], float (*O)[4]);
+static void poseSig(float* sig) {
+    float inv[3][4], rel[3][4]; affInv(&g_vsc[BONE_REG0], inv);
+    const UINT slots[2] = { SIG_HAND_SLOT_A, SIG_HAND_SLOT_B };
+    for (int s = 0; s < 2; s++) {
+        affMul(inv, &g_vsc[BONE_REG0 + slots[s] * BONE_REGS], rel);
+        for (int c = 0; c < 3; c++) sig[s * 3 + c] = rel[c][3];
+    }
+}
+// The shadow caster uploads the same player's palette, in this slot order for
+// the skin's (measured 09-10, one frame, both passes: the caster's slot 4 held
+// the skin's slot 11 translation, its slot 17 the skin's slot 3 - identical
+// numbers). So the caster's slots 4/17 identify the player exactly, against the
+// skin's slots 11/3 recorded here.
+static const UINT CASTER_SLOT_A = 4, SKIN_SLOT_A = 11, CASTER_SLOT_B = 17, SKIN_SLOT_B = 3;
+static void recordSkin(DWORD pass, const float key[3], LONG model, bool marked, bool anchored) {
+    if (g_nObsCur == MAX_OBS) return;
+    SkinObs& o = g_obsCur[g_nObsCur++];
+    o.pass = pass; memcpy(o.key, key, sizeof(o.key)); o.model = model; o.marked = marked; o.anchored = anchored;
+    const UINT sl[2] = { SKIN_SLOT_A, SKIN_SLOT_B };
+    for (int a = 0; a < 2; a++)
+        for (int c = 0; c < 3; c++) o.alt[a][c] = g_vsc[BONE_REG0 + sl[a] * BONE_REGS + c][3];
+    poseSig(o.sig);
+}
+static void labelByPose() {
+    for (int i = 0; i < g_nObsCur; i++) {
+        SkinObs& o = g_obsCur[i];
+        if (o.marked) { o.anchored = o.model >= 0; continue; }
+        float bd = POSE_MATCH_DIST * POSE_MATCH_DIST; LONG best = -1;
+        for (int j = 0; j < g_nObsCur; j++) {
+            const SkinObs& c = g_obsCur[j];
+            if (!c.marked || c.pass == o.pass) continue;
+            float d = 0; for (int s = 0; s < SIG_N; s++) { float e = c.sig[s] - o.sig[s]; d += e * e; }
+            if (d < bd) { bd = d; best = c.model; }
+        }
+        o.model = best; o.anchored = best >= 0;
+    }
+    memcpy(g_obsPrev, g_obsCur, sizeof(g_obsCur)); g_nObsPrev = g_nObsCur; g_nObsCur = 0;
+}
+static LONG modelForKey(DWORD pass, const float k[3]) {
+    LONG best = -1; float bd = KEY_MATCH_DIST * KEY_MATCH_DIST;
+    for (int i = 0; i < g_nObsPrev; i++) {
+        if (g_obsPrev[i].pass != pass || g_obsPrev[i].model < 0 || !g_obsPrev[i].anchored) continue;
+        float d = 0; for (int c = 0; c < 3; c++) { float e = g_obsPrev[i].key[c] - k[c]; d += e * e; }
+        if (d < bd) { bd = d; best = g_obsPrev[i].model; }
     }
     return best;
 }
 
+// ---- the ground shadow caster. The game casts every player's shadow from ONE
+// shared low-poly mesh (471 v, stride 32, single-bone), drawn once per player
+// with that player's own bone palette into the shadow target (09-10 census:
+// nV=471/nP=1491, one shared buffer, first vertex at chest height, 12+ draws
+// per frame; its placement keys matched the same-frame skin keys to 1-2 m).
+// Its vertex layout (its declaration, captured live):
+static const UINT CASTER_NV = 471, CASTER_STRIDE = 32;
+static const UINT CASTER_POS_OFF = 0, CASTER_W_OFF = 12, CASTER_SL_OFF = 16, CASTER_NRM_OFF = 20;
+// our 80-byte vertex (tools/fmdl_to_pes12.py '<3f3f4B...'): indices[0] gets
+// the remainder; packed weights correspond to indices[1..3]
+static const UINT SRC_POS_OFF = 0, SRC_W_OFF = 12, SRC_SL_OFF = 24, SRC_NRM_OFF = 28, SRC_BONES = 4;
+static const float CASTER_SAME_FRAME_M = 0.01f;   // same frame, same palette: equal (10-10 probe: 0 mm)
+// live play draws the casters before this frame's skins: a caster's slots
+// 4/17 sit within one frame of motion of its own player's previous-frame
+// colour skin record (10-10, /g/ v /jp/ live: 15-287 mm, one distinct player
+// per caster draw; players stand metres apart). Provisional: re-measure if a
+// faster camera or player shows misses.
+static const float CASTER_PREV_FRAME_M = 0.5f;
+// the nearest record must beat the runner-up by this factor, else two players
+// are too close to tell apart and the stock caster stays (contact, walls)
+static const float CASTER_UNIQUE_RATIO = 2.0f;
+static IDirect3DVertexDeclaration9* g_casterDecl = NULL;
+static IDirect3DVertexDeclaration9* casterDecl() {
+    if (!g_casterDecl) {
+        const D3DVERTEXELEMENT9 el[] = {
+            { 0, CASTER_POS_OFF, D3DDECLTYPE_FLOAT3, D3DDECLMETHOD_DEFAULT, D3DDECLUSAGE_POSITION, 0 },
+            { 0, CASTER_W_OFF, D3DDECLTYPE_FLOAT1, D3DDECLMETHOD_DEFAULT, D3DDECLUSAGE_BLENDWEIGHT, 0 },
+            { 0, CASTER_SL_OFF, D3DDECLTYPE_UBYTE4, D3DDECLMETHOD_DEFAULT, D3DDECLUSAGE_BLENDINDICES, 0 },
+            { 0, CASTER_NRM_OFF, D3DDECLTYPE_FLOAT3, D3DDECLMETHOD_DEFAULT, D3DDECLUSAGE_NORMAL, 0 },
+            D3DDECL_END()
+        };
+        if (FAILED(g_dev->CreateVertexDeclaration(el, &g_casterDecl))) g_casterDecl = NULL;
+    }
+    return g_casterDecl;
+}
+// our vertices in the caster's format. Its shader blends two palette slots,
+// BLENDINDICES.x at 1 - w and .y at w (BLENDWEIGHT; caster_vs, 10-10): each
+// vertex keeps its two heaviest bones, re-normalised, at our own slot numbers
+// - the caster draws them on our own palettes (casterCustom).
+// ponytail: a third/fourth bone's share is dropped; shadow-only, add when a silhouette shows it
+static IDirect3DVertexBuffer9* buildCasterVB(const BYTE* src, UINT nv, UINT stride) {
+    const UINT len = nv * CASTER_STRIDE;
+    IDirect3DVertexBuffer9* vb = NULL;
+    if (FAILED(g_dev->CreateVertexBuffer(len, D3DUSAGE_WRITEONLY, 0, D3DPOOL_MANAGED, &vb, NULL))) return NULL;
+    BYTE* dst = NULL;
+    if (FAILED(vb->Lock(0, len, (void**)&dst, 0)) || !dst) { vb->Release(); return NULL; }
+    for (UINT v = 0; v < nv; v++) {
+        const BYTE* s = src + v * stride;
+        BYTE* o = dst + v * CASTER_STRIDE;
+        const float* wp = (const float*)(s + SRC_W_OFF);
+        const float w[SRC_BONES] = { 1.0f - wp[0] - wp[1] - wp[2], wp[0], wp[1], wp[2] };
+        UINT a = 0;
+        for (UINT k = 1; k < SRC_BONES; k++) if (w[k] > w[a]) a = k;
+        UINT b = a == 0 ? 1 : 0;
+        for (UINT k = 0; k < SRC_BONES; k++) if (k != a && w[k] > w[b]) b = k;
+        const float sum = w[a] + w[b], wb = sum > 0 ? w[b] / sum : 0.0f;
+        memcpy(o + CASTER_POS_OFF, s + SRC_POS_OFF, 3 * sizeof(float));
+        memcpy(o + CASTER_W_OFF, &wb, sizeof(wb));
+        o[CASTER_SL_OFF] = s[SRC_SL_OFF + a]; o[CASTER_SL_OFF + 1] = s[SRC_SL_OFF + b];
+        o[CASTER_SL_OFF + 2] = o[CASTER_SL_OFF + 3] = 0;
+        memcpy(o + CASTER_NRM_OFF, s + SRC_NRM_OFF, 3 * sizeof(float));
+    }
+    vb->Unlock();
+    return vb;
+}
+static const SkinObs* casterNearest(const SkinObs* L, int n, float maxM) {
+    const UINT cs[2] = { CASTER_SLOT_A, CASTER_SLOT_B };
+    float ck[2][3];
+    for (int a = 0; a < 2; a++) for (int c = 0; c < 3; c++) ck[a][c] = g_vsc[BONE_REG0 + cs[a] * BONE_REGS + c][3];
+    float dist[MAX_OBS]; const SkinObs* best = NULL; float bd = 1e30f;
+    for (int i = 0; i < n; i++) {
+        float d = 0;
+        for (int a = 0; a < 2; a++) {
+            float ad = 0; for (int q = 0; q < 3; q++) { float e = L[i].alt[a][q] - ck[a][q]; ad += e * e; }
+            if (ad > d) d = ad;
+        }
+        dist[i] = d;
+        if (d < bd) { bd = d; best = &L[i]; }
+    }
+    // the nearest record of any label, so an unlabelled player near by is a
+    // rival, not ignored; only a labelled, unambiguous winner is used. The
+    // depth pre-pass records the same player in the colour pass's space: his
+    // own other records are not rivals.
+    if (!best || bd >= maxM * maxM || best->model < 0 || !best->anchored) return NULL;
+    if (bd <= CASTER_SAME_FRAME_M * CASTER_SAME_FRAME_M) return best;
+    for (int i = 0; i < n; i++)
+        if (L[i].model != best->model && dist[i] < bd * CASTER_UNIQUE_RATIO * CASTER_UNIQUE_RATIO) return NULL;
+    return best;
+}
+static const SkinObs* casterObservation(int* age) {
+    const SkinObs* o = casterNearest(g_obsCur, g_nObsCur, CASTER_SAME_FRAME_M);
+    if (o) { *age = 0; return o; }
+    o = casterNearest(g_obsPrev, g_nObsPrev, CASTER_PREV_FRAME_M);
+    if (o) *age = 1;
+    return o;
+}
+// his bone block, out[]: the caster's own palette, which poses the same
+// skeleton this frame in the shadow's space (10-10, 10 /cgl/ v /mlp/ players
+// at kickoff: 18 of the 21 custom slots equal a caster slot to <1 cm, rotation
+// <0.01, the same slot for every player). The 3 slots the caster lacks ride
+// their nearest mapped bone with the local offset of the colour pass's newest
+// block, else rigidly on it.
+static const int CASTER_OF_CUSTOM[CU_SLOTS] = { 17, 16, 13, 12, 10, 11, 15, 6, 7, 4, 5, 2, 3, 0, 1, -1, 14, 9, 8, -1, -1 };
+static const UINT CASTER_EXTRA_ANCHOR[CU_SLOTS] = { 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2, 0, 0, 0, 11, 7 };
+static void casterBones(const CustomModel& M, float (*out)[4]) {
+    const CustomModel::PassBones* B = NULL;
+    for (int i = 0; i < PASS_BONES_N; i++)
+        if (M.passBones[i].pass && (!B || M.passBones[i].frame > B->frame)) B = &M.passBones[i];
+    for (UINT k = 0; k < CU_SLOTS; k++)
+        if (CASTER_OF_CUSTOM[k] >= 0) memcpy(out[k * BONE_REGS], g_vsc[BONE_REG0 + CASTER_OF_CUSTOM[k] * BONE_REGS], BONE_REGS * 16);
+    for (UINT k = 0; k < CU_SLOTS; k++) {
+        if (CASTER_OF_CUSTOM[k] >= 0) continue;
+        const UINT a = CASTER_EXTRA_ANCHOR[k];
+        if (!B) { memcpy(out[k * BONE_REGS], out[a * BONE_REGS], BONE_REGS * 16); continue; }
+        float inv[3][4], rel[3][4];
+        affInv(&B->c[a * BONE_REGS], inv);
+        affMul(inv, &B->c[k * BONE_REGS], rel);
+        affMul(&out[a * BONE_REGS], rel, &out[k * BONE_REGS]);
+    }
+}
 static void releaseModel(CustomModel& M) {
     if (M.vb) M.vb->Release(); if (M.ib) M.ib->Release();
+    if (M.blob) M.blob->Release(); M.blob = NULL;
     for (UINT i = 0; i < M.ntex; i++) if (M.tex[i]) M.tex[i]->Release();
     M.vb = NULL; M.ib = NULL; M.ntex = 0;
 }
@@ -743,6 +978,7 @@ static bool readModeFile(const wchar_t* dir, DWORD* keep) {
     }
     return true;
 }
+static bool useModel(IDirect3DDevice9* d, LONG pid);
 // dir: folder holding body.bin (+ body.tex | body_<k>.tex)
 static bool loadModel(IDirect3DDevice9* d, CustomModel& M, const wchar_t* dir) {
     wchar_t path[MAX_PATH]; lstrcpyW(path, dir); lstrcatW(path, L"body.bin");
@@ -764,16 +1000,20 @@ static bool loadModel(IDirect3DDevice9* d, CustomModel& M, const wchar_t* dir) {
     M.keep &= (PART_BIT << PIECE_COUNT) - 1;
     UINT isz = v2 ? 4 : 2, vlen = M.nv * M.stride, ilen = M.ni * isz;
     void* p = NULL;
-    bool ok = SUCCEEDED(d->CreateVertexBuffer(vlen, D3DUSAGE_WRITEONLY, 0, D3DPOOL_MANAGED, &M.vb, NULL))
-           && SUCCEEDED(d->CreateIndexBuffer(ilen, D3DUSAGE_WRITEONLY, v2 ? D3DFMT_INDEX32 : D3DFMT_INDEX16, D3DPOOL_MANAGED, &M.ib, NULL));
-    if (ok && SUCCEEDED(M.vb->Lock(0, vlen, &p, 0))) { memcpy(p, at, vlen); M.vb->Unlock(); }
+    // no geometry: a marker body (a model-less roster player, tools/
+    // pes12_import_team.py) that only names its player - stock body kept,
+    // his team's kit patched from his hip like anyone's
+    bool geo = M.nv && M.ni;
+    bool ok = !geo || (SUCCEEDED(d->CreateVertexBuffer(vlen, D3DUSAGE_WRITEONLY, 0, D3DPOOL_MANAGED, &M.vb, NULL))
+           && SUCCEEDED(d->CreateIndexBuffer(ilen, D3DUSAGE_WRITEONLY, v2 ? D3DFMT_INDEX32 : D3DFMT_INDEX16, D3DPOOL_MANAGED, &M.ib, NULL)));
+    if (geo && ok && SUCCEEDED(M.vb->Lock(0, vlen, &p, 0))) { memcpy(p, at, vlen); M.vb->Unlock(); }
     M.minY = 1e9f;   // POSITION is the vertex's first 3 floats (PGB2, pgb2.VERT_FMT)
     if (ok) for (UINT i = 0; i < M.nv; i++) { float y = *(const float*)(at + i * M.stride + sizeof(float)); if (y < M.minY) M.minY = y; }
-    if (ok && SUCCEEDED(M.ib->Lock(0, ilen, &p, 0))) { memcpy(p, at + vlen, ilen); M.ib->Unlock(); }
+    if (geo && ok && SUCCEEDED(M.ib->Lock(0, ilen, &p, 0))) { memcpy(p, at + vlen, ilen); M.ib->Unlock(); }
     const BYTE* tr = at + vlen + ilen;
     bool hrig = v2 && tr + sizeof(DWORD) + 2 * HRIG_SIDE_BYTES <= b + n && *(const DWORD*)tr == HRIG_MAGIC;
     for (int h = 0; h < 2; h++) {
-        M.handRig[h] = M.handCaught[h] = false;
+        M.handRig[h] = false; M.handFrame[h] = HAND_POSE_NEVER;
         if (!hrig) continue;
         const BYTE* q = tr + sizeof(DWORD) + h * HRIG_SIDE_BYTES;
         memcpy(M.hrigBone[h], q, HAND_RIG_BONES);
@@ -800,6 +1040,7 @@ static bool loadModel(IDirect3DDevice9* d, CustomModel& M, const wchar_t* dir) {
             }
         }
     }
+    if (geo && ok) M.blob = buildCasterVB(at, M.nv, M.stride);
     HeapFree(GetProcessHeap(), 0, b);
     M.ntex = 0;
     for (UINT i = 0; i < M.nsub; i++) if (M.sub[i].tex + 1 > M.ntex) M.ntex = M.sub[i].tex + 1;
@@ -882,8 +1123,8 @@ static int g_facelog = 0;
 // and boots poking out of Kurisu's mode-body model). They are matched to their
 // player on screen: each hidden custom player's feet and hands are projected
 // with exactly what its custom draw uses, each detail draw by its slot-0 bone.
-struct Extremity { float x, y, w; int model; DWORD hidden; };   // hidden: PIECE bits of this player's stock pieces it stands for
-static const int MAX_EXTREMITIES = 64;
+struct Extremity { float x, y, w; int model; DWORD hidden; bool valid; float projection[16]; };
+static const int MAX_EXTREMITIES = MAX_OBS * 2;
 static Extremity g_feet[2][MAX_EXTREMITIES], g_hands[2][MAX_EXTREMITIES];
 static int g_nFeet[2], g_nHands[2], g_extCur = 0;
 static const float FOOT_BIND_L[3] = { 0.09f, 0.11f, -0.059f };   // probe/body349b2_bones.json bone 7 (sk_foot_l)
@@ -891,50 +1132,114 @@ static const float FOOT_BIND_R[3] = { -0.09f, 0.11f, -0.059f };  // bone 8 (sk_f
 static const float HAND_BIND_L[3] = { 0.704f, 1.455f, -0.016f }; // bone 17 (sk_hand_l)
 static const float HAND_BIND_R[3] = { -0.704f, 1.455f, -0.016f };// bone 18 (sk_hand_r)
 static const UINT SLOT_FOOT_L = 5, SLOT_FOOT_R = 6, SLOT_HAND_R = 7, SLOT_HAND_L = 11;   // pgb2.SLOT_BONES
+static const UINT VIEW_PROJECTION_REG = 16;
 static Extremity projectBone(const float (*M)[4], const float* p) {
     float w[4] = { 0, 0, 0, 1 };
     for (int r = 0; r < 3; r++) w[r] = M[r][0] * p[0] + M[r][1] * p[1] + M[r][2] * p[2] + M[r][3];
     float c[4];
-    for (int r = 0; r < 4; r++) c[r] = g_vsc[16 + r][0] * w[0] + g_vsc[16 + r][1] * w[1] + g_vsc[16 + r][2] * w[2] + g_vsc[16 + r][3] * w[3];
-    Extremity e = { c[3] != 0 ? c[0] / c[3] : 0, c[3] != 0 ? c[1] / c[3] : 0, c[3], -1, 0 };
+    for (int r = 0; r < 4; r++) c[r] = g_vsc[VIEW_PROJECTION_REG + r][0] * w[0] + g_vsc[VIEW_PROJECTION_REG + r][1] * w[1] + g_vsc[VIEW_PROJECTION_REG + r][2] * w[2] + g_vsc[VIEW_PROJECTION_REG + r][3] * w[3];
+    const float sx = g_vsc[VIEW_PROJECTION_REG][0], sy = g_vsc[VIEW_PROJECTION_REG + 1][1];
+    Extremity e = { 0, 0, 0, -1, 0, false };
+    if (sx == 0 || sy == 0 || c[3] == 0) return e;
+    const float z = -c[3];
+    e.x = (c[0] - g_vsc[VIEW_PROJECTION_REG][2] * z - g_vsc[VIEW_PROJECTION_REG][3]) / sx;
+    e.y = (c[1] - g_vsc[VIEW_PROJECTION_REG + 1][2] * z - g_vsc[VIEW_PROJECTION_REG + 1][3]) / sy;
+    memcpy(e.projection, &g_vsc[VIEW_PROJECTION_REG][0], sizeof(e.projection));
+    e.w = z; e.valid = true;
     return e;
 }
+// every custom player's feet and hands, kept or not: a player who keeps the
+// stock boots must own his boot draws too, else a neighbour's record claims
+// and hides them (10-10, /g/ v /jp/: /g/ boots gone next to /jp/ players)
 static void noteExtremities(const float (*c)[4], DWORD keep, int model) {
     int k = g_extCur;
-    if (!keeps(keep, PART_BOOTS)) {
+    {
         const UINT sl[2] = { SLOT_FOOT_L, SLOT_FOOT_R }; const float* bp[2] = { FOOT_BIND_L, FOOT_BIND_R };
-        for (int i = 0; i < 2 && g_nFeet[k] < MAX_EXTREMITIES; i++) { Extremity e = projectBone(c + sl[i] * BONE_REGS, bp[i]); e.model = model; e.hidden = PART_BIT << PART_BOOTS; g_feet[k][g_nFeet[k]++] = e; }
+        for (int i = 0; i < 2 && g_nFeet[k] < MAX_EXTREMITIES; i++) {
+            Extremity e = projectBone(c + sl[i] * BONE_REGS, bp[i]);
+            if (e.valid) { e.model = model; e.hidden = keeps(keep, PART_BOOTS) ? 0 : PART_BIT << PART_BOOTS; g_feet[k][g_nFeet[k]++] = e; }
+        }
     }
     DWORD hands = ((keeps(keep, PIECE_HANDS) ? 0 : PART_BIT << PIECE_HANDS) | (keeps(keep, PART_GLOVES) ? 0 : PART_BIT << PART_GLOVES));
-    if (hands) {
+    {
         const UINT sl[2] = { SLOT_HAND_L, SLOT_HAND_R }; const float* bp[2] = { HAND_BIND_L, HAND_BIND_R };
-        for (int i = 0; i < 2 && g_nHands[k] < MAX_EXTREMITIES; i++) { Extremity e = projectBone(c + sl[i] * BONE_REGS, bp[i]); e.model = model; e.hidden = hands; g_hands[k][g_nHands[k]++] = e; }
+        for (int i = 0; i < 2 && g_nHands[k] < MAX_EXTREMITIES; i++) {
+            Extremity e = projectBone(c + sl[i] * BONE_REGS, bp[i]);
+            if (e.valid) { e.model = model; e.hidden = hands; g_hands[k][g_nHands[k]++] = e; }
+        }
     }
 }
+// The palette slots a detail draw's vertices reference (BLENDINDICES of the
+// bound declaration), cached per vertex range: the detail buffers are static.
+// The rest of its palette still holds the previous draw's bones - another
+// player's feet - and matched his records at a fixed distance in every draw
+// (10-10 broadcast: rival 78 / 118 / 289 mm repeated across the pitch), the
+// boot flicker on stock-bodied players.
+static const int MAX_DETAIL_SLOTCACHE = 64;
+struct DetailSlots { void* vb; UINT off, first, nV, stride; DWORD mask; };
+static DetailSlots g_detailSlots[MAX_DETAIL_SLOTCACHE]; static int g_nDetailSlots = 0;
+static DWORD detailSlotMask(UINT first, UINT nV) {
+    for (int i = 0; i < g_nDetailSlots; i++) {
+        const DetailSlots& e = g_detailSlots[i];
+        if (e.vb == g_vb && e.off == g_vbOff && e.first == first && e.nV == nV && e.stride == g_stride) return e.mask;
+    }
+    DWORD mask = 0;
+    D3DVERTEXELEMENT9 el[MAXD3DDECLLENGTH + 1]; UINT ne = 0; int at = -1;
+    if (g_decl && SUCCEEDED(g_decl->GetDeclaration(NULL, &ne)) && ne <= MAXD3DDECLLENGTH + 1 && SUCCEEDED(g_decl->GetDeclaration(el, &ne)))
+        for (UINT i = 0; i < ne; i++)
+            if (el[i].Stream == 0 && el[i].Usage == D3DDECLUSAGE_BLENDINDICES && (el[i].Type == D3DDECLTYPE_UBYTE4 || el[i].Type == D3DDECLTYPE_D3DCOLOR)) at = el[i].Offset;
+    void* p = NULL;
+    if (at >= 0 && g_vb && SUCCEEDED(g_vb->Lock(g_vbOff + first * g_stride, nV * g_stride, &p, D3DLOCK_READONLY)) && p) {
+        for (UINT v = 0; v < nV; v++)
+            for (int k = 0; k < 4; k++) { BYTE s = ((const BYTE*)p)[v * g_stride + at + k]; if (s < DETAIL_RIG_BONES) mask |= 1u << s; }
+        g_vb->Unlock();
+    }
+    if (!mask) mask = (1u << DETAIL_RIG_BONES) - 1;   // unreadable: every rig slot, as before
+    if (g_nDetailSlots < MAX_DETAIL_SLOTCACHE) g_detailSlots[g_nDetailSlots++] = { g_vb, g_vbOff, first, nV, g_stride, mask };
+    return mask;
+}
 // nearest recorded extremity (this frame and the last) to this draw's rig
-// root, in metres at its depth: the nearest of its first DETAIL_RIG_BONES
-// palette bones, each at the mesh origin (#589's pieces are modelled about
-// their wrist / ankle) and at the two bind joints (the 930-vertex boots are
-// both feet in body bind, 02-10 grab: at the origin their bones sat 11 cm off)
-static float nearestExtremity(int piece, int* model) {
+// root, in view-space metres. Same-projection records first (the depth
+// pre-pass shares the colour pass's camera, so they are this frame's); only
+// if none is near enough do older records compete, where the camera has moved
+// and the view-space positions carry that motion.
+// returns the owner hiding this piece, or -1: no record near enough, the
+// nearest record's player keeps the piece, or (other projections) a rival
+// player within CASTER_UNIQUE_RATIO of the nearest distance.
+static int nearestExtremity(int piece, DWORD slots) {
     bool feet = piece == PART_BOOTS;
     static const float ORIGIN[3] = { 0, 0, 0 };
     const float* at[3] = { ORIGIN, feet ? FOOT_BIND_L : HAND_BIND_L, feet ? FOOT_BIND_R : HAND_BIND_R };
-    float best = 1e9f; *model = -1;
     const UINT NAT = sizeof(at) / sizeof(at[0]);
-    for (UINT b = 0; b < DETAIL_RIG_BONES * NAT; b++) {
-        Extremity me = projectBone(&g_vsc[BONE_REG0 + (b / NAT) * BONE_REGS], at[b % NAT]);
-        for (int f = 0; f < 2; f++) {
-            int n = feet ? g_nFeet[f] : g_nHands[f]; Extremity* a = feet ? g_feet[f] : g_hands[f];
-            for (int i = 0; i < n; i++) {
-                if (!keeps(a[i].hidden, piece)) continue;
-                float dx = (a[i].x - me.x) * me.w, dy = (a[i].y - me.y) * me.w, dw = a[i].w - me.w;
-                float dd = sqrtf(dx * dx + dy * dy + dw * dw);
-                if (dd < best) { best = dd; *model = a[i].model; }
+    for (int tier = 0; tier < 2; tier++) {
+        const float limit = tier == 0 ? DETAIL_OWNER_MAX_M : DETAIL_OWNER_LOOSE_M;
+        float best = 1e9f, rival = 1e9f; const Extremity* win = NULL; bool winCur = false;
+        for (UINT b = 0; b < DETAIL_RIG_BONES * NAT; b++) {
+            if (!(slots >> (b / NAT) & 1)) continue;
+            Extremity me = projectBone(&g_vsc[BONE_REG0 + (b / NAT) * BONE_REGS], at[b % NAT]);
+            if (!me.valid) continue;
+            for (int f = 0; f < 2; f++) {
+                int n = feet ? g_nFeet[f] : g_nHands[f]; Extremity* a = feet ? g_feet[f] : g_hands[f];
+                for (int i = 0; i < n; i++) {
+                    if (!a[i].valid) continue;
+                    bool match = memcmp(a[i].projection, me.projection, sizeof(me.projection)) == 0;
+                    if (tier == 0 ? !match : match) continue;
+                    float dx = a[i].x - me.x, dy = a[i].y - me.y, dz = a[i].w - me.w;
+                    float dd = sqrtf(dx * dx + dy * dy + dz * dz);
+                    if (dd < best) { if (win && win->model != a[i].model && best < rival) rival = best; best = dd; win = &a[i]; winCur = f == g_extCur; }
+                    else if (win && a[i].model != win->model && dd < rival) rival = dd;
+                }
             }
         }
+        // the detail draws come before the player's own skin draw, so in play
+        // the nearest record is usually last frame's: a frame of his motion off
+        const float lim = tier ? limit : winCur ? DETAIL_OWNER_MAX_M : DETAIL_PREV_FRAME_M;
+        if (!win || best >= lim) continue;
+        if (!keeps(win->hidden, piece)) return -1;
+        if ((tier || !winCur) && rival < best * CASTER_UNIQUE_RATIO) return -1;
+        return win->model;
     }
-    return best;
+    return -1;
 }
 
 // 3x4 affine bone matrices (rows = x, y, z; column 3 = translation)
@@ -965,17 +1270,28 @@ static void captureHand(CustomModel& M, int side) {
     if (root == HAND_RIG_BONES) return;
     float inv[3][4]; affInv(&g_vsc[BONE_REG0 + root * BONE_REGS], inv);
     for (UINT k = 0; k < HAND_RIG_BONES; k++) affMul(inv, &g_vsc[BONE_REG0 + k * BONE_REGS], &M.handRel[side][k * BONE_REGS]);
-    M.handCaught[side] = true;
+    M.handFrame[side] = g_frame;
 }
 // That pose on this draw's hand bone, each rig bone turned about the model's
-// own joint (its rotation from the game, its pivot from HRIG: the stock palm
-// is cupped, a 4cc hand's joints sit up to 4 cm elsewhere) -> the 12-slot
-// palette its SUB_HAND_RIG vertices are weighted to.
+// own joint (the stock bone's change from its idle pose, STOCK_HAND_IDLE; its
+// pivot from HRIG: a 4cc hand's joints sit up to 4 cm from the stock ones)
+// -> the 12-slot palette its SUB_HAND_RIG vertices are weighted to.
+static float g_idleInv[2][HAND_RIG_BONES][3][4]; static bool g_idleInvReady = false;
 static void handPalette(const CustomModel& M, int side, const float (*handBone)[4], float (*pal)[4]) {
+    if (!g_idleInvReady) {
+        for (int s = 0; s < 2; s++)
+            for (UINT b = 0; b < HAND_RIG_BONES; b++) {
+                float m[3][4];
+                for (int r = 0; r < 3; r++) { for (int q = 0; q < 3; q++) m[r][q] = STOCK_HAND_IDLE[s][b][r][q]; m[r][3] = 0.0f; }
+                affInv(m, g_idleInv[s][b]);
+            }
+        g_idleInvReady = true;
+    }
     const float* wrist = side ? HAND_BIND_R : HAND_BIND_L;
     float anchor[3][4]; memcpy(anchor, handBone, sizeof(anchor));
     for (int r = 0; r < 3; r++) anchor[r][3] += anchor[r][0] * wrist[0] + anchor[r][1] * wrist[1] + anchor[r][2] * wrist[2];
     UINT slot[HAND_RIG_BONES];
+    for (UINT k = 0; k < HAND_RIG_BONES; k++) slot[k] = 0;   // missing rig bone -> stock slot 0, never a wild read
     for (UINT k = 0; k < HAND_RIG_BONES; k++) if (M.hrigBone[side][k] < HAND_RIG_BONES) slot[M.hrigBone[side][k]] = k;
     float bone[HAND_RIG_BONES][3][4];
     for (UINT b = 0; b < HAND_RIG_BONES; b++) {           // parents come first (#589: 0; 1-5 <- 0; 6-10 <- 1-5; 11 <- 6)
@@ -983,37 +1299,59 @@ static void handPalette(const CustomModel& M, int side, const float (*handBone)[
         int par = M.hrigParent[side][b];
         const float (*P)[4] = par >= 0 && (UINT)par < b ? bone[par] : R;
         const float* c = M.hrigJoint[side][b];
+        const float (*I)[4] = g_idleInv[side][b];
+        float rot[3][3];                                   // the stock bone's change from its idle pose
+        for (int r = 0; r < 3; r++)
+            for (int q = 0; q < 3; q++) rot[r][q] = R[r][0] * I[0][q] + R[r][1] * I[1][q] + R[r][2] * I[2][q];
         for (int r = 0; r < 3; r++) {
             float moved = P[r][0] * c[0] + P[r][1] * c[1] + P[r][2] * c[2] + P[r][3];   // the joint, carried by its parent
-            for (int q = 0; q < 3; q++) bone[b][r][q] = R[r][q];
-            bone[b][r][3] = moved - (R[r][0] * c[0] + R[r][1] * c[1] + R[r][2] * c[2]);
+            for (int q = 0; q < 3; q++) bone[b][r][q] = rot[r][q];
+            bone[b][r][3] = moved - (rot[r][0] * c[0] + rot[r][1] * c[1] + rot[r][2] * c[2]);
         }
     }
     for (UINT k = 0; k < HAND_RIG_BONES; k++) affMul(anchor, bone[M.hrigBone[side][k] < HAND_RIG_BONES ? M.hrigBone[side][k] : 0], &pal[k * BONE_REGS]);
 }
 
 static HRESULT drawWithBones(IDirect3DDevice9* d, const float (*c)[4], const char* who);
+// this pass's block for the shadow caster: the entry of the same pass, else
+// the stalest
+static void keepPassBones(CustomModel& M, DWORD pass, const float (*c)[4]) {
+    int k = 0;
+    for (int i = 0; i < PASS_BONES_N; i++) {
+        if (M.passBones[i].pass == pass) { k = i; break; }
+        if (M.passBones[i].frame < M.passBones[k].frame) k = i;
+    }
+    M.passBones[k].pass = pass; M.passBones[k].frame = g_frame;
+    memcpy(M.passBones[k].c, c, sizeof(M.passBones[k].c));
+}
 static HRESULT drawCustomLod0(IDirect3DDevice9* d) {
     float c[CU_SLOTS * BONE_REGS][4];
     for (UINT k = 0; k < CU_SLOTS; k++)
         for (UINT r = 0; r < BONE_REGS; r++)
             memcpy(c[k * BONE_REGS + r], CU_SRC_PKT[k] == 0 ? g_hipM[r] : g_vsc[BONE_REG0 + CU_SRC_SLOT[k] * BONE_REGS + r], 16);
+    IDirect3DVertexShader9* vs = NULL; d->GetVertexShader(&vs);
+    bool colour = isColourVS(vs); if (vs) vs->Release();
     noteExtremities(c, g_cuM->keep, g_curModel);
+    // the shadow caster's extra slots take their local offsets from the
+    // colour pass's block (casterBones)
+    if (colour) keepPassBones(*g_cuM, (DWORD)vs, c);
     return drawWithBones(d, c, "player");
 }
 
+static bool g_dumpcArmed = false;   // flags\dumpc exists (polled every 60 frames)
 // The custom model with the given 21-slot bone block, through the kit run's
 // declaration and vertex shader (captured at the last custom player's hip).
 static HRESULT drawWithBones(IDirect3DDevice9* d, const float (*c)[4], const char* who) {
     // flags\dumpc = "player" | "official": the next such custom draw writes its
-    // bone block and the game's VS constants to 4cc-players\uploaded_<who>.bin
-    if (flagExists(L"dumpc")) {
+    // bone block and the game's VS constants to 4cc-players\uploaded_<who>.bin.
+    // Polled with the other flags (logic_present), not probed per custom draw.
+    if (g_dumpcArmed) {
         wchar_t p[MAX_PATH]; lstrcpyW(p, FLAGDIR); lstrcatW(p, L"dumpc");
         char nm[32] = {0}; DWORD r = 0; HANDLE h = CreateFileW(p, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE, NULL, OPEN_EXISTING, 0, NULL);
         if (h != INVALID_HANDLE_VALUE) { ReadFile(h, nm, 31, &r, NULL); CloseHandle(h); }
         for (DWORD i = 0; i < r; i++) if (nm[i] < 'a' || nm[i] > 'z') { nm[i] = 0; break; }
         if (lstrcmpA(nm, who) != 0) goto draw;
-        DeleteFileW(p);
+        DeleteFileW(p); g_dumpcArmed = false;
         wchar_t up[MAX_PATH]; wsprintfW(up, L"%suploaded_%S.bin", g_root, nm);
         HANDLE f = CreateFileW(up, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, 0, NULL);
         DWORD w; WriteFile(f, c, CU_SLOTS * BONE_REGS * 16, &w, NULL); WriteFile(f, g_vsc, sizeof(g_vsc), &w, NULL); CloseHandle(f);
@@ -1027,8 +1365,7 @@ draw:
     g_orgSVSCF(d, BONE_REG0, &c[0][0], CU_SLOTS * BONE_REGS);
     HRESULT hr = drawCustom(d);
     for (int s = 0; s < 2; s++) {                // his hands on the stock hand's pose (captureHand)
-        if (!g_cuM->handCaught[s]) continue;
-        g_cuM->handCaught[s] = false;
+        if (!handPosed(*g_cuM, s)) continue;
         float pal[HAND_RIG_BONES * BONE_REGS][4];
         handPalette(*g_cuM, s, &c[(s ? SLOT_HAND_R : SLOT_HAND_L) * BONE_REGS], pal);
         g_orgSVSCF(d, BONE_REG0, &pal[0][0], HAND_RIG_BONES * BONE_REGS);
@@ -1113,14 +1450,17 @@ static LONG officialPid(IDirect3DVertexBuffer9* head) {
 // at the game's face draw (players). Officials have none: every face slot
 // takes the head joint's frame (head skin matrix through the head's bind
 // position, officialmap.h), so the face rides the head without animating.
-static HRESULT drawFaceRigid(IDirect3DDevice9* d, const float (*c)[4]) {
-    float f[FACE_SLOTS * BONE_REGS][4];
+static void faceRigidPalette(const float (*c)[4], float (*f)[4]) {
     const float (*h)[4] = c + HEAD_SLOT * BONE_REGS;
     for (UINT r = 0; r < BONE_REGS; r++) {
         float row[4] = { h[r][0], h[r][1], h[r][2],
                          h[r][0] * HEAD_BIND[0] + h[r][1] * HEAD_BIND[1] + h[r][2] * HEAD_BIND[2] + h[r][3] };
         for (UINT k = 0; k < FACE_SLOTS; k++) memcpy(f[k * BONE_REGS + r], row, 16);
     }
+}
+static HRESULT drawFaceRigid(IDirect3DDevice9* d, const float (*c)[4]) {
+    float f[FACE_SLOTS * BONE_REGS][4];
+    faceRigidPalette(c, f);
     float keep[FACE_SLOTS * BONE_REGS][4];
     memcpy(keep, g_vsc[BONE_REG0], sizeof(keep));
     IDirect3DVertexDeclaration9* keepDecl = NULL; IDirect3DVertexShader9* keepVS = NULL;
@@ -1190,8 +1530,10 @@ static bool drawOfficial(IDirect3DDevice9* d, const float (*c)[4]) {
 // 4cc-players\shaders\vs_<n>.bin / ps_<n>.bin (disassemble with vkd3d-compiler
 // -x d3dbc -b d3d-asm); the flag is removed after SHADER_DUMP_MAX pairs.
 static const int SHADER_DUMP_MAX = 8;
+static int g_dumpNSeen = 0;   // reset when flags\shaderdump is (re)created
 static void dumpShaders(IDirect3DDevice9* d) {
-    static void* seen[SHADER_DUMP_MAX][2]; static int nseen = 0;
+    static void* seen[SHADER_DUMP_MAX][2];
+    int nseen = g_dumpNSeen;
     wchar_t p[MAX_PATH], dir[MAX_PATH]; CreateDirectoryW(rootFile(dir, L"shaders"), NULL);
     IDirect3DVertexShader9* vs = NULL; IDirect3DPixelShader9* ps = NULL;
     d->GetVertexShader(&vs); d->GetPixelShader(&ps);
@@ -1210,6 +1552,7 @@ static void dumpShaders(IDirect3DDevice9* d) {
         }
         char m[64]; wsprintfA(m, "shaders dumped: pair %d", nseen); logline(m);
         if (++nseen == SHADER_DUMP_MAX) { lstrcpyW(p, FLAGDIR); lstrcatW(p, L"shaderdump"); DeleteFileW(p); }
+        g_dumpNSeen = nseen;
     }
     if (vs) vs->Release(); if (ps) ps->Release();
 }
@@ -1241,8 +1584,18 @@ static IDirect3DTexture9* flatNormal(IDirect3DDevice9* d) {
     return g_flatNormal;
 }
 
+// face subs are head-local on the face palette: only at the face draw;
+// hand-rig subs hand-local on the stock hand palette: only at its draw, and
+// then the rigid body copy of that hand stays out of the body draw
+static bool subInPart(const CustomModel& M, const CustomSub& S, int part) {
+    bool face = (S.flags & SUB_FACE) != 0, rig = (S.flags & SUB_HAND_RIG) != 0;
+    if (part == DRAW_FACE ? !face : part == DRAW_BODY ? face || rig
+        : !rig || !(S.flags & SUB_HAND_SIDE[part - DRAW_HAND_L])) return false;
+    return !(part == DRAW_BODY && ((S.flags & SUB_HAND_L && handPosed(M, 0)) || (S.flags & SUB_HAND_R && handPosed(M, 1))));
+}
 static HRESULT drawCustom(IDirect3DDevice9* d, int part) {
     CustomModel& M = *g_cuM;
+    if (!M.vb) return D3D_OK;                      // marker body: nothing of its own to draw
     if (g_shaderDump) dumpShaders(d);
     if (g_rtDumpArm && !g_rtDump && part == DRAW_BODY) d->GetRenderTarget(0, &g_rtDump);
     IDirect3DVertexBuffer9* keepVB = g_vb; UINT keepOff = g_vbOff, keepSt = g_stride;
@@ -1288,12 +1641,7 @@ static HRESULT drawCustom(IDirect3DDevice9* d, int part) {
     for (int k = 0; k < NNS; k++) { keepNrm[k] = NULL; d->GetTexture(NORMAL_MAP_STAGES[k], &keepNrm[k]); if (!g_keepNormalMaps && flatNormal(d)) g_orgSTEX(d, NORMAL_MAP_STAGES[k], g_flatNormal); }
     for (UINT i = 0; i < M.nsub; i++) {
         const CustomSub& S = M.sub[i];
-        // face subs are head-local on the face palette: only at the face draw;
-        // hand-rig subs hand-local on the stock hand palette: only at its draw
-        bool face = (S.flags & SUB_FACE) != 0, rig = (S.flags & SUB_HAND_RIG) != 0;
-        if (part == DRAW_FACE ? !face : part == DRAW_BODY ? face || rig
-            : !rig || !(S.flags & SUB_HAND_SIDE[part - DRAW_HAND_L])) continue;
-        if (part == DRAW_BODY && ((S.flags & SUB_HAND_L && M.handCaught[0]) || (S.flags & SUB_HAND_R && M.handCaught[1]))) continue;
+        if (!subInPart(M, S, part)) continue;
         // a texture that failed to load binds nothing, never the previous sub's
         // texture (01-10: Eustace's chair drew his newspaper)
         if (!g_cuKeepGameTex) g_orgSTEX(d, 0, S.tex < M.ntex ? M.tex[S.tex] : NULL);
@@ -1389,6 +1737,62 @@ static HRESULT drawCustom(IDirect3DDevice9* d, int part) {
     g_orgSI(d, keepIB);
     g_orgSSS(d, 0, keepVB, keepOff, keepSt);
     return hr;
+}
+// The caster VS samples no texture alpha, so an alpha-tested or blended card
+// would shadow as its whole quad (Coscom p271109: every sub alpha-tested;
+// Derpy Hooves p273601: wings are blended cards, a bar across the shoulders).
+static const DWORD CASTER_SKIP_SUBS = SUB_ALPHATEST | SUB_BLEND;
+static void casterSubs(IDirect3DDevice9* d, const CustomModel& M, int part) {
+    for (UINT i = 0; i < M.nsub; i++)
+        if (subInPart(M, M.sub[i], part) && M.sub[i].count && !(M.sub[i].flags & CASTER_SKIP_SUBS))
+            g_orgDIP(d, D3DPT_TRIANGLELIST, 0, 0, M.nv, M.sub[i].first, M.sub[i].count / 3);
+}
+static bool casterOpaqueBody(const CustomModel& M, int part) {
+    for (UINT i = 0; i < M.nsub; i++)
+        if (subInPart(M, M.sub[i], part) && M.sub[i].count && !(M.sub[i].flags & CASTER_SKIP_SUBS)) return true;
+    return false;
+}
+static bool casterCustom(IDirect3DDevice9* d) {
+    int obsAge = 0;
+    const SkinObs* obs = casterObservation(&obsAge);
+    if (!obs) return false;
+    LONG pid = obs->model;
+    CustomModel* keepM = g_cuM;
+    if (!useModel(d, pid)) { g_cuM = keepM; return false; }
+    CustomModel* M = g_cuM;
+    g_cuM = keepM;
+    if (M->keep) return false;
+    float c[CU_SLOTS * BONE_REGS][4];
+    casterBones(*M, c);
+    IDirect3DVertexDeclaration9* cdec = casterDecl();
+    if (!M->blob || !M->ib || !M->nsub || !cdec) return false;
+    // A fully cutout body has no opaque sub to pose: leave the stock caster
+    // to draw (humanoid shadow) instead of consuming its draw here. Returning
+    // false before touching device state keeps the stock fallthrough intact.
+    if (!casterOpaqueBody(*M, DRAW_BODY)) return false;
+    float keep[FACE_SLOTS * BONE_REGS][4];
+    memcpy(keep, g_vsc[BONE_REG0], sizeof(keep));
+    IDirect3DVertexBuffer9* keepVB = g_vb; UINT keepOff = g_vbOff, keepSt = g_stride;
+    IDirect3DIndexBuffer9* keepIB = g_ib;
+    IDirect3DVertexDeclaration9* keepDecl = NULL; d->GetVertexDeclaration(&keepDecl);
+    g_orgSSS(d, 0, M->blob, 0, CASTER_STRIDE); g_orgSI(d, M->ib); g_orgSVD(d, cdec);
+    g_orgSVSCF(d, BONE_REG0, &c[0][0], CU_SLOTS * BONE_REGS);
+    casterSubs(d, *M, DRAW_BODY);
+    for (int s = 0; s < 2; s++) {
+        if (!handPosed(*M, s)) continue;
+        float pal[HAND_RIG_BONES * BONE_REGS][4];
+        handPalette(*M, s, &c[(s ? SLOT_HAND_R : SLOT_HAND_L) * BONE_REGS], pal);
+        g_orgSVSCF(d, BONE_REG0, &pal[0][0], HAND_RIG_BONES * BONE_REGS);
+        casterSubs(d, *M, DRAW_HAND_L + s);
+    }
+    float f[FACE_SLOTS * BONE_REGS][4];
+    faceRigidPalette(c, f);
+    g_orgSVSCF(d, BONE_REG0, &f[0][0], FACE_SLOTS * BONE_REGS);
+    casterSubs(d, *M, DRAW_FACE);
+    g_orgSVSCF(d, BONE_REG0, &keep[0][0], FACE_SLOTS * BONE_REGS);
+    g_orgSSS(d, 0, keepVB, keepOff, keepSt); g_orgSI(d, keepIB);
+    g_orgSVD(d, keepDecl); if (keepDecl) keepDecl->Release();
+    return true;
 }
 
 
@@ -1617,6 +2021,9 @@ static UINT g_texDumpNV = 0;
 // flags\hidenv: "<nV>" skips every draw with that vertex count; draw indices
 // shift between frames, a signature does not (debug, finding characters).
 static UINT g_hideNV = 0;
+// flags\hidevs: "<decimal vs pointer>" skips every draw bound to that vertex
+// shader (debug: which pass paints something, 09-10 the ground shadows).
+static DWORD g_hideVS = 0;
 static const int OFFICIAL_HEAD_DRAWS = 2;   // head + hair after each official (01-10 kickoff log)
 static const UINT OFFICIAL_HEAD_STRIDE = 64;  // the head's first piece at both LODs (82/171/64, 145/369/64; 01-10 grabs)
 static const int OFFICIAL_FACE_DRAWS_MAX = 5; // close LOD face set before the head (8/7/60 30/57/88 8/9/60 671/1599/88 28/39/80)
@@ -1669,6 +2076,177 @@ static void dumpStageTextures(UINT nV, UINT nP, LONG di) {
     }
 }
 
+// Installed stadium geometry (tools/pes12_stadium.py install): stride-40
+// diffuse+lightmap packets in the slot's template blocks. The engine draws a
+// fixed subset of those blocks per camera (09-10 census, Karasuno: broadcast
+// 11 12 13 14 24 25, half time 0-3 11-16 19 22, replay 10-16 19 24 26; only
+// the pitch block in every frame), chosen for the STOCK stadium's layout. No
+// placement of an imported hall survives that - the west roof half was never
+// drawn by the broadcast camera, walls cut on a diagonal at half time - so
+// every installed draw is recorded, and in the same pass (pixel shader) of
+// a later frame one the engine skipped last frame is drawn again. Stock
+// stadiums are untouched: an installed packet is one whose vertex count the
+// installer listed (4cc-players\stand_draws.txt, pes12_stadium
+// write_stand_draws) AND which binds the installer's neutral lightmap (one
+// DXT1 block, every texel grey 128). The lightmap alone is not enough: the
+// installer writes it over a stand texture of the slot that stock props share,
+// and replaying those (nV 516, 742, 2025 ... at Karasuno) drew a black slab
+// over the broadcast view (09-10); stock blocks also have near/far variants
+// that must not double up.
+static const UINT STAND_STRIDE = 40;
+static const UINT INSTALLED_LIGHTMAP_PX = 4;
+static const int INSTALLED_LIGHTMAP_GREY = 128, INSTALLED_LIGHTMAP_TOL = 4;   // NEUTRAL_LIGHTMAP, after DXT1 rounding (129,128,129)
+static const int MAX_STAND_DRAWS = 128, MAX_STAND_COUNTS = 512;
+static UINT g_standCounts[MAX_STAND_COUNTS]; static int g_nStandCounts = -1;   // -1: list not read yet
+static bool listedStandCount(UINT nV) {
+    if (g_nStandCounts < 0) {
+        g_nStandCounts = 0; wchar_t p[MAX_PATH]; DWORD n = 0;
+        BYTE* b = readAll(rootFile(p, L"stand_draws.txt"), &n);
+        UINT v = 0; bool digit = false;
+        for (DWORD i = 0; b && i <= n; i++) {
+            if (i < n && b[i] >= '0' && b[i] <= '9') { v = v * 10 + (b[i] - '0'); digit = true; continue; }
+            if (digit && g_nStandCounts < MAX_STAND_COUNTS) g_standCounts[g_nStandCounts++] = v;
+            v = 0; digit = false;
+        }
+        if (b) HeapFree(GetProcessHeap(), 0, b);
+        char m[64]; wsprintfA(m, "stand: %d installed packet sizes listed", g_nStandCounts); logline(m);
+    }
+    for (int i = 0; i < g_nStandCounts; i++) if (g_standCounts[i] == nV) return true;
+    return false;
+}
+static const LONG STAND_IDLE_FRAMES = 60;   // no installed draw this long (menus, loading): the stadium is gone, refs dropped
+static const D3DRENDERSTATETYPE STAND_RS[] = { D3DRS_ALPHABLENDENABLE, D3DRS_SRCBLEND, D3DRS_DESTBLEND,
+    D3DRS_ALPHATESTENABLE, D3DRS_ALPHAREF, D3DRS_ALPHAFUNC, D3DRS_ZWRITEENABLE, D3DRS_CULLMODE, D3DRS_ZFUNC,
+    D3DRS_ZENABLE, D3DRS_COLORWRITEENABLE };
+static const int STAND_RS_N = sizeof(STAND_RS) / sizeof(STAND_RS[0]);
+static const D3DSAMPLERSTATETYPE STAND_SS[] = { D3DSAMP_ADDRESSU, D3DSAMP_ADDRESSV, D3DSAMP_MAGFILTER, D3DSAMP_MINFILTER, D3DSAMP_MIPFILTER };
+static const int STAND_SS_N = sizeof(STAND_SS) / sizeof(STAND_SS[0]), STAND_STAGES = 2;   // diffuse + lightmap
+struct StandDraw {
+    IDirect3DVertexBuffer9* vb; UINT off; IDirect3DIndexBuffer9* ib; IDirect3DBaseTexture9* tex[STAND_STAGES];
+    IDirect3DVertexDeclaration9* decl; IDirect3DVertexShader9* vs; IDirect3DPixelShader9* ps;
+    D3DPRIMITIVETYPE t; INT bV; UINT mV, nV, sI, nP; DWORD rs[STAND_RS_N], ss[STAND_STAGES][STAND_SS_N]; LONG last;
+};
+static StandDraw g_stand[MAX_STAND_DRAWS]; static int g_nstand = 0; static LONG g_standSeen = 0;
+// Every installed stadium draw is recorded once; in the same pass another
+// frame draws again any the engine skipped last frame. Stock stadiums are
+// untouched: an installed packet is one whose vertex count the installer
+// listed (4cc-players\stand_draws.txt, pes12_stadium write_stand_draws) AND
+// which binds the installer's neutral lightmap (one DXT1 block, every texel
+// grey 128). The lightmap alone is not enough: the installer writes it over
+// a stand texture of the slot that stock props share, and replaying those
+// (nV 516, 742, 2025 ... at Karasuno) drew a black slab over the broadcast
+// view (09-10); stock blocks also have near/far variants that must not
+// double up.
+static IDirect3DBaseTexture9* g_lmChecked = NULL; static bool g_lmInstalled = false;
+static int expand565(int v, int bits) { return (v * 255 + ((1 << bits) - 1) / 2) / ((1 << bits) - 1); }
+// a one-block DXT1 texture whose 16 texels are all the neutral grey
+static bool isNeutralLightmap(IDirect3DBaseTexture9* b) {
+    D3DSURFACE_DESC sd;
+    if (!b || b->GetType() != D3DRTYPE_TEXTURE) return false;
+    IDirect3DTexture9* t = (IDirect3DTexture9*)b;
+    if (FAILED(t->GetLevelDesc(0, &sd)) || sd.Width != INSTALLED_LIGHTMAP_PX || sd.Height != INSTALLED_LIGHTMAP_PX || sd.Format != D3DFMT_DXT1) return false;
+    D3DLOCKED_RECT lr; if (FAILED(t->LockRect(0, &lr, NULL, D3DLOCK_READONLY))) return false;
+    const BYTE* q = (const BYTE*)lr.pBits;
+    WORD c[2] = { *(const WORD*)q, *(const WORD*)(q + 2) }; DWORD idx = *(const DWORD*)(q + 4);
+    t->UnlockRect(0);
+    int pal[4][3];
+    for (int k = 0; k < 2; k++) { pal[k][0] = expand565(c[k] >> 11, 5); pal[k][1] = expand565((c[k] >> 5) & 63, 6); pal[k][2] = expand565(c[k] & 31, 5); }
+    for (int ch = 0; ch < 3; ch++) {
+        if (c[0] > c[1]) { pal[2][ch] = (2 * pal[0][ch] + pal[1][ch]) / 3; pal[3][ch] = (pal[0][ch] + 2 * pal[1][ch]) / 3; }
+        else { pal[2][ch] = (pal[0][ch] + pal[1][ch]) / 2; pal[3][ch] = -1000; }   // index 3: transparent, never grey
+    }
+    for (int k = 0; k < 16; k++)
+        for (int ch = 0; ch < 3; ch++) {
+            int v = pal[(idx >> (2 * k)) & 3][ch] - INSTALLED_LIGHTMAP_GREY;
+            if (v < -INSTALLED_LIGHTMAP_TOL || v > INSTALLED_LIGHTMAP_TOL) return false;
+        }
+    return true;
+}
+static void standDraw(IDirect3DDevice9* d, const StandDraw& e) {
+    g_orgSSS(d, 0, e.vb, e.off, STAND_STRIDE); g_orgSI(d, e.ib);
+    for (int s = 0; s < STAND_STAGES; s++) {
+        g_orgSTEX(d, s, e.tex[s]);
+        for (int k = 0; k < STAND_SS_N; k++) d->SetSamplerState(s, STAND_SS[k], e.ss[s][k]);
+    }
+    g_orgSVD(d, e.decl); d->SetVertexShader(e.vs); d->SetPixelShader(e.ps);
+    for (int r = 0; r < STAND_RS_N; r++) d->SetRenderState(STAND_RS[r], e.rs[r]);
+    g_orgDIP(d, e.t, e.bV, e.mV, e.nV, e.sI, e.nP);
+}
+// the device state standDraw touches, saved and restored around a batch of them
+struct StandKeep {
+    IDirect3DVertexBuffer9* vb; UINT off, stride; IDirect3DIndexBuffer9* ib; IDirect3DBaseTexture9* tex[STAND_STAGES];
+    DWORD ss[STAND_STAGES][STAND_SS_N], rs[STAND_RS_N];
+    IDirect3DVertexDeclaration9* decl; IDirect3DVertexShader9* vs; IDirect3DPixelShader9* ps;
+};
+static void standSave(IDirect3DDevice9* d, StandKeep& k) {
+    d->GetStreamSource(0, &k.vb, &k.off, &k.stride); d->GetIndices(&k.ib);
+    for (int s = 0; s < STAND_STAGES; s++) {
+        d->GetTexture(s, &k.tex[s]);
+        for (int q = 0; q < STAND_SS_N; q++) d->GetSamplerState(s, STAND_SS[q], &k.ss[s][q]);
+    }
+    for (int r = 0; r < STAND_RS_N; r++) d->GetRenderState(STAND_RS[r], &k.rs[r]);
+    d->GetVertexDeclaration(&k.decl); d->GetVertexShader(&k.vs); d->GetPixelShader(&k.ps);
+}
+static void standRestore(IDirect3DDevice9* d, StandKeep& k) {
+    g_orgSSS(d, 0, k.vb, k.off, k.stride); g_orgSI(d, k.ib);
+    for (int s = 0; s < STAND_STAGES; s++) {
+        g_orgSTEX(d, s, k.tex[s]);
+        for (int q = 0; q < STAND_SS_N; q++) d->SetSamplerState(s, STAND_SS[q], k.ss[s][q]);
+        if (k.tex[s]) k.tex[s]->Release();
+    }
+    for (int r = 0; r < STAND_RS_N; r++) d->SetRenderState(STAND_RS[r], k.rs[r]);
+    g_orgSVD(d, k.decl); d->SetVertexShader(k.vs); d->SetPixelShader(k.ps);
+    if (k.vb) k.vb->Release(); if (k.ib) k.ib->Release(); if (k.decl) k.decl->Release(); if (k.vs) k.vs->Release(); if (k.ps) k.ps->Release();
+}
+static void standRelease() {
+    for (int i = 0; i < g_nstand; i++) {
+        StandDraw& e = g_stand[i];
+        e.vb->Release(); e.ib->Release(); e.decl->Release(); e.vs->Release(); e.ps->Release();
+        for (int s = 0; s < 2; s++) if (e.tex[s]) e.tex[s]->Release();
+    }
+    g_nstand = 0; g_lmChecked = NULL;
+}
+static void standCull(IDirect3DDevice9* d, D3DPRIMITIVETYPE t, INT bV, UINT mV, UINT nV, UINT sI, UINT nP) {
+    IDirect3DBaseTexture9* lm = NULL; d->GetTexture(1, &lm);
+    if (lm != g_lmChecked) {
+        g_lmChecked = lm; g_lmInstalled = isNeutralLightmap(lm);
+    }
+    bool mine = g_lmInstalled && g_vb && g_ib && listedStandCount(nV);
+    if (lm) lm->Release();
+    IDirect3DPixelShader9* ps = NULL; d->GetPixelShader(&ps);
+    if (!ps) return;
+    if (mine) {
+        int k = 0;
+        while (k < g_nstand && !(g_stand[k].vb == g_vb && g_stand[k].off == g_vbOff && g_stand[k].ib == g_ib && g_stand[k].bV == bV
+                                 && g_stand[k].sI == sI && g_stand[k].nP == nP && g_stand[k].ps == ps)) k++;
+        if (k == g_nstand && k < MAX_STAND_DRAWS) {
+            StandDraw& e = g_stand[g_nstand++];
+            e.vb = g_vb; e.vb->AddRef(); e.off = g_vbOff; e.ib = g_ib; e.ib->AddRef(); e.ps = ps; ps->AddRef();
+            for (int s = 0; s < STAND_STAGES; s++) {
+                d->GetTexture(s, &e.tex[s]);
+                for (int q = 0; q < STAND_SS_N; q++) d->GetSamplerState(s, STAND_SS[q], &e.ss[s][q]);
+            }
+            d->GetVertexDeclaration(&e.decl); d->GetVertexShader(&e.vs);
+            e.t = t; e.bV = bV; e.mV = mV; e.nV = nV; e.sI = sI; e.nP = nP;
+            for (int r = 0; r < STAND_RS_N; r++) d->GetRenderState(STAND_RS[r], &e.rs[r]);
+            if (!e.decl || !e.vs) { standRelease(); ps->Release(); return; }
+            char m[128]; wsprintfA(m, "stand: installed draw %d nV=%u ps=%08x", g_nstand, nV, (DWORD)ps); logline(m);
+        }
+        if (k < g_nstand) g_stand[k].last = g_frame;
+        g_standSeen = g_frame;
+    }
+    // this pass's installed draws the engine skipped last frame, once per frame
+    bool saved = false; StandKeep keep;
+    for (int i = 0; i < g_nstand; i++) {
+        StandDraw& e = g_stand[i];
+        if (e.ps != ps || e.last >= g_frame - 1) continue;
+        if (!saved) { standSave(d, keep); saved = true; }
+        standDraw(d, e);
+        e.last = g_frame - 1;   // drawn: not again this frame
+    }
+    if (saved) standRestore(d, keep);
+    ps->Release();
+}
 static HRESULT STDMETHODCALLTYPE myDIP(IDirect3DDevice9* d, D3DPRIMITIVETYPE t,
         INT bV, UINT mV, UINT nV, UINT sI, UINT nP) {
     if (nV == GROUP_START_NV && nP == GROUP_START_NP && g_stride == GROUP_START_STRIDE) {
@@ -1680,9 +2258,17 @@ static HRESULT STDMETHODCALLTYPE myDIP(IDirect3DDevice9* d, D3DPRIMITIVETYPE t,
     }
     bool inGroup = g_group >= 0 && g_group < 32;
     LONG di = g_drawIdx++;
-    if (g_texDumpArmed && (nV == g_texDumpNV || g_texDumpNV == TEXDUMP_ALL)) dumpStageTextures(nV, nP, di);
+    if (g_stride == STAND_STRIDE) standCull(d, t, bV, mV, nV, sI, nP);
+    if (g_texDumpArmed && (nV == g_texDumpNV || g_texDumpNV == TEXDUMP_ALL)) {
+        dumpStageTextures(nV, nP, di);
+    }
     if (di >= g_hrLo && di < g_hrHi) return D3D_OK;
     if (g_hideNV && nV == g_hideNV) return D3D_OK;   // flags\hidenv (debug)
+    if (g_hideVS) {   // flags\hidevs: the whole pass bound to one vertex shader (debug)
+        IDirect3DVertexShader9* hvs = NULL; d->GetVertexShader(&hvs); DWORD hp = (DWORD)hvs;
+        if (hvs) hvs->Release();
+        if (hp == g_hideVS) return D3D_OK;
+    }
     {   // Officials: the dt09 #349 block 1 model, recognised by its vertex buffer.
         // One official = consecutive draws from that buffer, then his head and
         // hair (2 skinned draws from his own head buffer; 01-10 kickoff log).
@@ -1746,17 +2332,25 @@ static HRESULT STDMETHODCALLTYPE myDIP(IDirect3DDevice9* d, D3DPRIMITIVETYPE t,
         g_runPos = -1;                  // a skin draw opens the next player
         int mk = findMarker(g_tex0);
         float key[3]; runKey(key);
-        if (mk >= 0) {
-            g_pendingModel = mk; g_pendingSrc = SRC_MARKER;
-            if (g_pendingModel >= 0 && g_nKeyCur < MAX_KEYS) {
-                for (int c = 0; c < 3; c++) g_keyCur[g_nKeyCur].p[c] = key[c];
-                g_keyCur[g_nKeyCur++].model = g_pendingModel;
-            }
-        } else if (g_pendingModel < 0) { g_pendingModel = modelForKey(key); g_pendingSrc = g_pendingModel >= 0 ? SRC_KEY : SRC_NONE; }
+        IDirect3DVertexShader9* vs = NULL; d->GetVertexShader(&vs);
+        bool colour = isColourVS(vs); DWORD pass = (DWORD)vs; if (vs) vs->Release();
+        if (mk >= 0) { g_pendingModel = mk; g_pendingSrc = SRC_MARKER; }
+        else if (g_pendingModel < 0) {
+            g_pendingModel = colour ? -1 : modelForKey(pass, key);
+            g_pendingSrc = g_pendingModel >= 0 ? SRC_KEY : SRC_NONE;
+        }
         else g_pendingSrc = SRC_CARRIED;
+        recordSkin(pass, key, g_pendingModel, mk >= 0, g_pendingSrc != SRC_NONE);
         if (g_runLog) {
-            IDirect3DVertexShader9* vs = NULL; d->GetVertexShader(&vs); bool col = isColourVS(vs); if (vs) vs->Release();
-            char m[128]; wsprintfA(m, "run SKIN %u/%u/%u tex=%08x mk=%d pend=%d src=%s %s", nV, nP, g_stride, (DWORD)g_tex0, mk, g_pendingModel, SRC_NAME[g_pendingSrc], col ? "colour" : "other"); logline(m);
+            const int SL2[] = { 0, 3, 4, 5, 11, 17 };
+            const int MM_PER_M = 1000;
+            char m[256];
+            int q = wsprintfA(m, "run SKIN %u/%u/%u tex=%08x mk=%d pend=%d", nV, nP, g_stride, (DWORD)g_tex0, mk, g_pendingModel);
+            for (int s = 0; s < 6 && q < 200; s++)
+                q += wsprintfA(m + q, " b%d=%d,%d,%d", SL2[s], (int)(g_vsc[BONE_REG0 + SL2[s] * BONE_REGS][3] * MM_PER_M),
+                               (int)(g_vsc[BONE_REG0 + SL2[s] * BONE_REGS + 1][3] * MM_PER_M), (int)(g_vsc[BONE_REG0 + SL2[s] * BONE_REGS + 2][3] * MM_PER_M));
+            q += wsprintfA(m + q, " src=%s pass=%08x", SRC_NAME[g_pendingSrc], pass);
+            logline(m);
         }
         if (g_pendingModel >= 0 && useModel(d, g_pendingModel) && !keeps(g_cuM->keep, PIECE_SKIN)) return D3D_OK;
         if (g_pendingModel >= 0 && useModel(d, g_pendingModel) && !keeps(g_cuM->keep, PIECE_HANDS)) {
@@ -1826,22 +2420,29 @@ static HRESULT STDMETHODCALLTYPE myDIP(IDirect3DDevice9* d, D3DPRIMITIVETYPE t,
         }
         g_runKitOk = kitOfSheet(g_tex0, g_runTid, g_runSlot);
     }
+    if (nV == CASTER_NV && g_stride == CASTER_STRIDE) {
+        g_runPos = -1;
+        if (casterCustom(d)) return D3D_OK;
+    }
     int part = PART_OTHER;
+    // every part of a player is skinned (10-10 census: each draw the run hid
+    // had BLENDINDICES); an unskinned draw is the scene after him - the goal
+    // net (nV 2337, stride 40) was classed gloves and hidden behind a run
+    if (g_runPos >= 0 && !g_declSkinned && !hip) g_runPos = -1;
     if (g_runPos >= 0 && (g_curModel >= 0 || g_pMask)) {
         part = classifyPart((UINT)(bV + (INT)mV), nV);
         if (part == PART_OTHER && !hip) g_runPos = -1;   // left the player
     }
-    if (g_runLog) { char m[160]; wsprintfA(m, "run%s m=%d pos=%d %u/%u/%u part=%d tex=%08x%s%s", hip ? " HIP" : "", g_curModel, (int)g_runPos, nV, nP, g_stride, part, (DWORD)g_tex0, hip ? " src=" : "", hip ? SRC_NAME[g_curSrc] : ""); if (hip) lstrcatA(m, g_hipColour ? " colour" : " other"); logline(m); }
     {
-        bool detailBoots = (nV == DETAIL_BOOTS_NV && nP == DETAIL_BOOTS_NP) || (nV == DETAIL_BOOT_NV && (nP == DETAIL_BOOT_L_NP || nP == DETAIL_BOOT_R_NP));
+        bool detailBoots = nV == DETAIL_BOOTS_NV && nP == DETAIL_BOOTS_NP;
         bool detailHands = (nV == DETAIL_HANDS_NV && nP == DETAIL_HANDS_NP) ||
             (g_stride == DETAIL_HAND_STRIDE && ((nV == DETAIL_HAND_L_NV && nP == DETAIL_HAND_L_NP) || (nV == DETAIL_HAND_R_NV && nP == DETAIL_HAND_R_NP)));
-        bool detailGloves = g_stride == DETAIL_GLOVE_STRIDE && nV == DETAIL_GLOVE_NV && (nP == DETAIL_GLOVE_L_NP || nP == DETAIL_GLOVE_R_NP);
+        bool detailGloves = (g_stride == DETAIL_GLOVE_STRIDE && nV == DETAIL_GLOVE_NV && (nP == DETAIL_GLOVE_L_NP || nP == DETAIL_GLOVE_R_NP))
+            || (g_stride == DETAIL_GK_GLOVE_STRIDE && nV == DETAIL_GK_GLOVE_NV && (nP == DETAIL_GK_GLOVE_L_NP || nP == DETAIL_GK_GLOVE_R_NP));
         if (detailBoots || detailHands || detailGloves) {
             int piece = detailBoots ? (int)PART_BOOTS : detailHands ? (int)PIECE_HANDS : (int)PART_GLOVES;
-            int who; float dm = nearestExtremity(piece, &who);
-            if (g_runLog) { char m[128]; wsprintfA(m, "  detail %s %u/%u/%u: nearest hiding model %d at %d mm", PIECE_NAMES[piece], nV, nP, g_stride, who, (int)(dm * 1000)); logline(m); }
-            if (dm < DETAIL_OWNER_MAX_M) {               // a custom player's, who does not keep it
+            int who = nearestExtremity(piece, detailSlotMask((UINT)(bV + (INT)mV), nV));
+            if (who >= 0) {               // a custom player's, who does not keep it
                 // his own hand on this rig, if he has one: the game has just
                 // uploaded this hand's palette; its pose relative to the rig
                 // root is kept for his body draw (drawWithBones), which
@@ -1921,6 +2522,25 @@ static void dumpSurface(IDirect3DDevice9* d, IDirect3DSurface9* bb, const wchar_
     IDirect3DSurface9* sys = NULL;
     D3DSURFACE_DESC sd; bb->GetDesc(&sd);
     { char m[128]; wsprintfA(m, "%s: surface %08x %ux%u fmt %u ms %u", what, (DWORD)bb, sd.Width, sd.Height, (UINT)sd.Format, (UINT)sd.MultiSampleType); if (lstrcmpA(what, "shot")) logline(m); }
+    // R32F targets (the light-view shadow map, 09-10): raw floats, u32 w, h first -> <path>.r32f
+    if (sd.Format == D3DFMT_R32F) {
+        if (SUCCEEDED(d->CreateOffscreenPlainSurface(sd.Width, sd.Height, sd.Format, D3DPOOL_SYSTEMMEM, &sys, NULL))
+            && SUCCEEDED(d->GetRenderTargetData(bb, sys))) {
+            D3DLOCKED_RECT lr;
+            if (SUCCEEDED(sys->LockRect(&lr, NULL, D3DLOCK_READONLY))) {
+                wchar_t p[MAX_PATH]; lstrcpyW(p, path); lstrcatW(p, L".r32f");
+                HANDLE f = CreateFileW(p, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, 0, NULL);
+                if (f != INVALID_HANDLE_VALUE) {
+                    DWORD w, hd[2] = { sd.Width, sd.Height }; WriteFile(f, hd, sizeof(hd), &w, NULL);
+                    for (UINT y = 0; y < sd.Height; y++) WriteFile(f, (BYTE*)lr.pBits + y * lr.Pitch, sd.Width * sizeof(float), &w, NULL);
+                    CloseHandle(f);
+                }
+                sys->UnlockRect();
+            }
+        } else logline("rtdump: GetRenderTargetData failed");
+        if (sys) sys->Release();
+        return;
+    }
     if (sd.Format != D3DFMT_A8R8G8B8 && sd.Format != D3DFMT_X8R8G8B8) return;
     if (SUCCEEDED(d->CreateOffscreenPlainSurface(sd.Width, sd.Height, sd.Format, D3DPOOL_SYSTEMMEM, &sys, NULL))
         && SUCCEEDED(d->GetRenderTargetData(bb, sys))) {
@@ -1952,14 +2572,20 @@ static void captureFrame(IDirect3DDevice9* d) {
 }
 
 extern "C" __declspec(dllexport) void logic_present(IDirect3DDevice9* d) {
-    if (flagExists(L"shot")) { wchar_t p[MAX_PATH]; lstrcpyW(p, FLAGDIR); lstrcatW(p, L"shot"); DeleteFileW(p); captureFrame(d); }
+    // Each flag probe is a file-system call through wineserver (~0.1-0.2 ms;
+    // 10-10: ~90 per frame cost 10-20 ms); the capture flags are checked on
+    // every SHOT_POLL_FRAMES-th frame only.
+    static const LONG SHOT_POLL_FRAMES = 10;
+    bool poll = g_frame % SHOT_POLL_FRAMES == 0;
+    if (poll && flagExists(L"shot")) { wchar_t p[MAX_PATH]; lstrcpyW(p, FLAGDIR); lstrcatW(p, L"shot"); DeleteFileW(p); captureFrame(d); }
     if (g_rtDump) {
         wchar_t p[MAX_PATH]; dumpSurface(d, g_rtDump, rootFile(p, L"shots\\rt.bmp"), "rtdump");
         g_rtDump->Release(); g_rtDump = NULL; g_rtDumpArm = false;
-    } else if (flagExists(L"rtdump")) {
+    } else if (poll && flagExists(L"rtdump")) {
         wchar_t p[MAX_PATH]; lstrcpyW(p, FLAGDIR); lstrcatW(p, L"rtdump"); DeleteFileW(p); g_rtDumpArm = true;
     }
     LONG f = InterlockedIncrement(&g_frame);
+    if (g_nstand && f - g_standSeen > STAND_IDLE_FRAMES) standRelease();
     static LONG dumpStart = 0;
     if (g_grabAll == 2) { g_grabAll = 0; char m[64]; wsprintfA(m, "frame %d grabbed all: %d draws", (int)f, (int)g_grabSeq); logline(m); }
     if (g_grabAll == 1) g_grabAll = 2;  // arm for the next full frame
@@ -1986,14 +2612,16 @@ extern "C" __declspec(dllexport) void logic_present(IDirect3DDevice9* d) {
     // team's art into whichever sheet that player had bound (the away team wore
     // /g/'s kit, 01-10). Anything still pending when the frame rolls over is stale.
     g_pendingModel = -1; g_pendingSrc = SRC_NONE;
-    memcpy(g_keyPrev, g_keyCur, sizeof(g_keyCur)); g_nKeyPrev = g_nKeyCur; g_nKeyCur = 0;
+    labelByPose();
     g_extCur ^= 1; g_nFeet[g_extCur] = g_nHands[g_extCur] = 0;
     if (f % 60 == 0) {
         g_hideMask = readFlagInt(L"hide", 0);
         g_bodyHide = readFlagInt(L"bodyhide", 0);
         g_pMask = readFlagInt(L"pmask", 0);
         g_hideNV = readFlagInt(L"hidenv", 0);
+        g_hideVS = (DWORD)readFlagInt(L"hidevs", 0);
         g_officialPid = readFlagInt(L"officialpid", 0);
+        g_dumpcArmed = flagExists(L"dumpc");
         g_runLog = flagExists(L"runlog");
         if (g_runLog) { wchar_t p[MAX_PATH]; lstrcpyW(p, FLAGDIR); lstrcatW(p, L"runlog"); DeleteFileW(p); }
         readRange(L"hr", &g_hrLo, &g_hrHi);
@@ -2007,6 +2635,7 @@ extern "C" __declspec(dllexport) void logic_present(IDirect3DDevice9* d) {
         g_kitPatchOff = flagExists(L"nokitpatch");
         g_keepNormalMaps = flagExists(L"gamenormals");
         g_noHairFringe = flagExists(L"nohairfringe");
+        if (flagExists(L"shaderdump") && !g_shaderDump) g_dumpNSeen = 0;   // fresh set per flag session
         g_shaderDump = flagExists(L"shaderdump");
         if (flagExists(L"codedump")) {   // flags\codedump: "hexaddr hexlen" -> 4cc-players\codedump.bin
             wchar_t p[MAX_PATH]; lstrcpyW(p, FLAGDIR); lstrcatW(p, L"codedump");
@@ -2091,7 +2720,38 @@ static void hookS(void** vt, int idx, void* fn, void** org) {
 static PVOID g_veh = NULL;   // faultLog's vectored handler (below)
 static void unhookGameUEF();
 static void unhookPct3();
+// drawhook reloads drawlogic (flags\reload), which resets every static: the
+// installed stand draws recorded so far were lost, and pieces only another
+// camera submits stayed culled until it came round (owner, 09-10, after a
+// reload mid-match). The table and the references it holds pass to the next
+// instance through a process-heap block named in this environment variable.
+static const char* STAND_HANDOVER_ENV = "DRAWLOGIC_STAND_HANDOVER";
+static const DWORD STAND_HANDOVER_MAGIC = 0x53544e44;   // 'DNTS'
+struct StandHandover { DWORD magic, size; int n; StandDraw e[MAX_STAND_DRAWS]; };
+static void standHandOut() {
+    if (!g_nstand) return;
+    StandHandover* h = (StandHandover*)HeapAlloc(GetProcessHeap(), 0, sizeof(StandHandover));
+    if (!h) return;
+    h->magic = STAND_HANDOVER_MAGIC; h->size = sizeof(StandHandover); h->n = g_nstand;
+    memcpy(h->e, g_stand, g_nstand * sizeof(StandDraw));
+    char v[16]; wsprintfA(v, "%08x", (DWORD)h); SetEnvironmentVariableA(STAND_HANDOVER_ENV, v);
+    g_nstand = 0;   // the references go with it
+}
+static void standHandIn() {
+    char v[16] = {0};
+    if (!GetEnvironmentVariableA(STAND_HANDOVER_ENV, v, sizeof(v))) return;
+    SetEnvironmentVariableA(STAND_HANDOVER_ENV, NULL);
+    DWORD p = 0; for (int i = 0; v[i]; i++) p = p * 16 + (v[i] <= '9' ? v[i] - '0' : v[i] - 'a' + 10);
+    StandHandover* h = (StandHandover*)p;
+    if (!h || h->magic != STAND_HANDOVER_MAGIC || h->size != sizeof(StandHandover)) { logline("stand: handover from an older build ignored"); return; }
+    g_nstand = h->n;
+    memcpy(g_stand, h->e, g_nstand * sizeof(StandDraw));
+    for (int i = 0; i < g_nstand; i++) g_stand[i].last = -1;   // frame numbers restart
+    HeapFree(GetProcessHeap(), 0, h);
+    char m[64]; wsprintfA(m, "stand: %d installed draws carried over", g_nstand); logline(m);
+}
 extern "C" __declspec(dllexport) void logic_uninstall() {
+    standHandOut();
     if (g_veh) { RemoveVectoredExceptionHandler(g_veh); g_veh = NULL; }
     unhookGameUEF();
     unhookPct3();
@@ -2104,6 +2764,7 @@ extern "C" __declspec(dllexport) void logic_uninstall() {
         if (g_passDecl[k]) g_passDecl[k]->Release(); if (g_passVS[k]) g_passVS[k]->Release(); if (g_passPS[k]) g_passPS[k]->Release(); g_passDecl[k] = NULL; g_passVS[k] = NULL; g_passPS[k] = NULL;
         for (int st = 1; st < KIT_STAGES; st++) { if (g_passStage[k][st]) g_passStage[k][st]->Release(); g_passStage[k][st] = NULL; }
     }
+    if (g_casterDecl) { g_casterDecl->Release(); g_casterDecl = NULL; }
     for (int i = 0; i < g_nmodels; i++) releaseModel(g_models[i]);
     g_nmodels = 0;
     releaseModel(g_default); memset(&g_default, 0, sizeof(g_default)); g_cuM = NULL;
@@ -2332,11 +2993,13 @@ extern "C" __declspec(dllexport) void logic_install(IDirect3DDevice9* dev) {
     hookS(vt, 94, (void*)mySVSCF, (void**)&g_orgSVSCF); // SetVertexShaderConstantF
     hookS(vt, 109, (void*)mySPSCF, (void**)&g_orgSPSCF); // SetPixelShaderConstantF
     hookS(vt, 82, (void*)myDIP, (void**)&g_orgDIP);    // DrawIndexedPrimitive
+    // slot 83 DrawPrimitiveUP intentionally unhooked: the deferral build used it
     hookS(vt, 26, (void*)myCVB, (void**)&g_orgCVB);    // CreateVertexBuffer
     guardAfsioSizeReads();
     g_veh = AddVectoredExceptionHandler(1, faultLog);
     hookGameUEF();
     hookPct3();
+    standHandIn();
     logline("logic installed");
 }
 

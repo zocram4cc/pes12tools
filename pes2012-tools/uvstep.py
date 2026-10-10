@@ -9,6 +9,7 @@ that builds frame-grid and timing textures from plain images.
 
     python3 tools/uvstep.py grid <out.png> <frame...> [--tiles-u N] [--tiles-v N]
     python3 tools/uvstep.py timing <out.png> <spec> [--width N] [--height N]
+    python3 tools/uvstep.py tex <body_K.tex> <image.png>
 
 Grid inputs are image files; one may be an animated GIF (every frame is
 taken, in order). All frames must share one size - resampling authored art
@@ -252,9 +253,10 @@ def build_timing(spec, tiles_used, width=256, height=1):
 
 def main(argv):
     from PIL import Image
-    if len(argv) < 4 or argv[1] not in ('grid', 'timing'):
+    if len(argv) < 4 or argv[1] not in ('grid', 'timing', 'tex'):
         raise SystemExit('usage: uvstep.py grid <out.png> <frame...> [--tiles-u N] [--tiles-v N]\n'
-                         '       uvstep.py timing <out.png> <spec> [--width N] [--height N]')
+                         '       uvstep.py timing <out.png> <spec> [--width N] [--height N]\n'
+                         '       uvstep.py tex <body_K.tex> <image.png>')
     cmd, out = argv[1], argv[2]
     rest, opts = [], {}
     for a in argv[3:]:
@@ -263,7 +265,11 @@ def main(argv):
             opts[k.replace('-', '_')] = v if _ else True
         else:
             rest.append(a)
-    if cmd == 'grid':
+    if cmd == 'tex':   # an authored image -> the PGT1 texture drawlogic loads as body_<k>.tex
+        from fmdl_to_pes12 import write_tex
+        write_tex(rest[0], out)
+        print('%s: %dx%d PGT1' % ((out,) + Image.open(rest[0]).size))
+    elif cmd == 'grid':
         grid_frames = load_frames(rest)
         grid, tu, tv = build_grid(
             grid_frames, int(opts.get('tiles_u', 0)),

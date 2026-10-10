@@ -99,6 +99,10 @@ SUB_HAND_SIDE = {'l': SUB_HAND_L, 'r': SUB_HAND_R}
 # share of solid texels is (Stallman 55 %, No Time For Love 56 %).
 HAIR_MIN_SOLID = 0.25
 HAIR_SOLID_ALPHA = 250
+# PES's limb skin shader, the body's skin colour (SUB_SKIN; mark_face.py tints
+# the stock skin to it). Not Wrinkle/Wrinkle_Face: those are the head, whose
+# face.dds is often a placeholder (black 4x4 on /an/'s Longboi, 09-10).
+SKIN_SHADERS = ('Skin_New',)
 
 
 def hair_has_opacity(tex):
@@ -141,6 +145,47 @@ def joint(bone):
     r = [m[0:3], m[4:7], m[8:11]]
     t = [m[3], m[7], m[11]]
     return tuple(-sum(r[k][i] * t[k] for k in range(3)) for i in range(3))
+
+
+# A bone the model binds at the origin carries no placement, and the
+# nearest-joint fallback for an unknown name (retarget.resolve_bone) then
+# reads it as the foot: Source-rig ports bring ValveBiped.* bones bound so,
+# and /his/ Ea-Nasir's whole head rode his left foot on
+# ValveBiped.Bip01_Head1 (09-10: hat on the neck, head floating above).
+# Such a bone is placed on the trunk-chain joint nearest the weighted centroid
+# of the vertices it moves (Head1 -> sk_head, Neck1 -> sk_neck). Only joints
+# whose render->rig alignment (retarget.PES_ALIGN) is a no-op: a limb joint
+# carries its 4-55 deg pose turn onto the part - props near an arm came out
+# tilted 45 deg (09-10 previews, p274322's display stand).
+UNBOUND_JOINT_M2 = 1e-6     # (1 mm)^2: a bind joint this close to the origin was never set
+UNBOUND_TARGET_MAX_ALIGN_DEG = 1.0   # trunk chain 0.0 deg; feet 4.1, legs 7, arms 45-55
+
+
+def _align_deg(bone):
+    q = retarget.PES_ALIGN.get(bone, (0.0, 0.0, 0.0, 1.0))
+    return 2.0 * math.degrees(math.acos(min(1.0, abs(q[3]))))
+
+
+def model_bind(m):
+    """{bone: world joint} of a loaded model; an unbound unknown bone sits on the
+    unrotated (trunk-chain) joint nearest its riders' centroid."""
+    bind = {b.name: joint(b) for b in m.bones}
+    unbound = {n for n, p in bind.items() if sum(c * c for c in p) < UNBOUND_JOINT_M2
+               and n not in F.FOX_TO_PES12 and retarget.resolve_bone(n) is None}
+    acc = {}
+    for mesh in m.meshes:
+        bones = mesh.boneGroup.bones if mesh.boneGroup else []
+        for v in mesh.vertices:
+            for bi, w in (v.boneMapping or {}).items():
+                if bi < len(bones) and w > 0 and bones[bi].name in unbound:
+                    a = acc.setdefault(bones[bi].name, [0.0, 0.0, 0.0, 0.0])
+                    a[0] += w * v.position.x; a[1] += w * v.position.y; a[2] += w * v.position.z; a[3] += w
+    trunk = [b for b in F.FOX_TO_PES12 if b in retarget.PES_RENDER_BIND and _align_deg(b) < UNBOUND_TARGET_MAX_ALIGN_DEG]
+    for n, a in acc.items():
+        c = (a[0] / a[3], a[1] / a[3], a[2] / a[3])
+        best = min(trunk, key=lambda b: sum((x - y) ** 2 for x, y in zip(c, retarget.PES_RENDER_BIND[b][0])))
+        bind[n] = tuple(retarget.PES_RENDER_BIND[best][0])
+    return bind
 
 
 # PES2012's in-match body has one bone per hand (its fingers live on the
@@ -251,6 +296,8 @@ def sub_flags(states):
     """PES15 material states -> drawlogic submesh flags."""
     shader = states.get(SHADER_KEY)
     f = SUB_SHADELESS if shader in SHADELESS_SHADERS else SUB_TOON if shader in TOON_SHADERS else 0
+    if shader in SKIN_SHADERS:
+        f |= F.SUB_SKIN
     if shader in OPAQUE_SHADERS:
         return SUB_TWOSIDED | SUB_HAIR
     if states.get('alphatest') == '1':
@@ -613,12 +660,8 @@ HAND_RIG_PARENT = {'pip': 'mcp', 'dip': 'pip'}   # a finger joint rides its pare
 HRIG_MAGIC = b'HRIG'
 
 
-def hand_side(raw):
-    """'l' / 'r' when every influence is one hand's (HAND_RIG_BONE), else None."""
-    sides = {name[-1] for name, w in raw if w > 0 and name[-2:] in ('_l', '_r') and name[:-2] in HAND_RIG_BONE}
-    if len(sides) != 1 or any(w > 0 and name[:-2] not in HAND_RIG_BONE for name, w in raw):
-        return None
-    return sides.pop()
+hand_side = F.hand_side             # one definition for both converters (fold rule there)
+pack_hand_vertex = F.pack_hand_vertex
 
 
 def hand_joints(bind, side, to_body, wrist):
@@ -638,21 +681,6 @@ def hand_joints(bind, side, to_body, wrist):
         parent = '%s_%s_%s' % (finger, HAND_RIG_PARENT[joint_name], side)
         return curl_fingers(tb[name], (0.0, 1.0, 0.0), [(parent, 1.0)], tb)[0]
     return [tuple(a - w for a, w in zip(to_body(curled(names[b])), wrist)) for b in range(len(HAND_RIG_JOINT))]
-
-
-def pack_hand_vertex(pos, raw, palette, wrist, rest):
-    """The hand-local copy of a one-hand vertex: its rigid copy's position
-    minus the wrist (rest = that copy's normal/binormal/tangent/uv tail, the
-    frame being the same), weights on the stock hand palette."""
-    w = {}
-    for name, x in raw:
-        if x > 0:
-            b = HAND_RIG_BONE[name[:-2]]
-            w[b] = w.get(b, 0.0) + x
-    top = sorted(w.items(), key=lambda kv: -kv[1])[:F.MAX_INFLUENCES]
-    tw = sum(x for _, x in top) or 1.0
-    ws, slots = F.skin_pack([(palette.index(b), x / tw) for b, x in top])
-    return struct.pack('<3f3f4B', *[a - b for a, b in zip(pos, wrist)], *ws[:3], *slots) + rest
 
 
 def hrig_trailer(hand_rig, joints):
@@ -735,7 +763,7 @@ def used_bones(folder, mats):
         if SKIP_FILES.search(fname):
             continue
         m = load_model(os.path.join(folder, fname))
-        bind = {b.name: joint(b) for b in m.bones}
+        bind = model_bind(m)
         for mesh in m.meshes:
             bones = mesh.boneGroup.bones if mesh.boneGroup else []
             for v in mesh.vertices:
@@ -892,7 +920,7 @@ def convert(folder, kit_dds, out_dir, hide_body=None):
         nverts = sum(len(x.vertices) for x in m.meshes)
         if WHOLE_BODY_NAMES.search(fname) or nverts >= WHOLE_BODY_MIN_VERTS:
             geometry_whole = True
-        bind = {b.name: joint(b) for b in m.bones}
+        bind = model_bind(m)
         on_head = types.get(fname) in HEAD_TYPES and head_world is not None
         fslots = face_slots(bind, rig)
         hand_at = {}             # side -> (wrist, this model's joints) when it has a full finger rig
@@ -962,6 +990,9 @@ def convert(folder, kit_dds, out_dir, hide_body=None):
                         key = F.slot_key(name, fox)
                         infl[key] = infl.get(key, 0.0) + w * share
                     raw.append((name, w))
+                fold_side = hand_side(raw)
+                if fold_side in hand_at:     # only where a rig copy shares the seam
+                    infl = F.fold_off_hand(infl, fold_side)
                 if not infl and on_head:
                     infl = {(HEAD_BONE, False): 1.0}
                 if not infl:  # static geometry rides the nearest main joint

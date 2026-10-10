@@ -61,6 +61,7 @@ import pes17export as X17  # noqa: E402
 import pes15_kits as K  # noqa: E402
 import pes12edit as E  # noqa: E402
 import afs  # noqa: E402
+import fmdl_to_pes12 as F  # noqa: E402  (PGB2 header for marker bodies)
 
 PID_BASE = 2000                 # the DLC's placeholder pid base
 STARTERS = 11
@@ -256,6 +257,24 @@ def game_running():
     return False
 
 
+# The player's skin colour swatch (the export's Faces/XXXnn/skin.*, a single
+# colour): drawlogic tints the model's skin shells with it (SUB_SKIN), in this
+# search order. It travels with the model, whatever made the model.
+SKIN_SWATCH_FILES = ('skin.dds', 'skin.png', 'skin.bmp', 'skin.tga', 'skin.jpg')
+
+
+def copy_swatch(folder, out):
+    """The face folder's skin swatch into the model folder (a stale one removed)."""
+    for f in os.listdir(out):
+        if f.lower() in SKIN_SWATCH_FILES:
+            os.remove(os.path.join(out, f))
+    have = {f.lower(): f for f in os.listdir(folder)}
+    for name in SKIN_SWATCH_FILES:
+        if name in have:
+            shutil.copy2(os.path.join(folder, have[name]), os.path.join(out, name))
+            return
+
+
 def main(aes, edit, custom, gdb, export=None, tid=None, starters_only=True, pes21=None,
          pes17=False, tactics=None, rename=None, pes15=None):
     if game_running():
@@ -327,30 +346,49 @@ def main(aes, edit, custom, gdb, export=None, tid=None, starters_only=True, pes2
 
     bodies = sorted((x['lineup'] if starters_only else [{'pid': p} for p in order]),
                     key=lambda s: s['pid'] % 100)  # marker order = face folder XXXnn
-    found = []
+    found, bare = [], []
     for s in bodies:
         folder = face_folder(faces, s['pid'])
         if folder is None or not any(f.lower().endswith('.model') for f in os.listdir(folder)):
-            print('no face models for', s['pid'])  # e.g. /pw/ Inoki: a portrait only
+            # e.g. /his/ Charles II, /pw/ Inoki (a portrait only): PES edit
+            # faces the pack ships no model for. He still gets his marker
+            # (and a body that keeps every stock piece): unmarked, nothing
+            # told drawlogic his team, so where no teammate of his drew - the
+            # pre-match screen - his kit stayed the DLC's white placeholder
+            # (owner, 09-10).
+            bare.append(s)
             continue
         found.append((s, folder))
-    register(custom, gdb, tid, [new_pid[s['pid']] for s, _ in found])
+    register(custom, gdb, tid, [new_pid[s['pid']] for s, _ in found] + [new_pid[s['pid']] for s in bare])
     os.makedirs(os.path.join(gdb, 'faces', '4cc'), exist_ok=True)
     template = os.path.join(gdb, 'faces', '4cc', FACE_TEMPLATE_NAME)
     if not os.path.exists(template):
         img = os.path.join(gdb, '..', '..', 'img', FACE_TEMPLATE_IMG)
         open(template, 'wb').write(afs.read(img, FACE_TEMPLATE_ENTRY))
+
+    def mark(pid, out):
+        subprocess.run([sys.executable, os.path.join(HERE, 'mark_face.py'), template,
+                        str(pid), os.path.join(gdb, 'faces', '4cc', '%d.bin' % pid), out],
+                       check=True, stdout=subprocess.DEVNULL)
     for s, folder in found:
         pid = new_pid[s['pid']]
+        out = os.path.join(custom, 'p%d' % pid)
         app = x['players'][s['pid']]['appearance']
         # the export's word on PES hiding its body (FPC); none: judge from the geometry
         hint = [] if app is None else ['hide' if X.hides_body(app) else 'keep']
-        subprocess.run([sys.executable, os.path.join(HERE, 'pes15_to_pes12.py'), folder, kit,
-                        os.path.join(custom, 'p%d' % pid)] + hint, check=True)
-        subprocess.run([sys.executable, os.path.join(HERE, 'mark_face.py'), template,
-                        str(pid), os.path.join(gdb, 'faces', '4cc', '%d.bin' % pid)],
-                       check=True, stdout=subprocess.DEVNULL)
+        subprocess.run([sys.executable, os.path.join(HERE, 'pes15_to_pes12.py'), folder, kit, out] + hint, check=True)
+        copy_swatch(folder, out)
+        mark(pid, out)
         print('p%d %s' % (pid, os.path.basename(folder)))
+    for s in bare:
+        pid = new_pid[s['pid']]
+        out = os.path.join(custom, 'p%d' % pid)
+        shutil.rmtree(out, ignore_errors=True)
+        os.makedirs(out)
+        open(os.path.join(out, 'body.bin'), 'wb').write(struct.pack(
+            '<6I', F.BODY2_MAGIC, 0, 0, F.VERTEX_STRIDE, 0, F.keep_mask(*F.PIECES)))
+        mark(pid, out)
+        print('p%d marker only (no face models)' % pid)
 
 
 if __name__ == '__main__':

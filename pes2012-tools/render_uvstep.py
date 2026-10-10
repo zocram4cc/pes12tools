@@ -3,7 +3,8 @@
     python3 tools/render_uvstep.py <body dir> <out.png> [t0,t1,...]
 
 Reads the real body.bin + body_<k>.tex (PGT1 or DDS, like pgb_preview.py)
-and draws the front face of every SUB_UVSTEP submesh at the given times
+and draws the front face of each SUB_UVSTEP submesh (one row per submesh,
+one column per time) at the given times
 (seconds), uniform and timing modes through tools/uvstep.py's mirror
 (frame_at/tile_uv/timing_lookup). Not a game screenshot: it proves the
 trailer, the textures and the frame math agree before a boot.
@@ -15,8 +16,8 @@ import sys
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
-sys.path.insert(0, os.path.join(HERE, '..', 'dist', 'pes2012-blender',
-                                'pes2012_starter_pack'))
+for _p in (('..', 'dist', 'pes2012-blender'), ('..', 'pes2012-blender')):   # repo / dist layout
+    sys.path.insert(0, os.path.join(HERE, *_p, 'pes2012_starter_pack'))
 import uvstep  # noqa: E402
 import pgb2  # noqa: E402
 
@@ -139,12 +140,15 @@ def _timing_px(ttex, tu, t, p):
 def main(d, out, times):
     from PIL import Image
     parsed, pos, uv0, uv1, idx, texs = load(d)
-    ims = [render_face(parsed, pos, uv0, uv1, idx, texs, t) for t in times]
-    sheet = Image.new('RGB', (PX * len(ims), PX), (40, 40, 40))
-    for k, im in enumerate(ims):
-        sheet.paste(im, (k * PX, 0))
+    ustep = pgb2.parse_ustep(parsed['trailer'])
+    subs = [si for si, s in enumerate(parsed['subs']) if s['flags'] & pgb2.SUB_UVSTEP and si in ustep]
+    sheet = Image.new('RGB', (PX * len(times), PX * max(1, len(subs))), (40, 40, 40))
+    for row, si in enumerate(subs):
+        for k, t in enumerate(times):
+            sheet.paste(render_face(parsed, pos, uv0, uv1, idx, texs, t, only=si), (k * PX, row * PX))
     sheet.save(out)
-    print('%s: %s' % (out, ', '.join('t=%.1fs' % t for t in times)))
+    print('%s: rows = UVStep submeshes %s, columns = %s' % (
+        out, subs, ', '.join('t=%.1fs' % t for t in times)))
 
 
 if __name__ == '__main__':

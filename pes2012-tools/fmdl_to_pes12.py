@@ -183,6 +183,10 @@ SUB_HAIR = 1 << 18
 # hand draw on the stock hand's palette (HAND_RIG_BONE, drawlogic SUB_HAND_*).
 SUB_HAND_L, SUB_HAND_R, SUB_HAND_RIG = 1 << 19, 1 << 20, 1 << 21
 SUB_HAND_SIDE = {'l': SUB_HAND_L, 'r': SUB_HAND_R}
+# A limb skin shell (PES Skin_New, PES21's non-face skin shaders): its texture
+# is the body's skin colour, which mark_face.py tints the stock skin draws to
+# (the face atlas). Never a head: face textures are often placeholders.
+SUB_SKIN = 1 << 24
 HEAD_BONE = 'sk_head'
 # A Hair texture whose alpha is mostly empty is not an opacity map (DEVELOPERS'
 # hair_col: 87 % zero, drawn by alpha the hair vanished, 27-09); one with this
@@ -450,12 +454,39 @@ HAND_RIG_PARENT = {'pip': 'mcp', 'dip': 'pip'}   # a finger joint rides its pare
 HRIG_MAGIC = b'HRIG'
 
 
+# A hand vertex may carry this much weight off the hand (wrist twist feathered
+# over the back of the hand: p272111 forearm <= 0.24 within 20 mm of the
+# wrist, <= 0.19 at 20-40, <= 0.02 beyond) and still be drawn with the hand:
+# the rig copy folds it onto the wrist root. Requiring every influence on the
+# hand left those triangles on the rigid body copy, which stays at the
+# authored finger pose, and slits opened along the seam whenever the fingers
+# moved (owner, 09-10). The rigid copy keeps the exact weights.
+HAND_FOLD_MAX_WEIGHT = 0.25
+
+
 def hand_side(raw):
-    """'l' / 'r' when every influence is one hand's (HAND_RIG_BONE), else None."""
-    sides = {name[-1] for name, w in raw if w > 0 and name[-2:] in ('_l', '_r') and name[:-2] in HAND_RIG_BONE}
-    if len(sides) != 1 or any(w > 0 and name[:-2] not in HAND_RIG_BONE for name, w in raw):
+    """'l' / 'r' when one hand's bones (HAND_RIG_BONE) carry all of the
+    vertex but at most HAND_FOLD_MAX_WEIGHT of it, else None."""
+    hand = [(name, w) for name, w in raw if w > 0 and name[-2:] in ('_l', '_r') and name[:-2] in HAND_RIG_BONE]
+    sides = {name[-1] for name, _ in hand}
+    total = sum(w for _, w in raw if w > 0)
+    if len(sides) != 1 or total - sum(w for _, w in hand) > HAND_FOLD_MAX_WEIGHT * total:
         return None
     return sides.pop()
+
+
+def fold_off_hand(infl, side):
+    """The body copy's influences (slot_key -> weight) of a hand vertex
+    (hand_side) with its off-hand share on the hand bone, as the rig copy has
+    it on the wrist root: both copies of a seam vertex then move alike, and
+    the seam between them stays shut (09-10: 8 mm slits on the back of the
+    hand where the wrist twist reached)."""
+    hand = 'sk_hand_' + side
+    out = {}
+    for (fox, finger), w in infl.items():
+        key = (fox, finger) if fox == hand else (hand, False)
+        out[key] = out.get(key, 0.0) + w
+    return out
 
 
 def hand_joints(bind, side, to_body, wrist):
@@ -484,7 +515,7 @@ def pack_hand_vertex(pos, raw, palette, wrist, rest):
     w = {}
     for name, x in raw:
         if x > 0:
-            b = HAND_RIG_BONE[name[:-2]]
+            b = HAND_RIG_BONE.get(name[:-2], 0)   # off-hand weight (hand_side) rides the wrist root
             w[b] = w.get(b, 0.0) + x
     top = sorted(w.items(), key=lambda kv: -kv[1])[:MAX_INFLUENCES]
     tw = sum(x for _, x in top) or 1.0
@@ -774,6 +805,9 @@ def build(sources, out_dir, keep=None, hide_body=None):
                         key = slot_key(name, fox)
                         infl[key] = infl.get(key, 0.0) + w * share
                     raw.append((name, w))
+                fold_side = hand_side(raw)
+                if fold_side in hand_at:     # only where a rig copy shares the seam
+                    infl = fold_off_hand(infl, fold_side)
                 if not infl and src.get('head_world'):
                     # a head piece authored in the head bone's own space and
                     # carrying no weights rides the head bone
@@ -1075,6 +1109,10 @@ def fmdl_flags(mi, m):
         flags |= SUB_BLEND
     if OUTLINE_MATERIAL.search(mi.name or ''):
         flags |= SUB_OUTLINE
+    # PES21's limb skin shaders (pes_3ddf_skin_face is the head); the
+    # translucent dirt overlays on skin are not the skin itself
+    if 'skin' in shader and 'face' not in shader and 'dirt' not in shader and not FMDL_TRANSLUCENT.search(mi.name or ''):
+        flags |= SUB_SKIN
     return flags
 
 

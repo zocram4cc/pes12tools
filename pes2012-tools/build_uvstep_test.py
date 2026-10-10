@@ -12,8 +12,8 @@ import sys
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
-sys.path.insert(0, os.path.join(HERE, '..', 'dist', 'pes2012-blender',
-                                'pes2012_starter_pack'))
+for _p in (('..', 'dist', 'pes2012-blender'), ('..', 'pes2012-blender')):   # repo / dist layout
+    sys.path.insert(0, os.path.join(HERE, *_p, 'pes2012_starter_pack'))
 import uvstep  # noqa: E402
 import pgb2  # noqa: E402
 

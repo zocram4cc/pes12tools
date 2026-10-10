@@ -406,6 +406,7 @@ FLAG_PROPS = (
     ('pgb2_hand_rig', pgb2.SUB_HAND_RIG, 'Hand-rig copy: hand-local verts on hand_<side>_XX (bit 21)'),
     ('pgb2_uvstep', pgb2.SUB_UVSTEP, 'UVStep frame-grid animation (bit 22)'),
     ('pgb2_uvstep_lit', pgb2.SUB_UVSTEP_LIT, 'UVStep lit variant, toon lighting (bit 23)'),
+    ('pgb2_skin', pgb2.SUB_SKIN, 'Limb skin shell: its texture sets the stock skin colour (bit 24)'),
 )
 # material property -> (default, min, max, description): the UVStep trailer
 # entry (tools/uvstep.py). pgb2_uvstep_tex is the timing texture slot
@@ -752,8 +753,69 @@ def menu_export(self, context):
     self.layout.operator(EXPORT_OT_pes12_slot.bl_idname, text='PES2012 stadium slot (afs2fs)')
 
 
+class OBJECT_PT_pgb2(bpy.types.Panel):
+    """Properties > Object: the stock pieces a PGB2 body keeps"""
+    bl_label = 'PGB2 body'
+    bl_space_type = 'PROPERTIES'
+    bl_region_type = 'WINDOW'
+    bl_context = 'object'
+
+    @classmethod
+    def poll(cls, context):
+        return context.object is not None and context.object.type == 'MESH'
+
+    def draw(self, context):
+        self.layout.prop(context.object, 'pgb2_keep')
+
+
+class MATERIAL_PT_pgb2(bpy.types.Panel):
+    """Properties > Material: the submesh flags, texture slot and UVStep
+    animation a PGB2 export writes for this material"""
+    bl_label = 'PGB2 submesh'
+    bl_space_type = 'PROPERTIES'
+    bl_region_type = 'WINDOW'
+    bl_context = 'material'
+
+    @classmethod
+    def poll(cls, context):
+        return context.material is not None
+
+    def draw(self, context):
+        mat, lay = context.material, self.layout
+        if 'pgb2_tex' in mat:
+            lay.prop(mat, '["pgb2_tex"]', text='Texture slot body_<k>')
+        else:
+            lay.label(text='Texture slot: add custom property pgb2_tex (int), else body_0')
+        col = lay.column(heading='Flags')
+        for name, _bit, desc in FLAG_PROPS:
+            if name in ('pgb2_uvstep', 'pgb2_uvstep_lit'):
+                continue
+            col.prop(mat, name, text=desc.split(' (bit')[0])
+        if mat.pgb2_alpha_test:
+            lay.prop(mat, 'pgb2_alpha_ref')
+        box = lay.box()
+        row = box.row()
+        row.prop(mat, 'pgb2_uvstep', text='UVStep animation')
+        row.prop(mat, 'pgb2_uvstep_lit', text='Lit (toon lighting)')
+        if not mat.pgb2_uvstep:   # Lit alone does nothing: it picks the lit shader for a UVStep sub
+            return
+        row = box.row()
+        row.prop(mat, 'pgb2_uvstep_tiles_u', text='Tiles U')
+        row.prop(mat, 'pgb2_uvstep_tiles_v', text='Tiles V')
+        box.prop(mat, 'pgb2_uvstep_used', text='Frames used')
+        box.prop(mat, 'pgb2_uvstep_scale')
+        box.prop(mat, 'pgb2_uvstep_tex', text='Timing texture slot (255 = none)')
+        if mat.pgb2_uvstep_tex == pgb2.USTP_NO_TIMING_TEX:
+            box.prop(mat, 'pgb2_uvstep_cycle', text='Cycle seconds')
+        else:
+            row = box.row()
+            row.prop(mat, 'pgb2_uvstep_sec_u', text='Scroll U s')
+            row.prop(mat, 'pgb2_uvstep_sec_v', text='Scroll V s')
+            box.label(text='Timing UVs: the UV map named UV1')
+
+
 classes = (IMPORT_OT_pes12_bin, EXPORT_OT_pes12_bin, IMPORT_OT_pgb2, EXPORT_OT_pgb2,
-           IMPORT_OT_pes12_slot, EXPORT_OT_pes12_slot)
+           IMPORT_OT_pes12_slot, EXPORT_OT_pes12_slot, OBJECT_PT_pgb2, MATERIAL_PT_pgb2)
 
 
 def register():

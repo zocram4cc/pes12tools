@@ -49,14 +49,16 @@ flag bits 22/23 with their params (`Tile_Count_U/V`, `Tiles_Used`,
 `Seconds_Per_Animation_Cycle`, `Seconds_Per_Timing_U/V_Cycle`,
 `Scale_UVs_To_Tiles`), the `Timing_Tex_LIN` role and the second UV channel
 in a `USTP` trailer section; drawlogic plays them in the colour pass
-(base texture on s0, timing texture on s2). Frame grids and timing strips
-are authored with `uvstep.py`:
+(base texture on s0, timing texture on s2). To make one yourself, follow
+[Animated materials (UVStep)](13-blender-tutorial.md) in the Blender
+tutorial; the commands it uses:
 
 ```sh
-python3 uvstep.py grid <out.png> <frame...> [--tiles-u N] [--tiles-v N]
-python3 uvstep.py timing <out.png> <frame:seconds,...> [--width N] [--height N]
+python3 uvstep.py grid <out.png> <frame...> [--tiles-u N] [--tiles-v N]   # frames -> one grid
+python3 uvstep.py timing <out.png> <frame:seconds[:0],...> [--width N] [--height N]   # timing strip
+python3 uvstep.py tex <body_K.tex> <image.png>   # any image -> a body texture the runtime loads
+python3 render_uvstep.py <body dir> <out.png> [t0,t1,...]   # offline check: a row per UVStep part, a column per time
 python3 test_uvstep.py               # trailer round trip + frame math
-python3 render_uvstep.py <body dir> <out.png> [t0,t1,...]   # offline check
 ```
 
 Models come out of a PES2021 install's `dt*.cpk` archives

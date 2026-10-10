@@ -42,6 +42,9 @@ SUB_HAND_L, SUB_HAND_R, SUB_HAND_RIG = 1 << 19, 1 << 20, 1 << 21
 # frame-grid animation (PES2019+ fox3d*_uvstep; tools/uvstep.py, USTP trailer):
 # bit 22 flags it, 23 picks the lit variant (else constant)
 SUB_UVSTEP, SUB_UVSTEP_LIT = 1 << 22, 1 << 23
+# limb skin shell: its texture is the body's skin colour; tools/mark_face.py
+# tints the stock skin (arms, legs, bare hands) to it via the marked face
+SUB_SKIN = 1 << 24
 SUB_REF_SHIFT = 8  # bits 8-15: alpha-test ref (pass alpha > ref)
 
 # USTP trailer section (tools/uvstep.py): magic + count + per-sub entries

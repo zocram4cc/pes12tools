@@ -1180,7 +1180,7 @@ def set_crowd_spec(slot, root, spec, log=print):
     _write_crowd(slot, root, C.join([s + (0,) for s in sections]), log=log)
 
 
-def set_crowd_audi(slot, root, path, log=print):
+def set_crowd_audi(slot, root, path, log=print, scale=1.0):
     """PES15/17 audiarea.bin (or its stadium folder/dp: */audi/area/stNNN)
     -> the slot's crowd block: one section per pack patch, boxes
     recomputed, header/uv from the slot's template row."""
@@ -1191,6 +1191,9 @@ def set_crowd_audi(slot, root, path, log=print):
             raise ValueError("%s: no audi/area/stNNN layout (looked for data/audiarea.bin)" % path)
         path = inner
     audi = C.read_audiarea(path)
+    # install --scale: the pockets ride with their platforms (x, z scaled)
+    audi = [(box, [(tuple(c * scale if i % 3 != 1 else c for i, c in enumerate(q[0])),) + tuple(q[1:]) for q in quads])
+            for box, quads in audi]
     if not audi:
         raise ValueError("%s: no crowd patches found" % path)
     template = _crowd_template(slot)
@@ -1702,6 +1705,19 @@ def atlas_pair(pieces, images, slot_number):
     return out, [i for i in images if i is not a and i is not b] + [atlas]
 
 
+# The engine draws a fixed subset of a slot's blocks per camera, picked for the
+# stock stadium; drawlogic re-draws installed blocks a camera skips, but only
+# ones some camera has drawn since the stadium loaded (standCull). Measured
+# per slot: the template blocks the walk-out and broadcast cameras draw
+# (09-10 census, Karasuno slot 1, 16 walk-out/kick-off frames + 120 broadcast
+# frames: 11-16, 22, 24-26). Block 1 (half time only) held the west half of
+# the hall, so it was missing from the broadcast view for the whole first
+# half; blocks 19 and 23 (celebration/replay only) held west-end pieces that
+# stayed culled the same way (owner, 09-10); block 6 was never drawn in 400+
+# sampled frames. Unmeasured slots keep every template block.
+KICKOFF_DRAWN_BLOCKS = {1: frozenset((11, 12, 13, 14, 15, 16, 22, 24, 25, 26))}
+
+
 def install(meshes, slot, out_root, sky=None, log=print):
     """Write `meshes` ([Mesh], KTMDL frame) into one stadium slot, from the
     stock geometry (stock pitch base kept: toggle it with set_asset); `sky`
@@ -1713,6 +1729,8 @@ def install(meshes, slot, out_root, sky=None, log=print):
     stock = split_bin(body)
     candidates = [(bi, pk) for bi, b in enumerate(stock) if b[:5] == b"KTMDL"
                   for pk in [template_packet(K, b)] if pk is not None]
+    if slot.number in KICKOFF_DRAWN_BLOCKS:
+        candidates = [c for c in candidates if c[0] in KICKOFF_DRAWN_BLOCKS[slot.number]]
     # The engine skips blocks reaching below y = 0 from the broadcast camera
     # (see tile()). Karasuno's floor sits at y -0.06..-0.03, so every floor
     # block was below ground and a quarter of the court vanished per camera
@@ -1847,7 +1865,7 @@ def pick_slots(spec, slots):
     return got
 
 
-def _install_crowd(src, slot, root, arg=None):
+def _install_crowd(src, slot, root, arg=None, scale=1.0):
     """Install-time crowd (see --crowd): off hides, stock keeps the host
     crowd, pack/None takes the source's audiarea.bin pockets when the
     source ships one (its sibling bg/audi/area/stNNN), FILE is a crowd
@@ -1863,7 +1881,7 @@ def _install_crowd(src, slot, root, arg=None):
                         "audi", "area", os.path.basename(os.path.normpath(src)),
                         "data", "audiarea.bin")
     if os.path.exists(audi) and (arg == "pack" or arg is None):
-        return set_crowd_audi(slot, root, audi)
+        return set_crowd_audi(slot, root, audi, scale=scale)
     if arg == "pack":
         print("slot %d: source ships no audiarea.bin, host crowd stays" % slot.number)
 
@@ -1871,11 +1889,13 @@ def _install_crowd(src, slot, root, arg=None):
 USAGE = """usage:
   pes12_stadium.py list                                    slots (geometry, pitch art, props)
   pes12_stadium.py names                                   stadium name ids and names
-  pes12_stadium.py install <source> <slots> <root> [--textures=<dir>] [--retexture=<material>:<image>,...] [--crowd=<off|stock|pack|FILE>]
+  pes12_stadium.py install <source> <slots> <root> [--textures=<dir>] [--retexture=<material>:<image>,...] [--crowd=<off|stock|pack|FILE>] [--scale=<k>]
       <source>: a PES15/17 stadium folder, or <archive.cpk>:<stNNN> (extracted to a temp folder);
       --crowd: pack = the pack's audiarea.bin pockets (default when the source ships one,
       else the host slot's stock crowd stays), stock = keep the host crowd, off = hide, FILE = a
       crowd JSON spec (see `crowd spec`); a <cpk>:<stNNN> source finds its audiarea.bin itself
+      --scale: the source scaled horizontally by k about the pitch centre, heights kept (a hall
+      smaller than PES2012's broadcast camera path, z up to 90.2 m, is drawn from outside its wall)
   pes12_stadium.py hide|show <slots> <root> <asset,...>     assets: %s
   pes12_stadium.py pitch <slots> <root> <image|GF stadium dir|stock>
   pes12_stadium.py thumb <ids> <root> <image|stock>
@@ -1889,6 +1909,35 @@ USAGE = """usage:
 ids (`names`); <root>: the afs2fs root. Slot <-> name id is known only for
 Allianz (slot 30 = id 61); find others with tools/afs_readlog.py while the
 game loads the stadium (its geometry entry = the slot).""" % ", ".join(ASSETS)
+
+
+# drawlogic.dll re-draws installed stand packets its camera skipped (the
+# engine draws a fixed per-camera subset of a slot's blocks, chosen for the
+# stock stadium; dllprobe/drawlogic.cpp standCull). It knows them by vertex
+# count, listed here: one per line, every installed slot's stride-40 packets,
+# beside drawlogic in <kitserver>/4cc-players (out_root is the kitserver's
+# afs2fs root next to it).
+STAND_DRAWS_FILE = "stand_draws.txt"
+STAND_STRIDE = 40
+
+
+def write_stand_draws(out_root):
+    K = _ktmdl_reader()
+    counts = set()
+    for s in read_slots():
+        if not os.path.exists(_override(out_root, s.geometry, DT07)):
+            continue
+        for b in split_bin(read_entry(s.geometry, root=out_root)[1]):
+            if b[:5] != b"KTMDL":
+                continue
+            for pk in range(len(K.parse_bytes(b)["packets"])):
+                v, _idx, stride = ktmdl_write.packet_mesh(b, pk)
+                if stride == STAND_STRIDE:
+                    counts.add(len(v) // stride)
+    dest = os.path.join(out_root, "..", "4cc-players", STAND_DRAWS_FILE)
+    with open(dest, "w") as f:
+        f.write("".join("%d\n" % n for n in sorted(counts)))
+    return dest
 
 
 def main(argv):
@@ -1942,6 +1991,19 @@ def main(argv):
                 sys.exit("%s has no stadium %s (looked for common/bg/model/bg/stadium/%s)" % (archive, st, st))
             return main([src if a == rest[0] else a for a in argv])   # the same install, from the extracted folder
     meshes, sky = read_source(rest[0], opts.get("textures"))
+    # --scale=<k>: the source scaled horizontally about the pitch centre (the
+    # KTMDL origin), heights kept. PES2012's broadcast camera runs at z 62.7-
+    # 90.2 m (09-10 census): a hall smaller than that puts the camera outside
+    # its wall, which then draws between camera and pitch (Karasuno: north
+    # wall inner face ~60 m; 1.55 tried 09-10, kept at authored scale - owner).
+    if "scale" in opts:
+        k = float(opts["scale"])
+
+        def unit(n):
+            s = math.sqrt(sum(c * c for c in n)) or 1.0
+            return tuple(c / s for c in n)
+        meshes = [m._replace(pos=[(x * k, y, z * k) for x, y, z in m.pos],
+                             nrm=[unit((nx / k, ny, nz / k)) for nx, ny, nz in m.nrm]) for m in meshes]
     # --retexture=<material>:<image>[,...]: that material's texture replaced
     # by an image (path relative to the source folder), e.g. Karasuno's
     # floor:texture/common/tex_bm_06.dds - the clean court its stage uses,
@@ -1958,7 +2020,8 @@ def main(argv):
         len(meshes), sum(len(m.tris) for m in meshes), "%d meshes" % len(sky) if sky else "none"))
     for s in pick_slots(rest[1], read_slots()):
         install(meshes, s, rest[2], sky)
-        _install_crowd(rest[0], s, rest[2], opts.get("crowd"))
+        _install_crowd(rest[0], s, rest[2], opts.get("crowd"), float(opts.get("scale", 1.0)))
+    write_stand_draws(rest[2])
 
 
 if __name__ == "__main__":

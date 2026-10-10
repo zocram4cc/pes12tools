@@ -133,13 +133,17 @@ goes out with the model entries (a stock crowd leaves no override).
 
 ## PGB2 custom bodies
 
-`dllprobe/custom/p<pid>/body.bin` (+ `body_<k>.dds` textures) as built by
-pes2012-tools.
+`kitserver/4cc-players/custom/p<pid>/body.bin` (+ `body_<k>.tex` textures:
+PGT1 or a DDS under that name) as built by pes2012-tools.
 
 - **File > Import > PGB2 body**: one mesh, one material per submesh, vertex
   groups for the 21 body slots and the 27 face slots (`face_00`..`face_26`).
-- Tick the object's **Stock pieces kept** (`pgb2_keep`) and per-material
-  flags, then select the mesh and **File > Export > PGB2 body**.
+- **Properties > Object > PGB2 body**: tick the **Stock pieces kept**
+  (`pgb2_keep`). **Properties > Material > PGB2 submesh**: the flags below,
+  the texture slot and the UVStep animation (step by step: the Blender
+  tutorial, "Animated materials (UVStep)"). Then select the mesh and
+  **File > Export > PGB2 body**. UV maps are read by name: `UV0` (main) and
+  `UV1` (UVStep timing).
 
 `pgb2_keep` = the stock pieces drawlogic still draws with the body (none
 ticked = a whole figure): `shorts`, `shirt`, `sleeves`, `socks`, `neck`,
